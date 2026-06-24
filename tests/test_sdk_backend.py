@@ -141,7 +141,6 @@ def test_build_options_locks_down_tools(sut):
         "mcp__aspen__read_file",
         "mcp__aspen__run_python_analysis",
     ]
-    assert "Bash" in opts.disallowed_tools
     assert opts.can_use_tool == s._can_use_tool
     assert opts.max_turns == config.AGENT_MAX_ROUNDS
     assert opts.system_prompt == prompts.SYSTEM_PROMPT

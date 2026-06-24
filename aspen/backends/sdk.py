@@ -9,10 +9,11 @@ event loop (``sessions._ensure_loop``) for its whole lifetime, as the SDK requir
 
 Tools are the shared impls wrapped as ``@tool`` and bundled with
 ``create_sdk_mcp_server`` (surfaced as ``mcp__aspen__*``). The agent is locked to
-ONLY those tools — ``allowed_tools`` auto-approves them, a ``can_use_tool`` callback
-denies everything else, and a built-in denylist is belt-and-suspenders — so the SDK
-agent has exactly the read-only + sandbox-only surface of the Messages backend and
-never gains Bash/file/web access via the CLI.
+ONLY those tools: ``allowed_tools`` auto-approves them and a ``can_use_tool``
+callback denies everything else (any name not ``mcp__aspen__*`` — robust across CLI
+versions, unlike a static built-in denylist). So the SDK agent has exactly the
+read-only + sandbox-only surface of the Messages backend and never gains Bash/file/
+web access via the CLI.
 
 ``claude-agent-sdk`` is imported lazily so the default ``messages`` backend never
 requires it (or the Claude Code CLI binary).
@@ -28,13 +29,6 @@ log = logging.getLogger("aspen")
 # Server (MCP) name; tools are surfaced to the model as mcp__aspen__<tool>.
 _SERVER = "aspen"
 _TOOL_PREFIX = f"mcp__{_SERVER}__"
-
-# Defense-in-depth denylist of common Claude Code built-ins. The can_use_tool
-# guard below is the definitive control; this just makes intent explicit.
-_BUILTIN_DENY = [
-    "Bash", "BashOutput", "KillBash", "Read", "Write", "Edit", "MultiEdit",
-    "NotebookEdit", "Glob", "Grep", "WebFetch", "WebSearch", "Task", "TodoWrite",
-]
 
 
 class SdkSession:
@@ -77,8 +71,7 @@ class SdkSession:
             model=config.MODEL,
             mcp_servers={_SERVER: server},
             allowed_tools=allowed,                 # auto-approve only our tools
-            disallowed_tools=list(_BUILTIN_DENY),  # explicit deny (defense in depth)
-            can_use_tool=self._can_use_tool,       # definitive lockdown
+            can_use_tool=self._can_use_tool,       # lockdown: deny anything not mcp__aspen__*
             max_turns=config.AGENT_MAX_ROUNDS,
         )
         if config.CLAUDE_CLI_PATH:                 # else the SDK finds "claude" on PATH
