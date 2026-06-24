@@ -59,24 +59,39 @@ class SdkSession:
         return built
 
     async def _can_use_tool(self, tool_name, tool_input, context):
-        """Allow only our MCP tools; deny everything else (built-ins, etc.)."""
+        """Backstop deny. Reached only for tool calls the allowlist did NOT
+        pre-approve (our MCP tools + the Bash patterns in ``allowed_tools`` never
+        get here). So a Bash call arriving here is an off-allowlist command."""
         import claude_agent_sdk as sdk
         if tool_name.startswith(_TOOL_PREFIX):
-            return sdk.PermissionResultAllow()
+            return sdk.PermissionResultAllow()     # defensive; normally auto-approved
+        if tool_name == "Bash":
+            cmd = (tool_input or {}).get("command", "")
+            return sdk.PermissionResultDeny(message=(
+                f"Command not in Aspen's allowlist: {cmd!r}. Only specific read-only "
+                "investigation commands are permitted (e.g. squeue, sacct, sinfo, "
+                f"grep). Allowlist: {', '.join(config.BASH_ALLOWLIST)}"
+            ))
         return sdk.PermissionResultDeny(message=f"{tool_name} is not permitted for Aspen.")
 
     def _build_options(self, sdk):
         server = sdk.create_sdk_mcp_server(
             name=_SERVER, version="1.0.0", tools=self._make_tools(sdk)
         )
-        allowed = [f"{_TOOL_PREFIX}{s['name']}" for s in tools.TOOL_SPECS]
+        # Auto-approve our MCP tools plus the configured read-only Bash patterns
+        # (e.g. "Bash(squeue:*)"). Anything else falls through to the can_use_tool
+        # backstop, which denies it.
+        allowed = [f"{_TOOL_PREFIX}{s['name']}" for s in tools.TOOL_SPECS] + list(config.BASH_ALLOWLIST)
         opts = dict(
             system_prompt=prompts.SYSTEM_PROMPT,   # plain string -> replaces (no preset)
             model=config.MODEL,
             mcp_servers={_SERVER: server},
-            allowed_tools=allowed,                 # auto-approve only our tools
-            can_use_tool=self._can_use_tool,       # lockdown: deny anything not mcp__aspen__*
-            max_turns=config.AGENT_MAX_ROUNDS,
+            allowed_tools=allowed,                 # auto-approve our tools + Bash allowlist
+            can_use_tool=self._can_use_tool,       # lockdown: deny anything not pre-approved
+            # Ignore host settings (~/.claude, project) so the allowlist above is the
+            # sole authority — an operator's permissions.allow can't widen the bot.
+            setting_sources=[],
+            max_turns=config.AGENT_MAX_ROUNDS
         )
         if config.CLAUDE_CLI_PATH:                 # else the SDK finds "claude" on PATH
             opts["cli_path"] = config.CLAUDE_CLI_PATH

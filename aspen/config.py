@@ -56,3 +56,38 @@ CLAUDE_CLI_PATH       = os.getenv("CLAUDE_CLI_PATH", "")
 # withholding ANTHROPIC_API_KEY from the CLI subprocess. Set false to let the CLI
 # use ANTHROPIC_API_KEY (API billing) instead.
 ASPEN_SDK_USE_SUBSCRIPTION = os.getenv("ASPEN_SDK_USE_SUBSCRIPTION", "true").lower() in ("1", "true", "yes")
+
+# Built-in Bash tool allowlist (HPC job investigation: squeue, sacct, grep, ...).
+# The SDK backend exposes Claude Code's *built-in* Bash tool, but only for the
+# command patterns listed here. Entries are Claude Code permission rules — the
+# "Bash(cmd:*)" form is a prefix match. The CLI's bash parser checks every
+# sub-command of a pipeline and refuses to auto-approve command substitution, so
+# "squeue | grep R" needs both squeue and grep allowlisted, and "squeue $(...)"
+# never auto-approves — matching commands run without prompting and everything
+# else is denied by the can_use_tool lockdown in backends/sdk.py.
+#
+# Defaults are read-only. Note: find (-exec/-delete), awk (system()), and sed
+# (w/e) are intentionally EXCLUDED — their flags can write files or run arbitrary
+# commands, which the prefix match cannot see. Only add such commands if you
+# accept that they escape the read-only intent.
+_DEFAULT_BASH_ALLOWLIST = [
+    "Bash(squeue:*)",         # job queue
+    "Bash(sacct:*)",          # job accounting / history
+    "Bash(sinfo:*)",          # partition / node info
+    "Bash(sstat:*)",          # running-job stats
+    "Bash(sprio:*)",          # job priorities
+    "Bash(scontrol show:*)",  # read-only job/node detail (not bare scontrol)
+    "Bash(grep:*)",           # filter output (e.g. squeue | grep)
+    "Bash(ls:*)",
+    "Bash(cat:*)",
+    "Bash(head:*)",
+    "Bash(tail:*)",
+    "Bash(wc:*)",
+    "Bash(sort:*)",
+    "Bash(uniq:*)",
+]
+BASH_ALLOWLIST = [
+    p.strip()
+    for p in os.getenv("ASPEN_BASH_ALLOWLIST", ",".join(_DEFAULT_BASH_ALLOWLIST)).split(",")
+    if p.strip()
+]

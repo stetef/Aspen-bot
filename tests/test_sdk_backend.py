@@ -123,10 +123,15 @@ def test_can_use_tool_allows_only_aspen_tools(sut):
 
     s = SdkSession("C:1")
     allow = asyncio.run(s._can_use_tool("mcp__aspen__read_file", {}, None))
-    deny = asyncio.run(s._can_use_tool("Bash", {"command": "rm -rf /"}, None))
+    deny_other = asyncio.run(s._can_use_tool("WebFetch", {"url": "http://x"}, None))
+    # An off-allowlist Bash command reaches the backstop and is denied; the
+    # message names the offending command and the allowlist.
+    deny_bash = asyncio.run(s._can_use_tool("Bash", {"command": "rm -rf /"}, None))
 
     assert allow.behavior == "allow"
-    assert deny.behavior == "deny"
+    assert deny_other.behavior == "deny"
+    assert deny_bash.behavior == "deny"
+    assert "rm -rf /" in deny_bash.message
 
 
 def test_build_options_locks_down_tools(sut):
@@ -136,15 +141,81 @@ def test_build_options_locks_down_tools(sut):
     s = SdkSession("C:1")
     opts = s._build_options(sdk)
 
+    # MCP tools first, then the configured read-only Bash allowlist patterns.
     assert opts.allowed_tools == [
         "mcp__aspen__list_directory",
         "mcp__aspen__read_file",
         "mcp__aspen__run_python_analysis",
-    ]
+    ] + list(config.BASH_ALLOWLIST)
+    assert "Bash(squeue:*)" in opts.allowed_tools
+    # Host settings are ignored so the allowlist is the sole permission authority.
+    assert opts.setting_sources == []
     assert opts.can_use_tool == s._can_use_tool
     assert opts.max_turns == config.AGENT_MAX_ROUNDS
     assert opts.system_prompt == prompts.SYSTEM_PROMPT
     assert opts.model == config.MODEL
+
+
+def test_default_bash_allowlist_is_readonly(sut):
+    from aspen import config
+
+    # The investigation commands the user asked for are present...
+    for rule in ("Bash(squeue:*)", "Bash(sacct:*)", "Bash(sinfo:*)", "Bash(grep:*)"):
+        assert rule in config.BASH_ALLOWLIST
+    # ...scontrol is restricted to the read-only 'show' subcommand (no bare scontrol,
+    # which could update/requeue jobs).
+    assert "Bash(scontrol show:*)" in config.BASH_ALLOWLIST
+    assert "Bash(scontrol:*)" not in config.BASH_ALLOWLIST
+    # find/awk/sed are excluded on purpose — their flags can write/execute and the
+    # prefix match can't see that.
+    cmds = " ".join(config.BASH_ALLOWLIST)
+    assert "find" not in cmds and "awk" not in cmds and "sed" not in cmds
+
+
+def test_bash_allowlist_override_flows_into_allowed_tools(sut, monkeypatch):
+    """The allowlist is config-driven: whatever config holds lands in allowed_tools
+    (after the MCP tools), so an operator's ASPEN_BASH_ALLOWLIST takes effect."""
+    from aspen.backends.sdk import SdkSession
+    from aspen import config
+
+    monkeypatch.setattr(config, "BASH_ALLOWLIST", ["Bash(squeue:*)", "Bash(sacct:*)"])
+    opts = SdkSession("C:1")._build_options(sdk)
+
+    assert opts.allowed_tools == [
+        "mcp__aspen__list_directory",
+        "mcp__aspen__read_file",
+        "mcp__aspen__run_python_analysis",
+        "Bash(squeue:*)",
+        "Bash(sacct:*)",
+    ]
+
+
+def test_bash_deny_message_lists_the_allowlist(sut, monkeypatch):
+    from aspen.backends.sdk import SdkSession
+    from aspen import config
+
+    monkeypatch.setattr(config, "BASH_ALLOWLIST", ["Bash(squeue:*)"])
+    deny = asyncio.run(
+        SdkSession("C:1")._can_use_tool("Bash", {"command": "scancel 42"}, None)
+    )
+
+    assert deny.behavior == "deny"
+    assert "scancel 42" in deny.message      # names the offending command
+    assert "Bash(squeue:*)" in deny.message  # tells the model what IS allowed
+
+
+def test_bash_allowlist_env_parsing(sut, monkeypatch):
+    """ASPEN_BASH_ALLOWLIST is parsed comma-separated, trimmed, blanks dropped."""
+    import importlib
+    from aspen import config
+
+    monkeypatch.setenv("ASPEN_BASH_ALLOWLIST", " Bash(squeue:*) , ,Bash(grep:*) ")
+    try:
+        importlib.reload(config)
+        assert config.BASH_ALLOWLIST == ["Bash(squeue:*)", "Bash(grep:*)"]
+    finally:
+        monkeypatch.delenv("ASPEN_BASH_ALLOWLIST", raising=False)
+        importlib.reload(config)  # restore module-level default for later tests
 
 
 def test_cli_path_passed_only_when_set(sut, monkeypatch):
