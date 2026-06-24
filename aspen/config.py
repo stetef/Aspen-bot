@@ -11,7 +11,6 @@ import logging
 import os
 from pathlib import Path
 
-import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,7 +22,9 @@ log = logging.getLogger("aspen")
 # ---------------------------------------------------------------------------
 SLACK_BOT_TOKEN     = os.environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN     = os.environ["SLACK_APP_TOKEN"]
-ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
+# ANTHROPIC_API_KEY is intentionally NOT read here — it is needed only by the
+# Messages API client, which is built lazily in __getattr__ below. This lets the
+# SDK backend run without ANTHROPIC_API_KEY set.
 CALCULATIONS_ROOT     = Path(os.environ["CALCULATIONS_ROOT"]).resolve()
 ALLOWED_USER_IDS      = set(os.environ["ASPEN_ALLOWED_SLACK_USER_IDS"].split(","))
 MODEL                 = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
@@ -60,4 +61,22 @@ CLAUDE_CLI_PATH       = os.getenv("CLAUDE_CLI_PATH", "")
 # CLI use ANTHROPIC_API_KEY (API billing) instead. (Messages backend is unaffected.)
 ASPEN_SDK_USE_SUBSCRIPTION = os.getenv("ASPEN_SDK_USE_SUBSCRIPTION", "true").lower() in ("1", "true", "yes")
 
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+def __getattr__(name):
+    """Lazily build the Messages API client on first access to ``anthropic_client``.
+
+    The API key is read here (not at import), so the SDK backend — which never
+    touches ``anthropic_client`` — runs without ANTHROPIC_API_KEY set. The error
+    surfaces only when the Messages backend actually needs the client.
+    """
+    if name == "anthropic_client":
+        key = os.environ.get("ANTHROPIC_API_KEY")
+        if not key:
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY is required for the Messages backend "
+                "(ASPEN_BACKEND=messages) but is not set."
+            )
+        import anthropic
+        client = anthropic.Anthropic(api_key=key)
+        globals()["anthropic_client"] = client   # cache for subsequent access
+        return client
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
