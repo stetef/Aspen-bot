@@ -8,12 +8,19 @@ between a response and the next user message". The session lives on the persiste
 event loop (``sessions._ensure_loop``) for its whole lifetime, as the SDK requires.
 
 Tools are the shared impls wrapped as ``@tool`` and bundled with
-``create_sdk_mcp_server`` (surfaced as ``mcp__aspen__*``). The agent is locked to
-ONLY those tools: ``allowed_tools`` auto-approves them and a ``can_use_tool``
-callback denies everything else (any name not ``mcp__aspen__*`` — robust across CLI
-versions, unlike a static built-in denylist). So the agent is confined to the
-read-only browsing + sandboxed-analysis surface and never gains Bash/file/web
-access via the CLI.
+``create_sdk_mcp_server`` (surfaced as ``mcp__aspen__*``). Tool access is layered:
+``allowed_tools`` auto-approves our MCP tools plus a read-only Bash allowlist
+(``config.BASH_ALLOWLIST``, e.g. ``Bash(squeue:*)``) for HPC job investigation,
+and the ``can_use_tool`` callback denies everything else. So beyond the read-only
+browsing + sandboxed-analysis surface the agent gets only the enumerated Bash
+commands — no file/web access via the CLI.
+
+Optionally (``config.SANDBOX_ENABLED``) Bash runs inside Claude Code's OS-level
+sandbox (bubblewrap on Linux / Seatbelt on macOS) via the ``sandbox`` option. The
+operator defines the agent's read/write/network boundary in ``config`` — giving it
+a *write* surface independent of the bot's Unix user — and sandboxed commands are
+auto-approved by that boundary. The read-only Slurm clients are excluded from the
+jail (they need cluster network/munge) but stay gated by the allowlist.
 
 ``claude-agent-sdk`` is imported lazily (inside methods) so importing this module
 — e.g. in tests — doesn't require the SDK package or the Claude Code CLI binary.
@@ -74,6 +81,39 @@ class SdkSession:
             ))
         return sdk.PermissionResultDeny(message=f"{tool_name} is not permitted for Aspen.")
 
+    def _sandbox_settings(self):
+        """Claude Code sandbox config from ``config``, or ``None`` when disabled.
+
+        Passed via the SDK's ``sandbox`` option, which the SDK merges into the
+        ``--settings`` flag layer — independent of ``setting_sources`` (so the
+        host-settings lockdown stays intact). The dict is forwarded verbatim, so
+        CLI-only keys not in the SDK TypedDict (``filesystem``, ``failIfUnavailable``)
+        are honored by the CLI. See https://code.claude.com/docs/en/sandboxing."""
+        if not config.SANDBOX_ENABLED:
+            return None
+        fs = {}
+        if config.SANDBOX_WRITE_PATHS:
+            fs["allowWrite"] = config.SANDBOX_WRITE_PATHS
+        if config.SANDBOX_DENY_READ_PATHS:
+            fs["denyRead"] = config.SANDBOX_DENY_READ_PATHS
+        if config.SANDBOX_ALLOW_READ_PATHS:
+            fs["allowRead"] = config.SANDBOX_ALLOW_READ_PATHS
+        net = {"allowedDomains": config.SANDBOX_ALLOWED_DOMAINS}  # [] => no network
+        if config.SANDBOX_UNIX_SOCKETS:
+            net["allowUnixSockets"] = config.SANDBOX_UNIX_SOCKETS
+        sandbox = {
+            "enabled": True,
+            "autoAllowBashIfSandboxed": config.SANDBOX_AUTO_ALLOW,
+            "allowUnsandboxedCommands": config.SANDBOX_ALLOW_UNSANDBOXED,
+            "failIfUnavailable": config.SANDBOX_FAIL_IF_UNAVAILABLE,
+            "network": net,
+        }
+        if config.SANDBOX_EXCLUDED_COMMANDS:
+            sandbox["excludedCommands"] = config.SANDBOX_EXCLUDED_COMMANDS
+        if fs:
+            sandbox["filesystem"] = fs
+        return sandbox
+
     def _build_options(self, sdk):
         server = sdk.create_sdk_mcp_server(
             name=_SERVER, version="1.0.0", tools=self._make_tools(sdk)
@@ -93,6 +133,13 @@ class SdkSession:
             setting_sources=[],
             max_turns=config.AGENT_MAX_ROUNDS
         )
+        sandbox = self._sandbox_settings()
+        if sandbox is not None:
+            # OS-level jail for Bash; the operator's write boundary lives here,
+            # separate from the bot user's own filesystem permissions.
+            opts["sandbox"] = sandbox
+            if config.SANDBOX_WORKDIR:             # keep the agent out of the repo/home
+                opts["cwd"] = str(config.SANDBOX_WORKDIR)
         if config.CLAUDE_CLI_PATH:                 # else the SDK finds "claude" on PATH
             opts["cli_path"] = config.CLAUDE_CLI_PATH
         if config.ASPEN_SDK_USE_SUBSCRIPTION:

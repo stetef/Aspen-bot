@@ -156,6 +156,52 @@ def test_build_options_locks_down_tools(sut):
     assert opts.model == config.MODEL
 
 
+def test_sandbox_disabled_by_default(sut):
+    from aspen.backends.sdk import SdkSession
+    from aspen import config
+
+    assert config.SANDBOX_ENABLED is False
+    s = SdkSession("C:1")
+    assert s._sandbox_settings() is None
+    opts = s._build_options(sdk)
+    # No sandbox => no OS jail and cwd untouched (current behavior preserved).
+    assert opts.sandbox is None
+    assert opts.cwd is None
+
+
+def test_sandbox_settings_built_from_config(sut, monkeypatch):
+    from aspen.backends.sdk import SdkSession
+    from aspen import config
+
+    monkeypatch.setattr(config, "SANDBOX_ENABLED", True)
+    monkeypatch.setattr(config, "SANDBOX_WRITE_PATHS", ["/scratch/aspen", "~/out"])
+    monkeypatch.setattr(config, "SANDBOX_ALLOWED_DOMAINS", ["pypi.org"])
+    monkeypatch.setattr(config, "SANDBOX_UNIX_SOCKETS", [])
+    monkeypatch.setattr(config, "SANDBOX_WORKDIR", "/scratch/aspen")
+
+    opts = SdkSession("C:1")._build_options(sdk)
+    sb = opts.sandbox
+
+    assert sb["enabled"] is True
+    assert sb["autoAllowBashIfSandboxed"] is config.SANDBOX_AUTO_ALLOW
+    assert sb["allowUnsandboxedCommands"] is config.SANDBOX_ALLOW_UNSANDBOXED
+    assert sb["failIfUnavailable"] is config.SANDBOX_FAIL_IF_UNAVAILABLE
+    assert sb["filesystem"]["allowWrite"] == ["/scratch/aspen", "~/out"]
+    assert sb["network"]["allowedDomains"] == ["pypi.org"]
+    assert "allowUnixSockets" not in sb["network"]   # omitted when empty
+    # Slurm clients run outside the jail (need cluster network/munge).
+    assert "squeue" in sb["excludedCommands"]
+    # Session pinned to the configured workdir so the agent stays out of repo/home.
+    assert opts.cwd == "/scratch/aspen"
+
+
+def test_sandbox_default_excludes_slurm_clients(sut):
+    from aspen import config
+
+    for cmd in ("squeue", "sacct", "sinfo", "scontrol"):
+        assert cmd in config.SANDBOX_EXCLUDED_COMMANDS
+
+
 def test_default_bash_allowlist_is_readonly(sut):
     from aspen import config
 

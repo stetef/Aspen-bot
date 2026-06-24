@@ -91,3 +91,64 @@ BASH_ALLOWLIST = [
     for p in os.getenv("ASPEN_BASH_ALLOWLIST", ",".join(_DEFAULT_BASH_ALLOWLIST)).split(",")
     if p.strip()
 ]
+
+
+# ---------------------------------------------------------------------------
+# Bash OS-level sandbox (Claude Code sandbox: bubblewrap on Linux, Seatbelt on
+# macOS). When enabled, the agent's Bash commands run inside an OS sandbox whose
+# read/write/network boundary is defined HERE by the operator — independent of
+# the Unix user the bot runs as. This is how the agent gets *write* access to a
+# controlled area without the bot's own account granting it everywhere.
+#
+# On Linux this needs `bubblewrap` and `socat` installed (apt/dnf). See
+# https://code.claude.com/docs/en/sandboxing.
+#
+# Design (how this composes with BASH_ALLOWLIST above):
+#   - Read-only investigation commands (squeue/sacct/...) are EXCLUDED from the
+#     sandbox: Slurm clients need cluster network + the munge socket, which the
+#     bwrap network jail blocks. Excluded commands run as the bot user but are
+#     still auto-approved by BASH_ALLOWLIST (and anything off it is denied by the
+#     can_use_tool backstop), so excluding them does not widen access.
+#   - Every other command runs INSIDE the jail, auto-approved by the sandbox
+#     boundary (autoAllow), able to write only within SANDBOX_WRITE_PATHS.
+# ---------------------------------------------------------------------------
+def _csv_env(name: str, default: str = "") -> list[str]:
+    return [p.strip() for p in os.getenv(name, default).split(",") if p.strip()]
+
+
+def _flag(name: str, default: str) -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes")
+
+SANDBOX_ENABLED = _flag("ASPEN_SANDBOX_ENABLED", "false")
+# Fail closed: if the sandbox can't start (missing bwrap, unsupported platform),
+# refuse to run rather than silently dropping to UNsandboxed execution.
+SANDBOX_FAIL_IF_UNAVAILABLE = _flag("ASPEN_SANDBOX_FAIL_IF_UNAVAILABLE", "true")
+# Auto-approve Bash commands that successfully run inside the sandbox (the point
+# of the jail — the OS boundary contains them, so no per-command prompt).
+SANDBOX_AUTO_ALLOW = _flag("ASPEN_SANDBOX_AUTO_ALLOW", "true")
+# Allow commands to escape the jail via dangerouslyDisableSandbox. Default false
+# (strict): a command either runs sandboxed or is in SANDBOX_EXCLUDED_COMMANDS.
+SANDBOX_ALLOW_UNSANDBOXED = _flag("ASPEN_SANDBOX_ALLOW_UNSANDBOXED", "false")
+# Session working directory when sandboxed (also writable by default). Keep the
+# agent out of the repo/home — point this at a scratch/workspace dir.
+SANDBOX_WORKDIR = os.getenv("ASPEN_SANDBOX_WORKDIR", str(WORKSPACE_ROOT))
+# Paths the sandboxed agent may WRITE to (beyond cwd + the session temp dir).
+# This is the agent's writable surface — operator-controlled, separate from what
+# the bot's Unix user could otherwise touch. Prefix rules: "/abs", "~/home", "rel".
+SANDBOX_WRITE_PATHS = _csv_env("ASPEN_SANDBOX_WRITE_PATHS")
+# Paths to deny reads of inside the jail (e.g. credentials). Empty = read-most.
+SANDBOX_DENY_READ_PATHS = _csv_env("ASPEN_SANDBOX_DENY_READ_PATHS")
+# Re-allow reads of specific paths inside a denied region.
+SANDBOX_ALLOW_READ_PATHS = _csv_env("ASPEN_SANDBOX_ALLOW_READ_PATHS")
+# Network domains the sandbox may reach. Empty = no network (safest); a command
+# needing an unlisted domain fails rather than hanging on a prompt.
+SANDBOX_ALLOWED_DOMAINS = _csv_env("ASPEN_SANDBOX_ALLOWED_DOMAINS")
+# Unix socket paths reachable inside the jail (e.g. an SSH agent). Be careful —
+# some sockets (docker.sock) are a sandbox escape.
+SANDBOX_UNIX_SOCKETS = _csv_env("ASPEN_SANDBOX_UNIX_SOCKETS")
+# Commands that run OUTSIDE the jail. Default = the read-only Slurm clients,
+# which need cluster network/munge the jail blocks (still gated by BASH_ALLOWLIST).
+SANDBOX_EXCLUDED_COMMANDS = _csv_env(
+    "ASPEN_SANDBOX_EXCLUDED_COMMANDS",
+    "squeue,sacct,sinfo,sstat,sprio,scontrol",
+)
