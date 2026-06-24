@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 from slack_bolt import App
 
@@ -18,7 +19,13 @@ from . import config, figures, ratelimit, sessions, state
 
 log = logging.getLogger("aspen")
 
-app = App(token=config.SLACK_BOT_TOKEN)
+# Each in-flight turn blocks a Bolt listener thread (it waits on the agent loop),
+# so size the pool above MAX_CONCURRENT — otherwise the pool, not the semaphore,
+# becomes the limiter and quick rejections get starved while turns are running.
+app = App(
+    token=config.SLACK_BOT_TOKEN,
+    listener_executor=ThreadPoolExecutor(max_workers=config.MAX_CONCURRENT + 4),
+)
 
 # Generous ceiling for a single turn (the analysis sandbox has its own timeout).
 _TURN_TIMEOUT = int(os.getenv("EXECUTION_TIMEOUT_SECONDS", "120")) + 600

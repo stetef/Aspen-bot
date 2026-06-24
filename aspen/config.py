@@ -32,7 +32,7 @@ MODEL                 = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
 RATE_LIMIT_REQUESTS   = int(os.getenv("RATE_LIMIT_REQUESTS", "5"))
 RATE_LIMIT_WINDOW     = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "600"))
 CONTEXT_EXPIRY        = int(os.getenv("CONTEXT_EXPIRY_SECONDS", "14400"))
-MAX_CONCURRENT        = int(os.getenv("MAX_CONCURRENT_EXECUTIONS", "2"))
+MAX_CONCURRENT        = int(os.getenv("MAX_CONCURRENT_EXECUTIONS", "5"))
 MAX_FILE_BYTES        = int(os.getenv("MAX_FILE_READ_BYTES", "50000"))
 
 # Tool server (only needed when run_python_analysis is used)

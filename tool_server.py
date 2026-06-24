@@ -122,27 +122,68 @@ def _safe_run_path(project_path: Path, run_name: str) -> Path:
 # Metadata loading
 # ---------------------------------------------------------------------------
 _METADATA_TEMPLATE = """\
-```toml
-name = "your_project_name"
-allowed_libraries = ["numpy", "pandas", "matplotlib"]
+Create `metadata.md` in the project root — plain markdown the AI assistant reads to
+understand the project. Example:
 
-[parsers]
-energy = "energy.csv"
-output_files = ["energy.csv", "log.txt"]
+# <Project name> — <one-line description>
 
-[datasets]
-run_group_1 = ["run_001", "run_002"]
-```"""
+## Summary
+<What this project is, in a sentence or two.>
+
+## What to look at / questions of interest
+- <question 1>
+- <question 2>
+
+## Datasets (groups of runs)
+### <dataset-name> — <what makes this group>
+Runs: run_001, run_002, run_003
+
+## Where the files are
+For a run `<run>`: input `<run>/<run>.in`, structure `<run>/<run>.xyz`, log `<run>/<run>.log`
+
+## Python libraries available for analysis
+- numpy
+- pandas
+- matplotlib"""
+
+
+def _parse_markdown_metadata(text: str, project_name: str) -> dict:
+    """
+    Best-effort parse of metadata.md. The document as a whole is the agent-facing
+    project description; the only field the server needs is the advisory list of
+    Python libraries, taken from the markdown list under a heading mentioning
+    "librar" (e.g. "## Python libraries available for analysis").
+    """
+    libs: list[str] = []
+    in_libs = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            in_libs = bool(re.search(r"librar", stripped, re.IGNORECASE))
+            continue
+        if in_libs:
+            m = re.match(r"[-*]\s+(.+)", stripped)
+            if m:
+                item = m.group(1).strip().strip("`").strip()
+                # Skip placeholder/prompt bullets like _(add ...)_ or <fill in>.
+                if item and item[0] not in "_(<" and "fill in" not in item.lower():
+                    libs.append(item)
+    if not libs:
+        libs = ["numpy", "pandas", "matplotlib"]  # sensible advisory default
+    return {"name": project_name, "allowed_libraries": libs, "description": text}
 
 
 def load_metadata(project_path: Path) -> dict:
     """
-    Load metadata.toml or metadata.yaml from the project root.
-    Returns the parsed dict, or raises HTTPException(422) with a helpful message.
+    Load project metadata. Prefers metadata.md (natural-language markdown); falls
+    back to metadata.toml / metadata.yaml. Raises HTTPException(422) if none found.
     """
+    md_path = project_path / "metadata.md"
     toml_path = project_path / "metadata.toml"
     yaml_path = project_path / "metadata.yaml"
 
+    if md_path.exists():
+        return _parse_markdown_metadata(md_path.read_text(), project_path.name)
     if toml_path.exists():
         try:
             return tomllib.loads(toml_path.read_text())
@@ -166,8 +207,8 @@ def load_metadata(project_path: Path) -> dict:
     raise HTTPException(
         status_code=422,
         detail=(
-            f"No metadata.toml or metadata.yaml found in {project_path.name}/. "
-            f"Please create one. Template:\n{_METADATA_TEMPLATE}"
+            f"No metadata.md (or metadata.toml/metadata.yaml) found in {project_path.name}/. "
+            f"Please create one.\n\n{_METADATA_TEMPLATE}"
         ),
     )
 

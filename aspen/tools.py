@@ -202,8 +202,8 @@ TOOL_SPECS = [
                 "code": {
                     "type": "string",
                     "description": (
-                        "Python code to execute. Import only libraries in the project's "
-                        "allowed_libraries (from metadata.toml/yaml). "
+                        "Python code to execute. Import only libraries listed under "
+                        "'Python libraries available for analysis' in the project's metadata.md. "
                         "Project data is at /projects/<project_name>/. "
                         "Save figures with plt.savefig('/aspen_workspace/figures/<name>.png', dpi=150)."
                     ),
