@@ -33,7 +33,7 @@ SLACK_APP_TOKEN     = os.environ["SLACK_APP_TOKEN"]
 ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
 CALCULATIONS_ROOT     = Path(os.environ["CALCULATIONS_ROOT"]).resolve()
 ALLOWED_USER_IDS      = set(os.environ["ASPEN_ALLOWED_SLACK_USER_IDS"].split(","))
-MODEL                 = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-5")
+MODEL                 = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
 
 RATE_LIMIT_REQUESTS   = int(os.getenv("RATE_LIMIT_REQUESTS", "5"))
 RATE_LIMIT_WINDOW     = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "600"))
