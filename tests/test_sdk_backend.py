@@ -73,7 +73,7 @@ def _fake_client(monkeypatch):
 
 
 def test_warm_session_reuses_client_across_turns(sut):
-    from aspen.backends.sdk import SdkSession
+    from aspen.agent import SdkSession
 
     s = SdkSession("C:1")
 
@@ -93,7 +93,7 @@ def test_warm_session_reuses_client_across_turns(sut):
 
 
 def test_error_subtype_returns_error_reply(sut):
-    from aspen.backends.sdk import SdkSession
+    from aspen.agent import SdkSession
 
     FakeClient.responder = staticmethod(_error_messages)
     s = SdkSession("C:1")
@@ -104,7 +104,7 @@ def test_error_subtype_returns_error_reply(sut):
 
 
 def test_tool_handler_drains_figures_into_sink(sut, monkeypatch):
-    from aspen.backends.sdk import SdkSession
+    from aspen.agent import SdkSession
     import aspen.tools as t
 
     monkeypatch.setitem(t.TOOL_FNS, "fake_fig", lambda inp, ctx: ("plotted", ["/w/x.png"]))
@@ -119,7 +119,7 @@ def test_tool_handler_drains_figures_into_sink(sut, monkeypatch):
 
 
 def test_can_use_tool_allows_only_aspen_tools(sut):
-    from aspen.backends.sdk import SdkSession
+    from aspen.agent import SdkSession
 
     s = SdkSession("C:1")
     allow = asyncio.run(s._can_use_tool("mcp__aspen__read_file", {}, None))
@@ -135,7 +135,7 @@ def test_can_use_tool_allows_only_aspen_tools(sut):
 
 
 def test_build_options_locks_down_tools(sut):
-    from aspen.backends.sdk import SdkSession
+    from aspen.agent import SdkSession
     from aspen import config, prompts
 
     s = SdkSession("C:1")
@@ -175,7 +175,7 @@ def test_default_bash_allowlist_is_readonly(sut):
 def test_bash_allowlist_override_flows_into_allowed_tools(sut, monkeypatch):
     """The allowlist is config-driven: whatever config holds lands in allowed_tools
     (after the MCP tools), so an operator's ASPEN_BASH_ALLOWLIST takes effect."""
-    from aspen.backends.sdk import SdkSession
+    from aspen.agent import SdkSession
     from aspen import config
 
     monkeypatch.setattr(config, "BASH_ALLOWLIST", ["Bash(squeue:*)", "Bash(sacct:*)"])
@@ -191,7 +191,7 @@ def test_bash_allowlist_override_flows_into_allowed_tools(sut, monkeypatch):
 
 
 def test_bash_deny_message_lists_the_allowlist(sut, monkeypatch):
-    from aspen.backends.sdk import SdkSession
+    from aspen.agent import SdkSession
     from aspen import config
 
     monkeypatch.setattr(config, "BASH_ALLOWLIST", ["Bash(squeue:*)"])
@@ -219,7 +219,7 @@ def test_bash_allowlist_env_parsing(sut, monkeypatch):
 
 
 def test_cli_path_passed_only_when_set(sut, monkeypatch):
-    from aspen.backends.sdk import SdkSession
+    from aspen.agent import SdkSession
     from aspen import config
 
     s = SdkSession("C:1")
@@ -234,7 +234,7 @@ def test_cli_path_passed_only_when_set(sut, monkeypatch):
 
 
 def test_subscription_auth_blanks_api_key_for_cli(sut, monkeypatch):
-    from aspen.backends.sdk import SdkSession
+    from aspen.agent import SdkSession
     from aspen import config
 
     s = SdkSession("C:1")

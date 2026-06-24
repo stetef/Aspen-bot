@@ -3,7 +3,7 @@ Conversation sessions and the persistent agent event loop.
 
 The **session registry + persistent asyncio loop**. Slack's (sync) handlers feed
 each user message into this async system via ``run_coroutine_threadsafe``; the
-``SessionManager`` keeps one ``AgentSession`` per conversation thread, which runs a
+``SessionManager`` keeps one ``SdkSession`` per conversation thread, which runs a
 turn and then parks until the next message (the warm SDK client retains the
 conversation context). Per-session locks serialize turns in the same thread; idle /
 LRU eviction (``aclose``) bounds live sessions. ``_thread_key`` maps a Slack thread
@@ -63,7 +63,7 @@ class _Entry:
 
 
 class SessionManager:
-    """Keeps one parked AgentSession per conversation thread (lives on the loop)."""
+    """Keeps one parked SdkSession per conversation thread (lives on the loop)."""
 
     def __init__(self):
         self._entries: "OrderedDict[str, _Entry]" = OrderedDict()
@@ -79,8 +79,8 @@ class SessionManager:
         await self._evict()
         entry = self._entries.get(key)
         if entry is None:
-            from .backends import make_session
-            entry = _Entry(make_session(key))
+            from .agent import SdkSession
+            entry = _Entry(SdkSession(key))
             self._entries[key] = entry
         return entry
 

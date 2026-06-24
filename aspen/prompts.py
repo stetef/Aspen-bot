@@ -1,4 +1,4 @@
-"""System prompt for the Aspen agent (backend-agnostic)."""
+"""System prompt for the Aspen agent."""
 
 from . import config
 

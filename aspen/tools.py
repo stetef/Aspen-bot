@@ -1,10 +1,10 @@
 """
-Backend-agnostic tools: read-only file browsing + the sandboxed-analysis bridge.
+Agent tools: read-only file browsing + the sandboxed-analysis bridge.
 
 ``TOOL_SPECS`` is the single source of truth (name / description / input_schema /
 impl). From it we derive ``TOOL_FNS`` (name → impl(input, context) -> (text,
 figures)). ``dispatch()`` calls an impl, drains its figures into the per-turn sink
-(``context["figures"]``) and returns the text only. The SDK backend wraps these
+(``context["figures"]``) and returns the text only. The agent wraps these
 specs as ``@tool`` handlers; the figure-sink seam lives entirely in ``dispatch``.
 """
 
@@ -148,7 +148,7 @@ def _call_tool_server(inp: dict, context: dict) -> tuple[str, list[str]]:
 
 
 # --------------------------------------------------------------------------- #
-# Tool specs — single source of truth for both backends
+# Tool specs — single source of truth for the agent
 # --------------------------------------------------------------------------- #
 TOOL_SPECS = [
     {

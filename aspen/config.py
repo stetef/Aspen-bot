@@ -22,9 +22,9 @@ log = logging.getLogger("aspen")
 # ---------------------------------------------------------------------------
 SLACK_BOT_TOKEN     = os.environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN     = os.environ["SLACK_APP_TOKEN"]
-# ANTHROPIC_API_KEY is not read here. The SDK backend authenticates the Claude
+# ANTHROPIC_API_KEY is not read here. The agent authenticates the Claude
 # Code CLI (via the subscription login, or the key passed to the CLI subprocess
-# when ASPEN_SDK_USE_SUBSCRIPTION=false) — see backends/sdk.py.
+# when ASPEN_SDK_USE_SUBSCRIPTION=false) — see agent.py.
 CALCULATIONS_ROOT     = Path(os.environ["CALCULATIONS_ROOT"]).resolve()
 ALLOWED_USER_IDS      = set(os.environ["ASPEN_ALLOWED_SLACK_USER_IDS"].split(","))
 MODEL                 = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
@@ -64,7 +64,7 @@ ASPEN_SDK_USE_SUBSCRIPTION = os.getenv("ASPEN_SDK_USE_SUBSCRIPTION", "true").low
 # sub-command of a pipeline and refuses to auto-approve command substitution, so
 # "squeue | grep R" needs both squeue and grep allowlisted, and "squeue $(...)"
 # never auto-approves — matching commands run without prompting and everything
-# else is denied by the can_use_tool lockdown in backends/sdk.py.
+# else is denied by the can_use_tool lockdown in agent.py.
 #
 # Defaults are read-only. Note: find (-exec/-delete), awk (system()), and sed
 # (w/e) are intentionally EXCLUDED — their flags can write files or run arbitrary

@@ -1,5 +1,5 @@
 """
-Claude Agent SDK backend.
+The agent session — a warm Claude Agent SDK conversation.
 
 A conversation is a warm ``ClaudeSDKClient`` session: ``connect()`` once, then
 ``query()`` per turn with the SDK retaining context natively. Between turns the
@@ -15,8 +15,8 @@ versions, unlike a static built-in denylist). So the agent is confined to the
 read-only browsing + sandboxed-analysis surface and never gains Bash/file/web
 access via the CLI.
 
-``claude-agent-sdk`` is imported lazily so the default ``messages`` backend never
-requires it (or the Claude Code CLI binary).
+``claude-agent-sdk`` is imported lazily (inside methods) so importing this module
+— e.g. in tests — doesn't require the SDK package or the Claude Code CLI binary.
 
 Auth: by default (``ASPEN_SDK_USE_SUBSCRIPTION``) the CLI uses the Claude Code login
 (subscription) — the SDK subprocess is given a blank ``ANTHROPIC_API_KEY`` so the
@@ -26,7 +26,7 @@ key in the environment (which the CLI would otherwise prefer) doesn't take over.
 import asyncio
 import logging
 
-from .. import config, prompts, tools
+from . import config, prompts, tools
 
 log = logging.getLogger("aspen")
 
