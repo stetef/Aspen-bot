@@ -119,6 +119,10 @@ def _csv_env(name: str, default: str = "") -> list[str]:
 def _flag(name: str, default: str) -> bool:
     return os.getenv(name, default).lower() in ("1", "true", "yes")
 
+# CAVEAT: verified 2026-06-24 that on Claude Code CLI 2.1.190 the sandbox is NOT
+# enforced in SDK/headless mode (the mode Aspen uses) — commands are auto-approved
+# as sandboxed but not confined, and that bypasses the can_use_tool allowlist. Keep
+# this false until enforcement is confirmed on your CLI version. See backends/sdk.py.
 SANDBOX_ENABLED = _flag("ASPEN_SANDBOX_ENABLED", "false")
 # Fail closed: if the sandbox can't start (missing bwrap, unsupported platform),
 # refuse to run rather than silently dropping to UNsandboxed execution.

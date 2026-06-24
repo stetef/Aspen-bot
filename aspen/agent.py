@@ -91,6 +91,18 @@ class SdkSession:
         are honored by the CLI. See https://code.claude.com/docs/en/sandboxing."""
         if not config.SANDBOX_ENABLED:
             return None
+        # CAVEAT (verified 2026-06-24 on Claude Code CLI 2.1.190 + bubblewrap 0.4.0):
+        # in SDK/headless mode the CLI auto-approves Bash as "sandboxed" but does
+        # NOT actually confine it (writes outside allowWrite still succeed), and
+        # that auto-approval bypasses the can_use_tool allowlist backstop. So on
+        # this CLI, enabling the sandbox is a net regression. Re-verify enforcement
+        # on a newer CLI before trusting it.
+        log.warning(
+            "ASPEN_SANDBOX_ENABLED=true: the Bash sandbox was NOT enforced in "
+            "SDK/headless mode on CLI 2.1.190 (writes weren't confined and the "
+            "can_use_tool allowlist was bypassed). Re-verify on your CLI version "
+            "before relying on it; otherwise prefer ASPEN_BASH_ALLOWLIST alone."
+        )
         fs = {}
         if config.SANDBOX_WRITE_PATHS:
             fs["allowWrite"] = config.SANDBOX_WRITE_PATHS
