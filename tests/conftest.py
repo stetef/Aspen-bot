@@ -1,41 +1,92 @@
 """
-Shared test fixtures for the Aspen bot characterization suite.
+Shared test fixtures for the Aspen characterization suite.
 
-These tests lock in the *current* behavior of ``aspen-bot.py`` so the upcoming
-refactor (package split + backend abstraction) can be proven behavior-preserving.
-
-The module under test is loaded through an **import shim**: ``aspen-bot.py`` has a
-hyphen (not importable as ``aspen_bot``) and, at import time, reads several required
-environment variables and constructs an ``anthropic.Anthropic`` client and a
-``slack_bolt.App``. The shim sets dummy env, neutralizes ``load_dotenv`` and the
-Slack ``App`` (so importing touches no real config and makes no network call), then
-loads the file under the stable name ``aspen_legacy``.
-
-This indirection is deliberate: when the refactor lands, ONLY this file changes — it
-will bind the same names from the new ``aspen.*`` modules — and the test bodies stay
-identical. That is what "the refactor preserves the tests" means in practice.
+THE TEST SEAM. The Phase 1 suite was written against the flat ``aspen-bot.py``
+module. After the Phase 2 refactor the code lives in the ``aspen.*`` package, so
+this file is the *only* thing that changed: it exposes a ``sut`` facade that maps
+the old flat names onto the new modules, proxying both reads and writes (so
+``monkeypatch.setattr(sut, ...)`` reaches the module the code actually reads from).
+The test bodies are unchanged — that is what "the refactor preserves the tests" means.
 """
 
-import importlib.util
+import importlib
 import os
-import sys
 import threading
-from pathlib import Path
 
 import pytest
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent
-BOT_FILE = PROJECT_DIR / "aspen-bot.py"
+# Legacy flat name -> module that now owns it (attribute name is identical).
+_MODMAP = {
+    # config
+    "MODEL": "aspen.config",
+    "MAX_FILE_BYTES": "aspen.config",
+    "AGENT_INTERNAL_SECRET": "aspen.config",
+    "TOOL_SERVER_URL": "aspen.config",
+    "CALCULATIONS_ROOT": "aspen.config",
+    "FIGURE_ARCHIVE_DIR": "aspen.config",
+    "MAX_CONCURRENT": "aspen.config",
+    "CONTEXT_MAX_TURNS": "aspen.config",
+    "CONTEXT_EXPIRY": "aspen.config",
+    "RATE_LIMIT_REQUESTS": "aspen.config",
+    "RATE_LIMIT_WINDOW": "aspen.config",
+    "ALLOWED_USER_IDS": "aspen.config",
+    "anthropic_client": "aspen.config",
+    # prompts
+    "SYSTEM_PROMPT": "aspen.prompts",
+    # tools
+    "_safe_path": "aspen.tools",
+    "_list_directory": "aspen.tools",
+    "_read_file": "aspen.tools",
+    "_call_tool_server": "aspen.tools",
+    "TOOL_FNS": "aspen.tools",
+    "TOOLS": "aspen.tools",
+    "TOOL_SPECS": "aspen.tools",
+    "dispatch": "aspen.tools",
+    # sessions / history store
+    "_thread_key": "aspen.sessions",
+    "_get_history": "aspen.sessions",
+    "_append_history": "aspen.sessions",
+    "_histories": "aspen.sessions",
+    "MANAGER": "aspen.sessions",
+    # rate limiting
+    "_check_rate_limit": "aspen.ratelimit",
+    "_release_user": "aspen.ratelimit",
+    # global state
+    "_rate_data": "aspen.state",
+    "_user_active": "aspen.state",
+    "_global_sem": "aspen.state",
+    # figures
+    "_upload_figures": "aspen.figures",
+    # backends
+    "_run_agent": "aspen.backends.messages",
+    # slack front-end
+    "_handle_event": "aspen.slack_app",
+}
+
+
+class _Facade:
+    """Proxies legacy flat attribute access onto the refactored ``aspen.*`` modules."""
+
+    def __getattr__(self, name):
+        if name == "requests":
+            return importlib.import_module("requests")
+        modname = _MODMAP.get(name)
+        if modname is None:
+            raise AttributeError(name)
+        return getattr(importlib.import_module(modname), name)
+
+    def __setattr__(self, name, value):
+        modname = _MODMAP.get(name)
+        if modname is None:
+            raise AttributeError(name)
+        setattr(importlib.import_module(modname), name, value)
 
 
 def _neutralize_import_side_effects():
-    """Stop the module's import-time work from reading real config or hitting the network."""
-    # load_dotenv() at import would read the real .env from the project dir.
+    """Stop import-time work from reading real config or hitting the network."""
     import dotenv
     dotenv.load_dotenv = lambda *a, **k: None
 
-    # App(token=...) is constructed at import and decorators (@app.event) run at import.
-    # Replace it with a no-op that still supports the .event(...) decorator usage.
     import slack_bolt
 
     class _DummyApp:
@@ -51,7 +102,11 @@ def _neutralize_import_side_effects():
     slack_bolt.App = _DummyApp
 
 
-def _load_sut(calc_root: Path, workspace_root: Path):
+@pytest.fixture(scope="session")
+def sut(tmp_path_factory):
+    """Facade over the refactored ``aspen`` package (system under test)."""
+    calc_root = tmp_path_factory.mktemp("calculations")
+    workspace_root = tmp_path_factory.mktemp("workspace")
     os.environ.update(
         {
             "SLACK_BOT_TOKEN": "xoxb-test",
@@ -64,20 +119,10 @@ def _load_sut(calc_root: Path, workspace_root: Path):
         }
     )
     _neutralize_import_side_effects()
-
-    spec = importlib.util.spec_from_file_location("aspen_legacy", BOT_FILE)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["aspen_legacy"] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-@pytest.fixture(scope="session")
-def sut(tmp_path_factory):
-    """The loaded ``aspen-bot.py`` module (system under test)."""
-    calc_root = tmp_path_factory.mktemp("calculations")
-    workspace_root = tmp_path_factory.mktemp("workspace")
-    return _load_sut(calc_root, workspace_root)
+    # Importing the Slack front-end pulls in the whole package (config, tools, ...).
+    importlib.import_module("aspen.slack_app")
+    importlib.import_module("aspen.backends.messages")
+    return _Facade()
 
 
 @pytest.fixture(autouse=True)
@@ -86,9 +131,8 @@ def _reset_state(sut):
     sut._histories.clear()
     sut._rate_data.clear()
     sut._user_active.clear()
-    # Re-create the semaphore so concurrency tests start from a full count and never
-    # leak an acquired slot into the next test.
     sut._global_sem = threading.Semaphore(sut.MAX_CONCURRENT)
+    sut.MANAGER.clear()
     yield
 
 
