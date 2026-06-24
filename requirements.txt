@@ -5,3 +5,5 @@ fastapi>=0.111
 uvicorn>=0.29
 pyyaml>=6.0
 requests>=2.31
+# Only needed when ASPEN_BACKEND=sdk. Also requires the Claude Code CLI binary on PATH.
+claude-agent-sdk>=0.2
