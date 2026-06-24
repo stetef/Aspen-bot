@@ -53,6 +53,10 @@ MAX_FIGURE_BYTES      = int(os.getenv("MAX_FIGURE_BYTES", str(5 * 1024 * 1024)))
 FIGURE_ARCHIVE_MAX    = int(os.getenv("FIGURE_ARCHIVE_MAX_BYTES", str(2 * 1024 ** 3)))
 FIGURE_ARCHIVE_TRIM   = int(os.getenv("FIGURE_ARCHIVE_TRIM_BYTES", str(int(1.5 * 1024 ** 3))))
 EXECUTION_TIMEOUT     = int(os.getenv("EXECUTION_TIMEOUT_SECONDS", "120"))
+# Hard per-task memory cap for the analysis sandbox. Enforced via Apptainer's
+# --memory/--memory-swap (needs cgroups v2 delegation, rootless, or root). Set to
+# an empty string to disable the cap.
+APPTAINER_MEMORY_LIMIT = os.getenv("APPTAINER_MEMORY_LIMIT", "1G")
 
 for _d in [FIGURES_DIR, FIGURE_ARCHIVE_DIR, CACHE_DIR, LOGS_DIR,
            GENERATED_CODE_DIR, SQLITE_DB_ROOT]:
@@ -353,7 +357,8 @@ def run_in_apptainer(
     - clean environment (no secrets)
     - project directory mounted read-only
     - figures and cache directories mounted read-write
-    - 8 GB memory limit (enforced if cgroups v2 delegation is available)
+    - hard memory limit per task (APPTAINER_MEMORY_LIMIT, default 1 GB;
+      requires cgroups v2 delegation / rootless or root to be enforced)
     - EXECUTION_TIMEOUT second hard kill
 
     Returns dict with stdout, stderr, figures, status, duration_seconds.
@@ -364,6 +369,12 @@ def run_in_apptainer(
         "apptainer", "exec",
         "--cleanenv",
         "--net", "--network", "none",
+    ]
+    # Hard memory cap (cgroups). --memory-swap == --memory disables swap, so the
+    # cap can't be circumvented by swapping.
+    if APPTAINER_MEMORY_LIMIT:
+        cmd += ["--memory", APPTAINER_MEMORY_LIMIT, "--memory-swap", APPTAINER_MEMORY_LIMIT]
+    cmd += [
         # Project data: read-only
         "--bind", f"{project_path}:/projects/{project_name}:ro",
         # Workspace outputs: read-write
@@ -389,6 +400,11 @@ def run_in_apptainer(
         stdout = filter_secrets(proc.stdout)
         stderr = filter_secrets(proc.stderr)
         status = "success" if proc.returncode == 0 else "error"
+        # A SIGKILL (-9 / 137) with a memory cap set is almost always an OOM kill;
+        # surface a clear hint since cgroup OOM leaves little/no stderr.
+        if APPTAINER_MEMORY_LIMIT and proc.returncode in (-9, 137):
+            note = f"Process killed — likely exceeded the {APPTAINER_MEMORY_LIMIT} memory limit."
+            stderr = f"{stderr}\n{note}".strip() if stderr else note
 
     except subprocess.TimeoutExpired as exc:
         duration = time.monotonic() - t0
