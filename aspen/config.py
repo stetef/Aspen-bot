@@ -55,5 +55,9 @@ MAX_OPEN_SESSIONS     = int(os.getenv("MAX_OPEN_SESSIONS", "20"))
 # Path to the Claude Code CLI binary (used only by the SDK backend). Empty =
 # auto-discover "claude" on PATH; set it when PATH is minimal (e.g. systemd).
 CLAUDE_CLI_PATH       = os.getenv("CLAUDE_CLI_PATH", "")
+# SDK backend auth: when true, the CLI uses the Claude Code login (subscription)
+# by withholding ANTHROPIC_API_KEY from the CLI subprocess. Set false to let the
+# CLI use ANTHROPIC_API_KEY (API billing) instead. (Messages backend is unaffected.)
+ASPEN_SDK_USE_SUBSCRIPTION = os.getenv("ASPEN_SDK_USE_SUBSCRIPTION", "true").lower() in ("1", "true", "yes")
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)

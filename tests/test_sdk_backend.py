@@ -160,3 +160,18 @@ def test_cli_path_passed_only_when_set(sut, monkeypatch):
     # Explicit override -> forwarded to ClaudeAgentOptions.
     monkeypatch.setattr(config, "CLAUDE_CLI_PATH", "/home/u/.local/bin/claude")
     assert s._build_options(sdk).cli_path == "/home/u/.local/bin/claude"
+
+
+def test_subscription_auth_blanks_api_key_for_cli(sut, monkeypatch):
+    from aspen.backends.sdk import SdkSession
+    from aspen import config
+
+    s = SdkSession("C:1")
+
+    # Subscription mode (default): blank ANTHROPIC_API_KEY so the CLI uses the login.
+    monkeypatch.setattr(config, "ASPEN_SDK_USE_SUBSCRIPTION", True)
+    assert s._build_options(sdk).env == {"ANTHROPIC_API_KEY": ""}
+
+    # API-key mode: don't touch the subprocess env (CLI inherits ANTHROPIC_API_KEY).
+    monkeypatch.setattr(config, "ASPEN_SDK_USE_SUBSCRIPTION", False)
+    assert s._build_options(sdk).env == {}

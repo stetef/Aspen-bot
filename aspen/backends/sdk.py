@@ -17,6 +17,10 @@ web access via the CLI.
 
 ``claude-agent-sdk`` is imported lazily so the default ``messages`` backend never
 requires it (or the Claude Code CLI binary).
+
+Auth: by default (``ASPEN_SDK_USE_SUBSCRIPTION``) the CLI uses the Claude Code login
+(subscription) — the SDK subprocess is given a blank ``ANTHROPIC_API_KEY`` so the
+key in the environment (which the CLI would otherwise prefer) doesn't take over.
 """
 
 import asyncio
@@ -76,6 +80,10 @@ class SdkSession:
         )
         if config.CLAUDE_CLI_PATH:                 # else the SDK finds "claude" on PATH
             opts["cli_path"] = config.CLAUDE_CLI_PATH
+        if config.ASPEN_SDK_USE_SUBSCRIPTION:
+            # The CLI prefers ANTHROPIC_API_KEY over the Claude Code login; blank it
+            # for the subprocess so it authenticates via the subscription instead.
+            opts["env"] = {"ANTHROPIC_API_KEY": ""}
         return sdk.ClaudeAgentOptions(**opts)
 
     # --- lifecycle --------------------------------------------------------- #
