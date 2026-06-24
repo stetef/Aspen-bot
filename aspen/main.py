@@ -12,8 +12,8 @@ log = logging.getLogger("aspen")
 def main() -> None:
     sessions._ensure_loop()
     log.info(
-        "Starting Aspen  backend=%s  model=%s  calculations_root=%s",
-        config.ASPEN_BACKEND, config.MODEL, config.CALCULATIONS_ROOT,
+        "Starting Aspen (Claude Agent SDK)  model=%s  calculations_root=%s",
+        config.MODEL, config.CALCULATIONS_ROOT,
     )
     SocketModeHandler(slack_app.app, config.SLACK_APP_TOKEN).start()
 

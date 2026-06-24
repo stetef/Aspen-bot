@@ -1,18 +1,13 @@
 """
 Conversation sessions and the persistent agent event loop.
 
-This module owns two things:
-
-1. The per-thread conversation **history store** (``_histories`` + the
-   ``_thread_key`` / ``_get_history`` / ``_append_history`` helpers) — unchanged
-   in behavior from the original single file. The Messages backend reads/writes
-   history through these.
-
-2. The **session registry + persistent asyncio loop**. Slack's (sync) handlers
-   feed each user message into this async system via ``run_coroutine_threadsafe``;
-   the ``SessionManager`` keeps one ``AgentSession`` per conversation thread, which
-   runs a turn and then parks until the next message. Per-session locks serialize
-   turns in the same thread; idle / LRU eviction (``aclose``) bounds live sessions.
+The **session registry + persistent asyncio loop**. Slack's (sync) handlers feed
+each user message into this async system via ``run_coroutine_threadsafe``; the
+``SessionManager`` keeps one ``AgentSession`` per conversation thread, which runs a
+turn and then parks until the next message (the warm SDK client retains the
+conversation context). Per-session locks serialize turns in the same thread; idle /
+LRU eviction (``aclose``) bounds live sessions. ``_thread_key`` maps a Slack thread
+to its session.
 """
 
 import asyncio
@@ -27,37 +22,13 @@ log = logging.getLogger("aspen")
 
 
 # --------------------------------------------------------------------------- #
-# Conversation history store (behavior-preserving)
+# Thread key
 # --------------------------------------------------------------------------- #
-_history_lock = threading.Lock()
-_histories: dict[str, dict] = {}       # key → {"turns": [...], "last_ts": float}
-
-
 def _thread_key(event: dict) -> str:
+    # Conversation context itself is retained inside each warm SDK session; this
+    # key just maps a Slack thread to its session in the SessionManager.
     ts = event.get("thread_ts") or event.get("ts", "")
     return f"{event.get('channel', '')}:{ts}"
-
-
-def _get_history(key: str) -> list[dict]:
-    with _history_lock:
-        entry = _histories.get(key)
-        if not entry:
-            return []
-        if time.time() - entry["last_ts"] > config.CONTEXT_EXPIRY:
-            del _histories[key]
-            return []
-        return list(entry["turns"])
-
-
-def _append_history(key: str, user_msg: str, assistant_msg: str) -> None:
-    with _history_lock:
-        entry = _histories.setdefault(key, {"turns": [], "last_ts": 0.0})
-        entry["turns"].extend([
-            {"role": "user",      "content": user_msg},
-            {"role": "assistant", "content": assistant_msg},
-        ])
-        entry["turns"] = entry["turns"][-config.CONTEXT_MAX_TURNS:]
-        entry["last_ts"] = time.time()
 
 
 # --------------------------------------------------------------------------- #
@@ -109,7 +80,7 @@ class SessionManager:
         entry = self._entries.get(key)
         if entry is None:
             from .backends import make_session
-            entry = _Entry(make_session(config.ASPEN_BACKEND, key))
+            entry = _Entry(make_session(key))
             self._entries[key] = entry
         return entry
 

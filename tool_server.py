@@ -554,4 +554,6 @@ if __name__ == "__main__":
         "Starting Aspen tool server  projects=%s  workspace=%s",
         PROJECTS_ROOT, WORKSPACE_ROOT,
     )
-    uvicorn.run(app, host="127.0.0.1", port=8000, workers=1)
+    from urllib.parse import urlparse
+    _url = urlparse(os.getenv("TOOL_SERVER_URL", "http://127.0.0.1:27195"))
+    uvicorn.run(app, host=_url.hostname or "127.0.0.1", port=_url.port or 27195, workers=1)

@@ -2,14 +2,10 @@
 Backend-agnostic tools: read-only file browsing + the sandboxed-analysis bridge.
 
 ``TOOL_SPECS`` is the single source of truth (name / description / input_schema /
-impl). From it we derive:
-  - ``TOOLS``     — the JSON tool list for the Messages API
-  - ``TOOL_FNS``  — name → impl(input, context) -> (text, figures)
-  - ``dispatch()``— calls an impl, drains its figures into the per-turn sink
-                    (``context["figures"]``) and returns the text only.
-
-The figure-sink seam lives entirely in ``dispatch``; the impls keep their original
-``(text, figures)`` return shape, so both backends share them unchanged.
+impl). From it we derive ``TOOL_FNS`` (name → impl(input, context) -> (text,
+figures)). ``dispatch()`` calls an impl, drains its figures into the per-turn sink
+(``context["figures"]``) and returns the text only. The SDK backend wraps these
+specs as ``@tool`` handlers; the figure-sink seam lives entirely in ``dispatch``.
 """
 
 import logging
@@ -226,12 +222,6 @@ TOOL_SPECS = [
         },
         "impl": _call_tool_server,
     },
-]
-
-# The Messages API tool list (identical shape to the original TOOLS constant).
-TOOLS = [
-    {"name": s["name"], "description": s["description"], "input_schema": s["input_schema"]}
-    for s in TOOL_SPECS
 ]
 
 # name → impl(input, context) -> (text, figures)

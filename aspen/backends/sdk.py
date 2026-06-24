@@ -11,9 +11,9 @@ Tools are the shared impls wrapped as ``@tool`` and bundled with
 ``create_sdk_mcp_server`` (surfaced as ``mcp__aspen__*``). The agent is locked to
 ONLY those tools: ``allowed_tools`` auto-approves them and a ``can_use_tool``
 callback denies everything else (any name not ``mcp__aspen__*`` — robust across CLI
-versions, unlike a static built-in denylist). So the SDK agent has exactly the
-read-only + sandbox-only surface of the Messages backend and never gains Bash/file/
-web access via the CLI.
+versions, unlike a static built-in denylist). So the agent is confined to the
+read-only browsing + sandboxed-analysis surface and never gains Bash/file/web
+access via the CLI.
 
 ``claude-agent-sdk`` is imported lazily so the default ``messages`` backend never
 requires it (or the Claude Code CLI binary).

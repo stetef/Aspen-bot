@@ -13,8 +13,12 @@ import pytest
 
 @pytest.fixture
 def no_op_agent(sut, monkeypatch):
-    """Replace the agent loop with a fast stub returning a fixed reply, no figures."""
-    monkeypatch.setattr(sut, "_run_agent", lambda msg, hist, ctx: ("reply!", []))
+    """Stub the session turn so admission tests stay hermetic (no real SDK)."""
+
+    async def _fake_handle(key, user_message, context):
+        return "reply!", []
+
+    monkeypatch.setattr(sut.MANAGER, "handle", _fake_handle)
 
 
 def _event(user, text, channel="C", ts="1.0"):

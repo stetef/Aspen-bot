@@ -4,8 +4,7 @@ Slack Socket Mode front-end.
 Sync Bolt handlers do the admission gates (allowlist → per-user rate limit →
 global concurrency semaphore), then feed the user message into the async session
 system via ``run_coroutine_threadsafe`` on the persistent loop and block for the
-reply. The agent backend is selected by ``config.ASPEN_BACKEND`` inside the
-SessionManager.
+reply. The SessionManager runs the turn on a warm Claude Agent SDK session.
 """
 
 import asyncio

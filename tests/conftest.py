@@ -25,12 +25,10 @@ _MODMAP = {
     "CALCULATIONS_ROOT": "aspen.config",
     "FIGURE_ARCHIVE_DIR": "aspen.config",
     "MAX_CONCURRENT": "aspen.config",
-    "CONTEXT_MAX_TURNS": "aspen.config",
     "CONTEXT_EXPIRY": "aspen.config",
     "RATE_LIMIT_REQUESTS": "aspen.config",
     "RATE_LIMIT_WINDOW": "aspen.config",
     "ALLOWED_USER_IDS": "aspen.config",
-    "anthropic_client": "aspen.config",
     # prompts
     "SYSTEM_PROMPT": "aspen.prompts",
     # tools
@@ -39,14 +37,10 @@ _MODMAP = {
     "_read_file": "aspen.tools",
     "_call_tool_server": "aspen.tools",
     "TOOL_FNS": "aspen.tools",
-    "TOOLS": "aspen.tools",
     "TOOL_SPECS": "aspen.tools",
     "dispatch": "aspen.tools",
-    # sessions / history store
+    # sessions
     "_thread_key": "aspen.sessions",
-    "_get_history": "aspen.sessions",
-    "_append_history": "aspen.sessions",
-    "_histories": "aspen.sessions",
     "MANAGER": "aspen.sessions",
     # rate limiting
     "_check_rate_limit": "aspen.ratelimit",
@@ -57,8 +51,6 @@ _MODMAP = {
     "_global_sem": "aspen.state",
     # figures
     "_upload_figures": "aspen.figures",
-    # backends
-    "_run_agent": "aspen.backends.messages",
     # slack front-end
     "_handle_event": "aspen.slack_app",
 }
@@ -121,14 +113,12 @@ def sut(tmp_path_factory):
     _neutralize_import_side_effects()
     # Importing the Slack front-end pulls in the whole package (config, tools, ...).
     importlib.import_module("aspen.slack_app")
-    importlib.import_module("aspen.backends.messages")
     return _Facade()
 
 
 @pytest.fixture(autouse=True)
 def _reset_state(sut):
     """Reset all in-memory module state before each test for isolation."""
-    sut._histories.clear()
     sut._rate_data.clear()
     sut._user_active.clear()
     sut._global_sem = threading.Semaphore(sut.MAX_CONCURRENT)

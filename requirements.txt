@@ -1,9 +1,8 @@
 slack-bolt>=1.21
-anthropic>=0.34
 python-dotenv>=1.0
 fastapi>=0.111
 uvicorn>=0.29
 pyyaml>=6.0
 requests>=2.31
-# Only needed when ASPEN_BACKEND=sdk. Also requires the Claude Code CLI binary on PATH.
+# The agent backend. Also requires the Claude Code CLI binary on PATH.
 claude-agent-sdk>=0.2
