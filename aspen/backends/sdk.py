@@ -72,7 +72,7 @@ class SdkSession:
             name=_SERVER, version="1.0.0", tools=self._make_tools(sdk)
         )
         allowed = [f"{_TOOL_PREFIX}{s['name']}" for s in tools.TOOL_SPECS]
-        return sdk.ClaudeAgentOptions(
+        opts = dict(
             system_prompt=prompts.SYSTEM_PROMPT,   # plain string -> replaces (no preset)
             model=config.MODEL,
             mcp_servers={_SERVER: server},
@@ -81,6 +81,9 @@ class SdkSession:
             can_use_tool=self._can_use_tool,       # definitive lockdown
             max_turns=config.AGENT_MAX_ROUNDS,
         )
+        if config.CLAUDE_CLI_PATH:                 # else the SDK finds "claude" on PATH
+            opts["cli_path"] = config.CLAUDE_CLI_PATH
+        return sdk.ClaudeAgentOptions(**opts)
 
     # --- lifecycle --------------------------------------------------------- #
     async def _ensure(self):

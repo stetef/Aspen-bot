@@ -146,3 +146,18 @@ def test_build_options_locks_down_tools(sut):
     assert opts.max_turns == config.AGENT_MAX_ROUNDS
     assert opts.system_prompt == prompts.SYSTEM_PROMPT
     assert opts.model == config.MODEL
+
+
+def test_cli_path_passed_only_when_set(sut, monkeypatch):
+    from aspen.backends.sdk import SdkSession
+    from aspen import config
+
+    s = SdkSession("C:1")
+
+    # Default (empty) -> rely on PATH discovery; cli_path stays unset (None).
+    monkeypatch.setattr(config, "CLAUDE_CLI_PATH", "")
+    assert s._build_options(sdk).cli_path is None
+
+    # Explicit override -> forwarded to ClaudeAgentOptions.
+    monkeypatch.setattr(config, "CLAUDE_CLI_PATH", "/home/u/.local/bin/claude")
+    assert s._build_options(sdk).cli_path == "/home/u/.local/bin/claude"

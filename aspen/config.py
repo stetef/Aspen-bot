@@ -52,5 +52,8 @@ AGENT_MAX_ROUNDS      = int(os.getenv("AGENT_MAX_ROUNDS", "10"))
 # Upper bound on concurrently parked conversation sessions (bounds warm SDK
 # subprocesses in Phase 3; harmless for the Messages backend).
 MAX_OPEN_SESSIONS     = int(os.getenv("MAX_OPEN_SESSIONS", "20"))
+# Path to the Claude Code CLI binary (used only by the SDK backend). Empty =
+# auto-discover "claude" on PATH; set it when PATH is minimal (e.g. systemd).
+CLAUDE_CLI_PATH       = os.getenv("CLAUDE_CLI_PATH", "")
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
