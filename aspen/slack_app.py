@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from slack_bolt import App
 
-from . import config, figures, ratelimit, sessions, state
+from . import attachments, config, ratelimit, render, sessions, state
 
 log = logging.getLogger("aspen")
 
@@ -65,22 +65,24 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
         say(text="_Thinking…_", thread_ts=thread_ts)
 
         key     = sessions._thread_key(event)
-        context = {"user_id": uid, "username": "", "thread_ts": thread_ts or "", "figures": []}
+        context = {"user_id": uid, "username": "", "thread_ts": thread_ts or "", "attachments": []}
 
         try:
             loop = sessions._ensure_loop()
             fut = asyncio.run_coroutine_threadsafe(
                 sessions.MANAGER.handle(key, user_message, context), loop
             )
-            reply, figs = fut.result(timeout=_TURN_TIMEOUT)
+            reply, atts = fut.result(timeout=_TURN_TIMEOUT)
         except Exception:
             log.exception("Unexpected error for user %s", uid)
-            reply, figs = "Sorry, something went wrong on my end. Please try again.", []
+            reply, atts = "Sorry, something went wrong on my end. Please try again.", []
 
-        say(text=reply, thread_ts=thread_ts)
+        # Slack's text field speaks mrkdwn, not the GFM the agent emits; send the
+        # reply through a markdown block so Slack renders it (render.slack_reply).
+        say(thread_ts=thread_ts, **render.slack_reply(reply))
 
-        if figs:
-            figures._upload_figures(figs, client, channel, thread_ts)
+        if atts:
+            attachments._upload_attachments(atts, client, channel, thread_ts)
 
     finally:
         ratelimit._release_user(uid)
