@@ -28,13 +28,11 @@ source venv/bin/activate
 # RHEL 8) and extracts just the binary into ~/.local/bin — no root required.
 # `bubblewrap` must already be installed by the system.
 #
-# CAVEAT (verified on Claude Code 2.1.190 + bubblewrap 0.4.0, 2026-06-24): the OS
-# sandbox is NOT actually enforced in the SDK/headless mode Aspen runs in. Bash
-# commands get auto-approved as "sandboxed" but are not confined (writes outside
-# the allow-list still succeed), AND auto-approval bypasses the can_use_tool
-# allow-list backstop. So enabling the sandbox on this CLI is a net regression —
-# keep ASPEN_SANDBOX_ENABLED=false and rely on ASPEN_BASH_ALLOWLIST. This
-# bootstrap exists so the dependency is ready to re-test on a future CLI.
+# Verified enforcing 2026-06-24 (Claude Code 2.1.190 + bubblewrap 0.4.0): writes
+# outside the allow-list are blocked. The sandbox is disabled only when the bot is
+# launched *nested* inside another Claude Code session — start.sh runs it as a
+# normal top-level process, so that's fine. Verify anytime: ./verify_sandbox.sh
+# from a plain shell.
 # ---------------------------------------------------------------------------
 ensure_socat() {
     command -v socat >/dev/null 2>&1 && { echo "socat already present: $(command -v socat)"; return 0; }

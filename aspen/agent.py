@@ -91,18 +91,13 @@ class SdkSession:
         are honored by the CLI. See https://code.claude.com/docs/en/sandboxing."""
         if not config.SANDBOX_ENABLED:
             return None
-        # CAVEAT (verified 2026-06-24 on Claude Code CLI 2.1.190 + bubblewrap 0.4.0):
-        # in SDK/headless mode the CLI auto-approves Bash as "sandboxed" but does
-        # NOT actually confine it (writes outside allowWrite still succeed), and
-        # that auto-approval bypasses the can_use_tool allowlist backstop. So on
-        # this CLI, enabling the sandbox is a net regression. Re-verify enforcement
-        # on a newer CLI before trusting it.
-        log.warning(
-            "ASPEN_SANDBOX_ENABLED=true: the Bash sandbox was NOT enforced in "
-            "SDK/headless mode on CLI 2.1.190 (writes weren't confined and the "
-            "can_use_tool allowlist was bypassed). Re-verify on your CLI version "
-            "before relying on it; otherwise prefer ASPEN_BASH_ALLOWLIST alone."
-        )
+        # Verified enforcing 2026-06-24 (CLI 2.1.190 + bubblewrap 0.4.0): writes
+        # outside allowWrite are blocked ("Read-only file system"). One gotcha —
+        # Claude Code suppresses its Bash sandbox when it detects it is running
+        # *nested* inside another Claude Code session (CLAUDECODE / CLAUDE_CODE_*
+        # in the environment). The bot launched normally via start.sh is a
+        # top-level process, so it sandboxes; just don't launch it from inside a
+        # Claude session. Re-check with ./verify_sandbox.sh from a plain shell.
         fs = {}
         if config.SANDBOX_WRITE_PATHS:
             fs["allowWrite"] = config.SANDBOX_WRITE_PATHS
