@@ -63,7 +63,9 @@ fi
 # $ANALYSIS_VENV — default $WORKSPACE_ROOT/analysis-venv, overridable via .env.
 # We export ANALYSIS_PYTHON so the tool server uses exactly this interpreter.
 # ---------------------------------------------------------------------------
-read_env() { grep -E "^[[:space:]]*$1[[:space:]]*=" .env | tail -1 | cut -d= -f2- | xargs; }
+# Read a KEY=value from .env (last wins). Tolerates a missing key: the `|| true`
+# keeps grep's no-match exit from tripping `set -o pipefail` + `set -e`.
+read_env() { { grep -E "^[[:space:]]*$1[[:space:]]*=" .env || true; } | tail -1 | cut -d= -f2- | xargs; }
 WORKSPACE_ROOT_VAL="$(read_env WORKSPACE_ROOT)"
 ANALYSIS_VENV="$(read_env ANALYSIS_VENV)"
 ANALYSIS_VENV="${ANALYSIS_VENV:-${WORKSPACE_ROOT_VAL:-$SCRIPT_DIR/aspen-workspace}/analysis-venv}"
@@ -75,10 +77,20 @@ ensure_analysis_venv() {
         return 0
     fi
     echo "Building analysis venv at $ANALYSIS_VENV ..."
-    python -m venv "$ANALYSIS_VENV" \
-        && "$ANALYSIS_VENV/bin/pip" install -q --upgrade pip \
-        && "$ANALYSIS_VENV/bin/pip" install -q -r analysis-requirements.txt \
-        && echo "Analysis venv ready ($("$ANALYSIS_VENV/bin/python" --version))"
+    # Prefer uv (matches how the bot venv was created; far faster, shared cache).
+    # Fall back to stdlib venv + pip where uv isn't installed. Resolve uv even when
+    # it lives in ~/.local/bin and that dir isn't on PATH yet.
+    local uv_bin; uv_bin="$(command -v uv || echo "$HOME/.local/bin/uv")"
+    if [[ -x "$uv_bin" ]]; then
+        "$uv_bin" venv --python 3.11 "$ANALYSIS_VENV" \
+            && "$uv_bin" pip install --python "$ANALYSIS_VENV/bin/python" -q -r analysis-requirements.txt \
+            && echo "Analysis venv ready via uv ($("$ANALYSIS_VENV/bin/python" --version))"
+    else
+        python -m venv "$ANALYSIS_VENV" \
+            && "$ANALYSIS_VENV/bin/pip" install -q --upgrade pip \
+            && "$ANALYSIS_VENV/bin/pip" install -q -r analysis-requirements.txt \
+            && echo "Analysis venv ready via venv+pip ($("$ANALYSIS_VENV/bin/python" --version))"
+    fi
 }
 
 if ! ensure_analysis_venv; then
