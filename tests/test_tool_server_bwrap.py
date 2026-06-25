@@ -116,3 +116,16 @@ def test_sandbox_env_is_scrubbed(ts):
     assert "SLACK_BOT_TOKEN" not in ts.SANDBOX_ENV
     assert ts.SANDBOX_ENV["MPLBACKEND"] == "Agg"
     assert ts.SANDBOX_ENV["PATH"] == "/usr/bin:/bin"
+
+
+def test_mplconfigdir_is_in_hook_writable_area(ts):
+    # matplotlib's cache must land where the import hook permits writes
+    # (figures/ or cache/), else its font cache write is denied at import.
+    assert ts.SANDBOX_ENV["MPLCONFIGDIR"].startswith(
+        ("/aspen_workspace/figures/", "/aspen_workspace/cache/")
+    )
+
+
+def test_fontconfig_dir_bound_read_only(ts):
+    cmd = _build(ts)
+    assert _adjacent(cmd, "--ro-bind-try", "/etc/fonts", "/etc/fonts")

@@ -89,7 +89,10 @@ SANDBOX_ENV = {
     "PATH": "/usr/bin:/bin",
     "HOME": "/tmp",
     "TMPDIR": "/tmp",
-    "MPLCONFIGDIR": "/tmp/mpl",   # matplotlib needs a writable config dir
+    # matplotlib's font cache must go somewhere the import hook permits writing
+    # (figures/ or cache/), not /tmp — and cache/ persists across runs, so the
+    # font list is built once instead of every invocation.
+    "MPLCONFIGDIR": "/aspen_workspace/cache/mpl",
     "MPLBACKEND": "Agg",          # headless plotting
     "PYTHONDONTWRITEBYTECODE": "1",
     "PYTHONUNBUFFERED": "1",
@@ -490,8 +493,10 @@ def build_sandbox_cmd(script_path: Path, project_name: str, project_path: Path) 
     # rather than fatal. No /home, no /etc secrets, no other projects.
     for p in ANALYSIS_RO_PATHS:
         bwrap += ["--ro-bind-try", p, p]
-    # Dynamic-loader config so compiled deps (libgfortran, libgomp, ...) resolve.
-    for p in ("/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d"):
+    # Dynamic-loader config so compiled deps (libgfortran, libgomp, ...) resolve,
+    # plus fontconfig config so matplotlib finds system fonts (and stops warning
+    # "Cannot load default config file"); the fonts themselves live under /usr.
+    for p in ("/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/fonts"):
         bwrap += ["--ro-bind-try", p, p]
     # The analysis interpreter's venv + base CPython prefixes.
     for p in _python_bind_paths():
