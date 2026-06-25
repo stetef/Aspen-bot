@@ -150,6 +150,28 @@ def test_write_metadata_overwrites_existing(sut):
     assert (proj / "metadata.md").read_text() == "new contents"
 
 
+def test_write_metadata_backs_up_clobbered_version(sut):
+    """An overwrite snapshots the PRIOR content to the workspace history dir, so a
+    careless full-file replace is recoverable."""
+    proj = sut.CALCULATIONS_ROOT / "proj_hist"
+    proj.mkdir()
+    (proj / "metadata.md").write_text("important notes")
+    sut._write_metadata("proj_hist", "oops, replaced everything")
+
+    hist_dir = sut.WORKSPACE_ROOT / "metadata_history" / "proj_hist"
+    backups = list(hist_dir.glob("*.md"))
+    assert len(backups) == 1
+    assert backups[0].read_text() == "important notes"   # the clobbered version
+
+
+def test_write_metadata_create_does_not_back_up(sut):
+    """Creating a new metadata.md has nothing to clobber, so no backup is made."""
+    proj = sut.CALCULATIONS_ROOT / "proj_new"
+    proj.mkdir()
+    sut._write_metadata("proj_new", "# fresh\n")
+    assert not (sut.WORKSPACE_ROOT / "metadata_history" / "proj_new").exists()
+
+
 def test_write_metadata_rejects_missing_project(sut):
     out = sut._write_metadata("ghost_proj", "x")
     assert "does not exist" in out

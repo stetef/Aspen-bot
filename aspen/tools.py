@@ -13,6 +13,8 @@ in ``dispatch``.
 
 import logging
 import os
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -101,6 +103,25 @@ def _attach_file(rel: str) -> tuple[str, list[str]]:
     return f"Attached '{rel}' — it will be uploaded with the reply.", [str(path)]
 
 
+def _backup_metadata(target: Path, project: str) -> None:
+    """Snapshot the current metadata.md before it is overwritten, so a careless
+    whole-file replace is recoverable. Best-effort — a backup failure never blocks
+    the write. History lives under the workspace (writable), one timestamped copy
+    per overwrite: ``<workspace>/metadata_history/<project>/<UTC>.md``."""
+    try:
+        hist_dir = config.WORKSPACE_ROOT / "metadata_history" / project
+        hist_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest = hist_dir / f"{ts}.md"
+        n = 1
+        while dest.exists():            # multiple overwrites within the same second
+            dest = hist_dir / f"{ts}-{n}.md"
+            n += 1
+        shutil.copy2(target, dest)
+    except Exception:
+        log.exception("metadata backup failed (non-fatal) for project %s", project)
+
+
 def _write_metadata(project: str, content: str) -> str:
     """Overwrite ``<calculations-root>/<project>/metadata.md`` with ``content``.
 
@@ -142,6 +163,8 @@ def _write_metadata(project: str, content: str) -> str:
         )
 
     existed = target.exists()
+    if existed:
+        _backup_metadata(target, project)   # snapshot the version we're about to clobber
     try:
         # Atomic replace so an interrupted write can't leave a half-written file.
         tmp = target.with_suffix(".md.tmp")
