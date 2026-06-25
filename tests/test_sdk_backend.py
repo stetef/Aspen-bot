@@ -229,17 +229,23 @@ def test_sandbox_default_excludes_slurm_clients(sut):
 def test_default_bash_allowlist_is_readonly(sut):
     from aspen import config
 
-    # The investigation commands the user asked for are present...
-    for rule in ("Bash(squeue:*)", "Bash(sacct:*)", "Bash(sinfo:*)", "Bash(grep:*)"):
+    # The Slurm investigation commands are present...
+    for rule in ("Bash(squeue:*)", "Bash(sacct:*)", "Bash(sinfo:*)",
+                 "Bash(sstat:*)", "Bash(sprio:*)"):
         assert rule in config.BASH_ALLOWLIST
     # ...scontrol is restricted to the read-only 'show' subcommand (no bare scontrol,
     # which could update/requeue jobs).
     assert "Bash(scontrol show:*)" in config.BASH_ALLOWLIST
     assert "Bash(scontrol:*)" not in config.BASH_ALLOWLIST
-    # find/awk/sed are excluded on purpose — their flags can write/execute and the
-    # prefix match can't see that.
+    # SECURITY: the default is Slurm-ONLY. General file-readers must NOT be in the
+    # default — with the OS sandbox off, Bash runs as the bot's Unix user with no
+    # path restriction, so cat/grep/head/tail/ls/wc/sort/uniq would let an
+    # allowlisted user read any file it can (SSH keys, .env, ~/.claude). find/awk/sed
+    # are excluded too (their flags can write/execute, unseen by the prefix match).
     cmds = " ".join(config.BASH_ALLOWLIST)
-    assert "find" not in cmds and "awk" not in cmds and "sed" not in cmds
+    for forbidden in ("cat", "grep", "head", "tail", "ls", "wc", "sort", "uniq",
+                      "find", "awk", "sed"):
+        assert forbidden not in cmds, f"{forbidden!r} must not be in the default allowlist"
 
 
 def test_bash_allowlist_override_flows_into_allowed_tools(sut, monkeypatch):

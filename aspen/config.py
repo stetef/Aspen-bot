@@ -59,19 +59,26 @@ CLAUDE_CLI_PATH       = os.getenv("CLAUDE_CLI_PATH", "")
 # use ANTHROPIC_API_KEY (API billing) instead.
 ASPEN_SDK_USE_SUBSCRIPTION = os.getenv("ASPEN_SDK_USE_SUBSCRIPTION", "true").lower() in ("1", "true", "yes")
 
-# Built-in Bash tool allowlist (HPC job investigation: squeue, sacct, grep, ...).
+# Built-in Bash tool allowlist (HPC job investigation: squeue, sacct, ...).
 # The SDK backend exposes Claude Code's *built-in* Bash tool, but only for the
 # command patterns listed here. Entries are Claude Code permission rules — the
 # "Bash(cmd:*)" form is a prefix match. The CLI's bash parser checks every
 # sub-command of a pipeline and refuses to auto-approve command substitution, so
-# "squeue | grep R" needs both squeue and grep allowlisted, and "squeue $(...)"
-# never auto-approves — matching commands run without prompting and everything
-# else is denied by the can_use_tool lockdown in agent.py.
+# a pipeline needs every command in it allowlisted and "squeue $(...)" never
+# auto-approves — matching commands run without prompting and everything else is
+# denied by the can_use_tool lockdown in agent.py.
 #
-# Defaults are read-only. Note: find (-exec/-delete), awk (system()), and sed
-# (w/e) are intentionally EXCLUDED — their flags can write files or run arbitrary
-# commands, which the prefix match cannot see. Only add such commands if you
-# accept that they escape the read-only intent.
+# SECURITY: the default is Slurm-ONLY. General text utilities (cat/head/tail/ls/
+# grep/wc/sort/uniq) are deliberately NOT in the default. With the OS Bash sandbox
+# off (SANDBOX_ENABLED=false, the default) the Bash tool runs as the bot's own
+# Unix user with no path restriction, so any allowlisted user could have the agent
+# read ANY file that user can — SSH private keys, this repo's .env (Slack tokens +
+# AGENT_INTERNAL_SECRET), ~/.claude credentials. Calculations-root files stay
+# available through the path-scoped read_file tool instead. Excluded for the same
+# can't-see-the-flags reason: find (-exec/-delete), awk (system()), sed (w/e).
+# Only widen this if you enable the OS sandbox with denyRead on the secret paths
+# (ASPEN_SANDBOX_DENY_READ_PATHS), or you accept those commands running unconfined
+# as the bot user.
 _DEFAULT_BASH_ALLOWLIST = [
     "Bash(squeue:*)",         # job queue
     "Bash(sacct:*)",          # job accounting / history
@@ -79,14 +86,6 @@ _DEFAULT_BASH_ALLOWLIST = [
     "Bash(sstat:*)",          # running-job stats
     "Bash(sprio:*)",          # job priorities
     "Bash(scontrol show:*)",  # read-only job/node detail (not bare scontrol)
-    "Bash(grep:*)",           # filter output (e.g. squeue | grep)
-    "Bash(ls:*)",
-    "Bash(cat:*)",
-    "Bash(head:*)",
-    "Bash(tail:*)",
-    "Bash(wc:*)",
-    "Bash(sort:*)",
-    "Bash(uniq:*)",
 ]
 BASH_ALLOWLIST = [
     p.strip()
