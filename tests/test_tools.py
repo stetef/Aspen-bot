@@ -132,6 +132,74 @@ def test_attach_file_drains_into_attachment_sink(sut):
 
 
 # --------------------------------------------------------------------------- #
+# _write_metadata
+# --------------------------------------------------------------------------- #
+def test_write_metadata_creates_in_existing_project(sut):
+    (sut.CALCULATIONS_ROOT / "proj_a").mkdir()
+    out = sut._write_metadata("proj_a", "# notes\nhello\n")
+    assert out.startswith("Created proj_a/metadata.md")
+    assert (sut.CALCULATIONS_ROOT / "proj_a" / "metadata.md").read_text() == "# notes\nhello\n"
+
+
+def test_write_metadata_overwrites_existing(sut):
+    proj = sut.CALCULATIONS_ROOT / "proj_b"
+    proj.mkdir()
+    (proj / "metadata.md").write_text("old")
+    out = sut._write_metadata("proj_b", "new contents")
+    assert out.startswith("Updated proj_b/metadata.md")
+    assert (proj / "metadata.md").read_text() == "new contents"
+
+
+def test_write_metadata_rejects_missing_project(sut):
+    out = sut._write_metadata("ghost_proj", "x")
+    assert "does not exist" in out
+    assert not (sut.CALCULATIONS_ROOT / "ghost_proj").exists()
+
+
+def test_write_metadata_rejects_nested_project_path(sut):
+    (sut.CALCULATIONS_ROOT / "proj_c").mkdir()
+    out = sut._write_metadata("proj_c/sub", "x")
+    assert "not a valid project name" in out
+
+
+def test_write_metadata_rejects_parent_traversal(sut):
+    out = sut._write_metadata("..", "x")
+    assert "not a valid project name" in out
+
+
+def test_write_metadata_rejects_absolute_project(sut):
+    out = sut._write_metadata("/etc", "x")
+    assert "not a valid project name" in out
+
+
+def test_write_metadata_does_not_write_other_files(sut):
+    """A project dir becomes writable for metadata.md only — not its data files."""
+    proj = sut.CALCULATIONS_ROOT / "proj_d"
+    proj.mkdir()
+    (proj / "results.dat").write_text("precious")
+    sut._write_metadata("proj_d", "meta")
+    # the only file the tool created is metadata.md; results.dat is untouched
+    assert (proj / "results.dat").read_text() == "precious"
+    assert (proj / "metadata.md").exists()
+
+
+def test_write_metadata_rejects_oversized_content(sut, monkeypatch):
+    monkeypatch.setattr(sut, "MAX_FILE_BYTES", 5)
+    (sut.CALCULATIONS_ROOT / "proj_e").mkdir()
+    out = sut._write_metadata("proj_e", "way too long")
+    assert "over the" in out and "metadata limit" in out
+    assert not (sut.CALCULATIONS_ROOT / "proj_e" / "metadata.md").exists()
+
+
+def test_write_metadata_dispatch_returns_text_no_attachments(sut):
+    (sut.CALCULATIONS_ROOT / "proj_f").mkdir()
+    ctx = {"attachments": []}
+    text = sut.dispatch("write_metadata", {"project": "proj_f", "content": "hi"}, ctx)
+    assert text.startswith("Created proj_f/metadata.md")
+    assert ctx["attachments"] == []
+
+
+# --------------------------------------------------------------------------- #
 # _call_tool_server
 # --------------------------------------------------------------------------- #
 def _ctx():

@@ -101,6 +101,61 @@ def _attach_file(rel: str) -> tuple[str, list[str]]:
     return f"Attached '{rel}' — it will be uploaded with the reply.", [str(path)]
 
 
+def _write_metadata(project: str, content: str) -> str:
+    """Overwrite ``<calculations-root>/<project>/metadata.md`` with ``content``.
+
+    This is the agent's *only* write surface. It is deliberately narrow: the
+    target is always the literal file ``metadata.md`` directly inside an existing
+    top-level project directory under the calculations root — never any other
+    file, never a nested path, never a directory we'd have to create. The project
+    directory must already exist (so the agent can record metadata for any current
+    or future project without this tool ever being able to mint new directories or
+    touch calculation data). Everything else under the calculations root stays
+    read-only.
+    """
+    # Reject path tricks early: the project name must be a single component, so a
+    # caller can't smuggle in '..', a nested 'a/b', or an absolute path.
+    if not project or "/" in project or "\\" in project or project in (".", ".."):
+        return f"Error: '{project}' is not a valid project name (use a single project directory name)."
+
+    try:
+        target = (config.CALCULATIONS_ROOT / project / "metadata.md").resolve()
+        target.relative_to(config.CALCULATIONS_ROOT)  # raises if it escapes the root
+    except (ValueError, OSError):
+        return f"Error: '{project}' resolves outside the calculations root."
+
+    # Enforce shape: <root>/<project>/metadata.md and nothing deeper.
+    if target.name != "metadata.md" or target.parent.parent != config.CALCULATIONS_ROOT:
+        return f"Error: refusing to write outside a top-level project's metadata.md (got '{project}')."
+
+    if not target.parent.is_dir():
+        return (
+            f"Error: project '{project}' does not exist under the calculations root. "
+            "metadata.md can only be written inside an existing project directory."
+        )
+
+    data = content.encode("utf-8")
+    if len(data) > config.MAX_FILE_BYTES:
+        return (
+            f"Error: content is {len(data)} bytes, over the "
+            f"{config.MAX_FILE_BYTES}-byte metadata limit. Keep metadata.md concise."
+        )
+
+    existed = target.exists()
+    try:
+        # Atomic replace so an interrupted write can't leave a half-written file.
+        tmp = target.with_suffix(".md.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp, target)
+    except OSError as exc:
+        return f"Error: could not write '{project}/metadata.md': {exc}."
+
+    verb = "Updated" if existed else "Created"
+    rel = target.relative_to(config.CALCULATIONS_ROOT)
+    return f"{verb} {rel} ({len(data)} bytes)."
+
+
 def _call_tool_server(inp: dict, context: dict) -> tuple[str, list[str]]:
     """
     POST to the FastAPI tool server for run_python_analysis.
@@ -232,6 +287,38 @@ TOOL_SPECS = [
             "required": ["path"],
         },
         "impl": lambda inp, _ctx: _attach_file(inp["path"]),
+    },
+    {
+        "name": "write_metadata",
+        "description": (
+            "Create or overwrite the metadata.md file in a project's top-level "
+            "directory under the calculations root. This is your ONLY way to write "
+            "files — it can touch nothing but each project's metadata.md, and all "
+            "other calculation data stays read-only. Use it to record or update a "
+            "project's metadata (e.g. notes, status, the list of Python libraries "
+            "available for analysis). The write replaces the whole file, so read the "
+            "current metadata.md first (read_file) and pass the complete new contents. "
+            "The project directory must already exist; this cannot create new projects."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": (
+                        "Name of the top-level project directory under the "
+                        "calculations root (e.g. 'thermolysin'). A single directory "
+                        "name, not a path."
+                    ),
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Full Markdown contents to write to that project's metadata.md.",
+                },
+            },
+            "required": ["project", "content"],
+        },
+        "impl": lambda inp, _ctx: (_write_metadata(inp["project"], inp["content"]), []),
     },
     {
         "name": "run_python_analysis",

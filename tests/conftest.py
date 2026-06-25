@@ -37,6 +37,7 @@ _MODMAP = {
     "_safe_path": "aspen.tools",
     "_list_directory": "aspen.tools",
     "_read_file": "aspen.tools",
+    "_write_metadata": "aspen.tools",
     "_call_tool_server": "aspen.tools",
     "_attach_file": "aspen.tools",
     "TOOL_FNS": "aspen.tools",
