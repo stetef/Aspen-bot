@@ -87,6 +87,51 @@ def test_read_file_outside_root(sut):
 
 
 # --------------------------------------------------------------------------- #
+# _attach_file
+# --------------------------------------------------------------------------- #
+def test_attach_file_returns_resolved_path(sut):
+    (sut.CALCULATIONS_ROOT / "report.csv").write_text("a,b\n1,2\n")
+    text, atts = sut._attach_file("report.csv")
+    assert atts == [str(sut.CALCULATIONS_ROOT / "report.csv")]
+    assert "Attached 'report.csv'" in text
+
+
+def test_attach_file_outside_root(sut):
+    text, atts = sut._attach_file("../../etc/passwd")
+    assert atts == []
+    assert text == "Error: '../../etc/passwd' is outside the allowed directory."
+
+
+def test_attach_file_missing(sut):
+    text, atts = sut._attach_file("nope.dat")
+    assert atts == []
+    assert text == "Error: 'nope.dat' does not exist."
+
+
+def test_attach_file_on_directory(sut):
+    (sut.CALCULATIONS_ROOT / "adir2").mkdir()
+    text, atts = sut._attach_file("adir2")
+    assert atts == []
+    assert text == "Error: 'adir2' is not a regular file."
+
+
+def test_attach_file_too_large(sut, monkeypatch):
+    monkeypatch.setattr(sut, "MAX_ATTACHMENT_BYTES", 4)
+    (sut.CALCULATIONS_ROOT / "big.bin").write_bytes(b"0123456789")  # 10 bytes
+    text, atts = sut._attach_file("big.bin")
+    assert atts == []
+    assert "attachment limit" in text
+
+
+def test_attach_file_drains_into_attachment_sink(sut):
+    (sut.CALCULATIONS_ROOT / "out.json").write_text("{}")
+    ctx = {"attachments": []}
+    text = sut.dispatch("attach_file", {"path": "out.json"}, ctx)
+    assert "Attached 'out.json'" in text
+    assert ctx["attachments"] == [str(sut.CALCULATIONS_ROOT / "out.json")]
+
+
+# --------------------------------------------------------------------------- #
 # _call_tool_server
 # --------------------------------------------------------------------------- #
 def _ctx():

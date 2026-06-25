@@ -34,6 +34,8 @@ RATE_LIMIT_WINDOW     = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "600"))
 CONTEXT_EXPIRY        = int(os.getenv("CONTEXT_EXPIRY_SECONDS", "14400"))
 MAX_CONCURRENT        = int(os.getenv("MAX_CONCURRENT_EXECUTIONS", "5"))
 MAX_FILE_BYTES        = int(os.getenv("MAX_FILE_READ_BYTES", "50000"))
+# Cap on a single file the agent may attach to a reply via the attach_file tool.
+MAX_ATTACHMENT_BYTES  = int(os.getenv("MAX_ATTACHMENT_BYTES", str(25 * 1024 * 1024)))
 
 # Tool server (only needed when run_python_analysis is used)
 AGENT_INTERNAL_SECRET = os.getenv("AGENT_INTERNAL_SECRET", "")

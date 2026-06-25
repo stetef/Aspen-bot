@@ -3,9 +3,12 @@ Agent tools: read-only file browsing + the sandboxed-analysis bridge.
 
 ``TOOL_SPECS`` is the single source of truth (name / description / input_schema /
 impl). From it we derive ``TOOL_FNS`` (name → impl(input, context) -> (text,
-figures)). ``dispatch()`` calls an impl, drains its figures into the per-turn sink
-(``context["figures"]``) and returns the text only. The agent wraps these
-specs as ``@tool`` handlers; the figure-sink seam lives entirely in ``dispatch``.
+attachments)). ``dispatch()`` calls an impl, drains any attachment paths into the
+per-turn sink (``context["attachments"]``) and returns the text only. Attachments
+are any files to upload alongside the reply — plots from ``run_python_analysis``
+and files the agent attaches via ``attach_file`` flow through the same sink. The
+agent wraps these specs as ``@tool`` handlers; the sink seam lives entirely
+in ``dispatch``.
 """
 
 import logging
@@ -72,6 +75,30 @@ def _read_file(rel: str) -> str:
         return f"--- {rel} ---\n{content}{truncation_note}"
     except PermissionError:
         return f"Error: permission denied for '{rel}'."
+
+
+def _attach_file(rel: str) -> tuple[str, list[str]]:
+    """Mark a calculations-root file for upload alongside the reply.
+
+    Returns (confirmation_or_error, [absolute_path]) — the path is drained into
+    the per-turn attachment sink by ``dispatch`` and uploaded by the front-end.
+    """
+    path = _safe_path(rel)
+    if path is None:
+        return f"Error: '{rel}' is outside the allowed directory.", []
+    if not path.exists():
+        return f"Error: '{rel}' does not exist.", []
+    if not path.is_file():
+        return f"Error: '{rel}' is not a regular file.", []
+    size = path.stat().st_size
+    if size > config.MAX_ATTACHMENT_BYTES:
+        return (
+            f"Error: '{rel}' is {size / 1e6:.1f} MB, over the "
+            f"{config.MAX_ATTACHMENT_BYTES / 1e6:.0f} MB attachment limit — "
+            "it can't be attached to the reply.",
+            [],
+        )
+    return f"Attached '{rel}' — it will be uploaded with the reply.", [str(path)]
 
 
 def _call_tool_server(inp: dict, context: dict) -> tuple[str, list[str]]:
@@ -185,6 +212,28 @@ TOOL_SPECS = [
         "impl": lambda inp, _ctx: (_read_file(inp["path"]), []),
     },
     {
+        "name": "attach_file",
+        "description": (
+            "Attach a file from the calculations root to your Slack reply so the "
+            "user receives it as a downloadable file alongside your text. Use this "
+            "when the user asks for a file directly, or when handing over a specific "
+            "output/data/structure file is more useful than pasting its contents. "
+            "Any file type works. The path is relative to the calculations root "
+            "(same as read_file). Call once per file; your text reply is still sent."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path of the file to attach, relative to the calculations root.",
+                }
+            },
+            "required": ["path"],
+        },
+        "impl": lambda inp, _ctx: _attach_file(inp["path"]),
+    },
+    {
         "name": "run_python_analysis",
         "description": (
             "Execute Python code in a secure sandbox to analyze project data. "
@@ -224,19 +273,19 @@ TOOL_SPECS = [
     },
 ]
 
-# name → impl(input, context) -> (text, figures)
+# name → impl(input, context) -> (text, attachments)
 TOOL_FNS = {s["name"]: s["impl"] for s in TOOL_SPECS}
 
 
 def dispatch(name: str, tool_input: dict, context: dict) -> str:
     """
-    Run a tool by name, draining any figures into the per-turn sink
-    (``context["figures"]``), and return just the tool-result text.
+    Run a tool by name, draining any attachment paths into the per-turn sink
+    (``context["attachments"]``), and return just the tool-result text.
     """
-    figures = context.setdefault("figures", [])
+    attachments = context.setdefault("attachments", [])
     fn = TOOL_FNS.get(name)
     if fn is None:
         return f"Unknown tool: {name}"
-    result_text, figs = fn(tool_input, context)
-    figures.extend(figs)
+    result_text, atts = fn(tool_input, context)
+    attachments.extend(atts)
     return result_text

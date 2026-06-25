@@ -24,6 +24,8 @@ _MODMAP = {
     "TOOL_SERVER_URL": "aspen.config",
     "CALCULATIONS_ROOT": "aspen.config",
     "FIGURE_ARCHIVE_DIR": "aspen.config",
+    "WORKSPACE_ROOT": "aspen.config",
+    "MAX_ATTACHMENT_BYTES": "aspen.config",
     "MAX_CONCURRENT": "aspen.config",
     "CONTEXT_EXPIRY": "aspen.config",
     "RATE_LIMIT_REQUESTS": "aspen.config",
@@ -36,6 +38,7 @@ _MODMAP = {
     "_list_directory": "aspen.tools",
     "_read_file": "aspen.tools",
     "_call_tool_server": "aspen.tools",
+    "_attach_file": "aspen.tools",
     "TOOL_FNS": "aspen.tools",
     "TOOL_SPECS": "aspen.tools",
     "dispatch": "aspen.tools",
@@ -49,8 +52,9 @@ _MODMAP = {
     "_rate_data": "aspen.state",
     "_user_active": "aspen.state",
     "_global_sem": "aspen.state",
-    # figures
-    "_upload_figures": "aspen.figures",
+    # attachments
+    "_upload_attachments": "aspen.attachments",
+    "_under": "aspen.attachments",
     # slack front-end
     "_handle_event": "aspen.slack_app",
 }

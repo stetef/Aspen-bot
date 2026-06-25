@@ -48,11 +48,11 @@ class SdkSession:
     def __init__(self, key: str):
         self.key = key
         self._client = None
-        self._current: dict | None = None   # current turn's context (figure sink)
+        self._current: dict | None = None   # current turn's context (attachment sink)
 
     # --- tool wiring ------------------------------------------------------- #
     async def _tool_handler(self, name: str, args: dict) -> dict:
-        """Run a shared tool impl off the loop; figures land in the turn's sink."""
+        """Run a shared tool impl off the loop; attachments land in the turn's sink."""
         text = await asyncio.to_thread(tools.dispatch, name, args, self._current)
         return {"content": [{"type": "text", "text": text}]}
 
@@ -169,7 +169,7 @@ class SdkSession:
 
     async def send(self, user_message: str, context: dict) -> tuple[str, list[str]]:
         import claude_agent_sdk as sdk
-        context.setdefault("figures", [])
+        context.setdefault("attachments", [])
         self._current = context
         try:
             await self._ensure()
@@ -187,13 +187,13 @@ class SdkSession:
                 "Sorry, the SDK backend hit an error. Please try again."
                 if errored else ("\n".join(parts) or "(no text response)")
             )
-            return reply, list(context["figures"])
+            return reply, list(context["attachments"])
         except sdk.ClaudeSDKError as exc:
             log.error("SDK backend error: %s", type(exc).__name__)
             await self.aclose()                    # reset; next turn reconnects
             return (
                 f"Sorry, there was an SDK error ({type(exc).__name__}). Please try again.",
-                list(context["figures"]),
+                list(context["attachments"]),
             )
 
     async def aclose(self) -> None:

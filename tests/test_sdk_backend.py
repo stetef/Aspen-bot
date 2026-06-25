@@ -78,8 +78,8 @@ def test_warm_session_reuses_client_across_turns(sut):
     s = SdkSession("C:1")
 
     async def two_turns():
-        r1, _ = await s.send("hi", {"user_id": "U1", "figures": []})
-        r2, _ = await s.send("again", {"user_id": "U1", "figures": []})
+        r1, _ = await s.send("hi", {"user_id": "U1", "attachments": []})
+        r2, _ = await s.send("again", {"user_id": "U1", "attachments": []})
         return r1, r2
 
     r1, r2 = asyncio.run(two_turns())
@@ -97,25 +97,25 @@ def test_error_subtype_returns_error_reply(sut):
 
     FakeClient.responder = staticmethod(_error_messages)
     s = SdkSession("C:1")
-    reply, figs = asyncio.run(s.send("do it", {"figures": []}))
+    reply, atts = asyncio.run(s.send("do it", {"attachments": []}))
 
     assert reply == "Sorry, the SDK backend hit an error. Please try again."
-    assert figs == []
+    assert atts == []
 
 
-def test_tool_handler_drains_figures_into_sink(sut, monkeypatch):
+def test_tool_handler_drains_attachments_into_sink(sut, monkeypatch):
     from aspen.agent import SdkSession
     import aspen.tools as t
 
     monkeypatch.setitem(t.TOOL_FNS, "fake_fig", lambda inp, ctx: ("plotted", ["/w/x.png"]))
     s = SdkSession("C:1")
-    ctx = {"figures": []}
+    ctx = {"attachments": []}
     s._current = ctx
 
     out = asyncio.run(s._tool_handler("fake_fig", {}))
 
     assert out == {"content": [{"type": "text", "text": "plotted"}]}
-    assert ctx["figures"] == ["/w/x.png"]
+    assert ctx["attachments"] == ["/w/x.png"]
 
 
 def test_can_use_tool_allows_only_aspen_tools(sut):
@@ -145,6 +145,7 @@ def test_build_options_locks_down_tools(sut):
     assert opts.allowed_tools == [
         "mcp__aspen__list_directory",
         "mcp__aspen__read_file",
+        "mcp__aspen__attach_file",
         "mcp__aspen__run_python_analysis",
     ] + list(config.BASH_ALLOWLIST)
     assert "Bash(squeue:*)" in opts.allowed_tools
@@ -157,7 +158,7 @@ def test_build_options_locks_down_tools(sut):
 
 
 def test_sandbox_disabled_by_default(sut):
-    from aspen.backends.sdk import SdkSession
+    from aspen.agent import SdkSession
     from aspen import config
 
     assert config.SANDBOX_ENABLED is False
@@ -170,7 +171,7 @@ def test_sandbox_disabled_by_default(sut):
 
 
 def test_sandbox_settings_built_from_config(sut, monkeypatch):
-    from aspen.backends.sdk import SdkSession
+    from aspen.agent import SdkSession
     from aspen import config
 
     monkeypatch.setattr(config, "SANDBOX_ENABLED", True)
@@ -230,6 +231,7 @@ def test_bash_allowlist_override_flows_into_allowed_tools(sut, monkeypatch):
     assert opts.allowed_tools == [
         "mcp__aspen__list_directory",
         "mcp__aspen__read_file",
+        "mcp__aspen__attach_file",
         "mcp__aspen__run_python_analysis",
         "Bash(squeue:*)",
         "Bash(sacct:*)",
