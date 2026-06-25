@@ -429,49 +429,113 @@ def write_audit_log(project_name: str, entry: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Apptainer execution
+# Sandboxed (bwrap) execution
 # ---------------------------------------------------------------------------
-def run_in_apptainer(
+@functools.lru_cache(maxsize=1)
+def _python_bind_paths() -> tuple[str, ...]:
+    """Read-only host paths the analysis interpreter needs: its venv prefix and the
+    base CPython prefix(es) it was created from. We bind all four of sys.{prefix,
+    exec_prefix,base_prefix,base_exec_prefix} because a uv-managed CPython (as here)
+    splits them — the actual python3.x binary lives under base_exec_prefix while the
+    venv symlink/stdlib reference base_prefix, and missing either breaks exec. Also
+    resolves the interpreter's real path (the symlink target) for good measure.
+    Discovered by asking the interpreter, so it works wherever they live (not /usr).
+    Cached; falls back to the interpreter's parent prefix if introspection fails."""
+    try:
+        out = subprocess.run(
+            [ANALYSIS_PYTHON, "-c",
+             "import sys,os;"
+             "print(sys.prefix,sys.exec_prefix,sys.base_prefix,sys.base_exec_prefix,"
+             "os.path.realpath(sys.executable),sep='\\n')"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.split("\n")
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("Could not introspect ANALYSIS_PYTHON (%s); binding its parent prefix", exc)
+        out = [str(Path(ANALYSIS_PYTHON).resolve().parent.parent)]
+    # Bind the LITERAL prefix paths (do NOT resolve them): the venv's python symlink
+    # points at the unresolved base path, so that exact path must exist in the jail.
+    # The final entry is the realpath of the executable — resolved, so we also cover
+    # wherever the symlink chain actually lands. A file entry binds its parent dir.
+    paths: list[str] = []
+    for p in out:
+        p = p.strip()
+        if not p:
+            continue
+        if os.path.isfile(p):
+            p = str(Path(p).parent)
+        if p and p != "/" and p not in paths:
+            paths.append(p)
+    return tuple(paths)
+
+
+def build_sandbox_cmd(script_path: Path, project_name: str, project_path: Path) -> list[str]:
+    """Assemble the ``prlimit`` + ``bwrap`` argv that runs the analysis script in a
+    no-network, read-only-filesystem jail. Pure (no side effects) so it is unit-testable.
+
+    bwrap gives us: all namespaces unshared (``--unshare-all`` — includes the network
+    namespace, so no network), the project mounted read-only at /projects/<name>, only
+    the workspace figures/cache writable, a tmpfs /tmp, and nothing else from the host
+    except the read-only system + interpreter paths needed to run Python. prlimit adds
+    the per-task resource caps bwrap cannot (this host is cgroups v1)."""
+    bwrap = [
+        BWRAP_BIN,
+        "--unshare-all",        # all namespaces incl. network -> no network access
+        "--die-with-parent",    # jail is torn down if the tool server dies
+        "--new-session",        # own session: blocks TIOCSTI terminal-injection tricks
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--tmpfs", "/tmp",
+    ]
+    # System libraries / interpreters, read-only. -try so a missing path is skipped
+    # rather than fatal. No /home, no /etc secrets, no other projects.
+    for p in ANALYSIS_RO_PATHS:
+        bwrap += ["--ro-bind-try", p, p]
+    # Dynamic-loader config so compiled deps (libgfortran, libgomp, ...) resolve.
+    for p in ("/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d"):
+        bwrap += ["--ro-bind-try", p, p]
+    # The analysis interpreter's venv + base CPython prefixes.
+    for p in _python_bind_paths():
+        bwrap += ["--ro-bind", p, p]
+    bwrap += [
+        "--ro-bind", str(project_path), f"/projects/{project_name}",   # project: read-only
+        "--bind", str(FIGURES_DIR), "/aspen_workspace/figures",        # outputs: read-write
+        "--bind", str(CACHE_DIR), "/aspen_workspace/cache",
+        "--ro-bind", str(script_path), "/aspen_script.py",
+        "--chdir", "/tmp",
+        ANALYSIS_PYTHON, "/aspen_script.py",
+    ]
+    # prlimit resource caps (bwrap has no cgroup limits; this host is cgroups v1).
+    limits = []
+    if ANALYSIS_AS_LIMIT_BYTES:
+        limits.append(f"--as={ANALYSIS_AS_LIMIT_BYTES}")
+    if ANALYSIS_CPU_LIMIT_SECONDS:
+        limits.append(f"--cpu={ANALYSIS_CPU_LIMIT_SECONDS}")
+    if ANALYSIS_FSIZE_LIMIT_BYTES:
+        limits.append(f"--fsize={ANALYSIS_FSIZE_LIMIT_BYTES}")
+    return [PRLIMIT_BIN, *limits, "--", *bwrap] if limits else bwrap
+
+
+def run_in_bwrap(
     script_path: Path,
     project_name: str,
     project_path: Path,
 ) -> dict:
     """
-    Run script_path in an Apptainer container with:
-    - no network access
-    - clean environment (no secrets)
-    - project directory mounted read-only
-    - figures and cache directories mounted read-write
-    - hard memory limit per task (APPTAINER_MEMORY_LIMIT, default 1 GB;
-      requires cgroups v2 delegation / rootless or root to be enforced)
+    Run script_path under a bwrap sandbox with:
+    - no network access (--unshare-all unshares the network namespace)
+    - scrubbed environment (SANDBOX_ENV only — no secrets)
+    - project directory mounted read-only; rest of the filesystem read-only
+    - figures and cache directories mounted read-write (the only writable host paths)
+    - per-task resource caps via prlimit (RLIMIT_AS / CPU / FSIZE)
     - EXECUTION_TIMEOUT second hard kill
 
     Returns dict with stdout, stderr, figures, status, duration_seconds.
     """
     figures_before = set(FIGURES_DIR.glob("*.png"))
 
-    cmd = [
-        "apptainer", "exec",
-        "--cleanenv",
-        "--net", "--network", "none",
-    ]
-    # Hard memory cap (cgroups). --memory-swap == --memory disables swap, so the
-    # cap can't be circumvented by swapping.
-    if APPTAINER_MEMORY_LIMIT:
-        cmd += ["--memory", APPTAINER_MEMORY_LIMIT, "--memory-swap", APPTAINER_MEMORY_LIMIT]
-    cmd += [
-        # Project data: read-only
-        "--bind", f"{project_path}:/projects/{project_name}:ro",
-        # Workspace outputs: read-write
-        "--bind", f"{FIGURES_DIR}:/aspen_workspace/figures:rw",
-        "--bind", f"{CACHE_DIR}:/aspen_workspace/cache:rw",
-        # Script: read-only bind of the single file
-        "--bind", f"{script_path}:/aspen_script.py:ro",
-        APPTAINER_IMAGE,
-        "python", "/aspen_script.py",
-    ]
+    cmd = build_sandbox_cmd(script_path, project_name, project_path)
 
-    log.info("Launching Apptainer for project=%s script=%s", project_name, script_path.name)
+    log.info("Launching bwrap sandbox for project=%s script=%s", project_name, script_path.name)
     t0 = time.monotonic()
 
     try:
@@ -480,15 +544,20 @@ def run_in_apptainer(
             capture_output=True,
             text=True,
             timeout=EXECUTION_TIMEOUT,
+            env=SANDBOX_ENV,           # scrubbed env — bwrap forwards exactly these vars
         )
         duration = time.monotonic() - t0
         stdout = filter_secrets(proc.stdout)
         stderr = filter_secrets(proc.stderr)
         status = "success" if proc.returncode == 0 else "error"
-        # A SIGKILL (-9 / 137) with a memory cap set is almost always an OOM kill;
-        # surface a clear hint since cgroup OOM leaves little/no stderr.
-        if APPTAINER_MEMORY_LIMIT and proc.returncode in (-9, 137):
-            note = f"Process killed — likely exceeded the {APPTAINER_MEMORY_LIMIT} memory limit."
+        # SIGKILL/SIGXCPU (-9 / -24 / 137 / 152) almost always means a prlimit cap was
+        # hit; surface a hint since that leaves little stderr. (An RLIMIT_AS overrun
+        # usually instead shows up as a Python MemoryError in stderr.)
+        if proc.returncode in (-9, -24, 137, 152):
+            note = (
+                "Process killed — likely hit a resource cap "
+                f"(memory/AS={ANALYSIS_AS_LIMIT_BYTES} B, CPU={ANALYSIS_CPU_LIMIT_SECONDS}s)."
+            )
             stderr = f"{stderr}\n{note}".strip() if stderr else note
 
     except subprocess.TimeoutExpired as exc:
@@ -496,7 +565,7 @@ def run_in_apptainer(
         stdout = filter_secrets(exc.stdout or "")
         stderr = filter_secrets(exc.stderr or "")
         status = "timeout"
-        log.warning("Apptainer timed out after %ds for project=%s", EXECUTION_TIMEOUT, project_name)
+        log.warning("bwrap sandbox timed out after %ds for project=%s", EXECUTION_TIMEOUT, project_name)
 
     # Collect any new figures produced
     figures_after = set(FIGURES_DIR.glob("*.png"))
@@ -592,7 +661,7 @@ def run_python_analysis(
     result = {}
 
     try:
-        result = run_in_apptainer(script_path, project_name, project_path)
+        result = run_in_bwrap(script_path, project_name, project_path)
     finally:
         # Always delete the generated script
         try:

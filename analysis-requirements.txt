@@ -1,0 +1,9 @@
+# Libraries available inside the bwrap analysis sandbox (run_python_analysis).
+# This venv replaces the old aspen.sif Apptainer image. start.sh bootstraps it
+# into $ANALYSIS_VENV (default: $WORKSPACE_ROOT/analysis-venv). To add a library,
+# add it here and delete the venv (or rerun after removing it) so it rebuilds.
+numpy
+pandas
+matplotlib
+scipy
+py3Dmol

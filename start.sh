@@ -57,6 +57,35 @@ if grep -qiE '^[[:space:]]*ASPEN_SANDBOX_ENABLED[[:space:]]*=[[:space:]]*(1|true
     ensure_socat || true
 fi
 
+# ---------------------------------------------------------------------------
+# Analysis venv: the Python environment run_python_analysis executes inside the
+# bwrap sandbox (replaces the old aspen.sif Apptainer image). Built once into
+# $ANALYSIS_VENV — default $WORKSPACE_ROOT/analysis-venv, overridable via .env.
+# We export ANALYSIS_PYTHON so the tool server uses exactly this interpreter.
+# ---------------------------------------------------------------------------
+read_env() { grep -E "^[[:space:]]*$1[[:space:]]*=" .env | tail -1 | cut -d= -f2- | xargs; }
+WORKSPACE_ROOT_VAL="$(read_env WORKSPACE_ROOT)"
+ANALYSIS_VENV="$(read_env ANALYSIS_VENV)"
+ANALYSIS_VENV="${ANALYSIS_VENV:-${WORKSPACE_ROOT_VAL:-$SCRIPT_DIR/aspen-workspace}/analysis-venv}"
+export ANALYSIS_PYTHON="$ANALYSIS_VENV/bin/python"
+
+ensure_analysis_venv() {
+    if [[ -x "$ANALYSIS_VENV/bin/python" ]]; then
+        echo "Analysis venv present: $ANALYSIS_VENV"
+        return 0
+    fi
+    echo "Building analysis venv at $ANALYSIS_VENV ..."
+    python -m venv "$ANALYSIS_VENV" \
+        && "$ANALYSIS_VENV/bin/pip" install -q --upgrade pip \
+        && "$ANALYSIS_VENV/bin/pip" install -q -r analysis-requirements.txt \
+        && echo "Analysis venv ready ($("$ANALYSIS_VENV/bin/python" --version))"
+}
+
+if ! ensure_analysis_venv; then
+    echo "ERROR: could not build the analysis venv at $ANALYSIS_VENV. run_python_analysis needs it."
+    exit 1
+fi
+
 # Start tool server in the background
 echo "Starting tool server on 127.0.0.1:8000 ..."
 python tool_server.py &
