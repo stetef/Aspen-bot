@@ -92,15 +92,37 @@ def test_warm_session_reuses_client_across_turns(sut):
     assert FakeClient.instances[0].queries == ["hi", "again"]
 
 
-def test_error_subtype_returns_error_reply(sut):
+def test_error_subtype_returns_specific_reply_keeping_partial_text(sut):
     from aspen.agent import SdkSession
 
     FakeClient.responder = staticmethod(_error_messages)
     s = SdkSession("C:1")
     reply, atts = asyncio.run(s.send("do it", {"attachments": []}))
 
-    assert reply == "Sorry, the SDK backend hit an error. Please try again."
+    # Specific reason surfaced, and the partial text the agent produced is preserved.
+    assert "partial" in reply
+    assert "error_during_execution" in reply
+    assert "ended early" in reply
     assert atts == []
+
+
+def test_max_turns_reports_soft_pause_not_failure(sut):
+    from aspen.agent import SdkSession
+    from aspen import config
+
+    def _max_turns_messages(prompt):
+        return [
+            sdk.AssistantMessage(content=[sdk.TextBlock(text="did step 1")], model="m"),
+            _result("error_max_turns"),
+        ]
+
+    FakeClient.responder = staticmethod(_max_turns_messages)
+    s = SdkSession("C:1")
+    reply, _ = asyncio.run(s.send("big task", {"attachments": []}))
+
+    assert "did step 1" in reply                       # partial progress kept
+    assert str(config.AGENT_MAX_ROUNDS) in reply        # names the actual cap
+    assert "continue" in reply.lower()                  # tells the user how to resume
 
 
 def test_tool_handler_drains_attachments_into_sink(sut, monkeypatch):

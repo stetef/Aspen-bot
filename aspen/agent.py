@@ -162,6 +162,47 @@ class SdkSession:
             self._client = sdk.ClaudeSDKClient(options=self._build_options(sdk))
             await self._client.connect()           # spawns the CLI subprocess once (warm)
 
+    def _format_result_reply(self, text: str, result_msg) -> str:
+        """Turn the turn's final ``ResultMessage`` into the user-facing reply.
+
+        On success, return the agent's text. On a non-success result, surface the
+        *specific* reason (and keep any partial text the agent already produced)
+        instead of a generic "backend error" — most importantly distinguishing a
+        soft ``error_max_turns`` pause (work continues next turn) from a real error.
+        """
+        subtype = getattr(result_msg, "subtype", "success") if result_msg is not None else "success"
+        if subtype == "success":
+            return text or "(no text response)"
+
+        denials = getattr(result_msg, "permission_denials", None) or []
+        api_status = getattr(result_msg, "api_error_status", None)
+        log.warning(
+            "Turn ended non-success: subtype=%s num_turns=%s stop_reason=%s "
+            "denials=%d api_error_status=%s",
+            subtype, getattr(result_msg, "num_turns", None),
+            getattr(result_msg, "stop_reason", None), len(denials), api_status,
+        )
+
+        if subtype == "error_max_turns":
+            note = (
+                f"⚠️ I hit my per-turn limit of {config.AGENT_MAX_ROUNDS} tool-call rounds and "
+                "paused before finishing — I didn't complete everything in one turn. Reply "
+                "“continue” and I'll pick up where I left off (this thread keeps its context)."
+            )
+        else:
+            bits = [f"reason: {subtype}"]
+            if api_status:
+                bits.append(f"API status {api_status}")
+            if denials:
+                bits.append(f"{len(denials)} tool call(s) blocked by the allowlist/sandbox")
+            note = "⚠️ My turn ended early — " + "; ".join(bits) + "."
+            detail = (getattr(result_msg, "result", None) or "").strip()
+            if detail and detail != text:
+                note += f"\nDetails: {detail[:500]}"
+            note += "\nYou can ask me to try again or rephrase; the thread keeps its context."
+
+        return f"{text}\n\n{note}".strip() if text else note
+
     async def send(self, user_message: str, context: dict) -> tuple[str, list[str]]:
         import claude_agent_sdk as sdk
         context.setdefault("attachments", [])
@@ -170,24 +211,29 @@ class SdkSession:
             await self._ensure()
             await self._client.query(user_message)
             parts: list[str] = []
-            errored = False
+            result_msg = None
             # Do NOT break out of receive_response early (SDK cleanup caveat).
             async for msg in self._client.receive_response():
                 if isinstance(msg, sdk.AssistantMessage):
                     parts += [b.text for b in msg.content if isinstance(b, sdk.TextBlock)]
                 elif isinstance(msg, sdk.ResultMessage):
-                    if getattr(msg, "subtype", "success") != "success":
-                        errored = True
-            reply = (
-                "Sorry, the SDK backend hit an error. Please try again."
-                if errored else ("\n".join(parts) or "(no text response)")
-            )
-            return reply, list(context["attachments"])
+                    result_msg = msg
+            text = "\n".join(p for p in parts if p).strip()
+            return self._format_result_reply(text, result_msg), list(context["attachments"])
         except sdk.ClaudeSDKError as exc:
-            log.error("SDK backend error: %s", type(exc).__name__)
+            name = type(exc).__name__
+            log.error("SDK backend error: %s: %s", name, exc)
             await self.aclose()                    # reset; next turn reconnects
+            hint = {
+                "CLINotFoundError": "the Claude CLI binary wasn't found (check CLAUDE_CLI_PATH)",
+                "CLIConnectionError": "couldn't connect to the Claude CLI process",
+                "ProcessError": "the Claude CLI process exited unexpectedly",
+                "CLIJSONDecodeError": "the Claude CLI returned output the SDK couldn't parse",
+            }.get(name, "an unexpected SDK error occurred")
+            detail = str(exc).strip()
+            suffix = f" Details: {detail[:300]}" if detail else ""
             return (
-                f"Sorry, there was an SDK error ({type(exc).__name__}). Please try again.",
+                f"⚠️ SDK error — {hint} ({name}).{suffix} The session was reset; please try again.",
                 list(context["attachments"]),
             )
 

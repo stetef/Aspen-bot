@@ -47,7 +47,7 @@ FIGURE_ARCHIVE_DIR    = WORKSPACE_ROOT / "figure_archive"
 # Claude Agent SDK backend
 # ---------------------------------------------------------------------------
 # Per-turn tool-call (agentic round) cap, passed to the SDK as max_turns.
-AGENT_MAX_ROUNDS      = int(os.getenv("AGENT_MAX_ROUNDS", "10"))
+AGENT_MAX_ROUNDS      = int(os.getenv("AGENT_MAX_ROUNDS", "25"))
 # Upper bound on concurrently parked conversation sessions (bounds warm SDK
 # CLI subprocesses).
 MAX_OPEN_SESSIONS     = int(os.getenv("MAX_OPEN_SESSIONS", "20"))
