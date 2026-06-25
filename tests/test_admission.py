@@ -31,11 +31,26 @@ def test_unauthorized_user_is_rejected(sut, say):
 
 
 def test_happy_path_strips_mention_and_replies(sut, say, no_op_agent):
-    sut._handle_event(_event("U1", "<@BOT123> hello there"), say, MagicMock(), strip_mention=True)
-    assert "_Thinking…_" in say.texts
+    client = MagicMock()
+    sut._handle_event(_event("U1", "<@BOT123> hello there"), say, client, strip_mention=True)
+    # The native "Aspen is typing…" status replaces the old "_Thinking…_" post.
+    client.assistant_threads_setStatus.assert_any_call(
+        channel_id="C", thread_ts="1.0", status=sut._STATUS_TEXT
+    )
+    assert "_Thinking…_" not in say.texts
     assert "reply!" in say.texts
     # The in-flight flag is released in the finally block.
     assert sut._user_active["U1"] is False
+
+
+def test_status_falls_back_to_thinking_when_setstatus_unavailable(sut, say, no_op_agent):
+    # Channel @-mentions aren't assistant threads, so setStatus errors there; the
+    # handler must degrade to the plain "_Thinking…_" message rather than fail.
+    client = MagicMock()
+    client.assistant_threads_setStatus.side_effect = Exception("not an assistant thread")
+    sut._handle_event(_event("U1", "<@BOT123> hello"), say, client, strip_mention=True)
+    assert "_Thinking…_" in say.texts
+    assert "reply!" in say.texts
 
 
 def test_empty_message_prompts_for_input(sut, say, no_op_agent):

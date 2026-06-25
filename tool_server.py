@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Aspen FastAPI Tool Server
-Handles sandboxed Apptainer execution of LLM-generated analysis code.
+Handles sandboxed bubblewrap (bwrap) execution of LLM-generated analysis code.
 Binds to 127.0.0.1 only — not reachable from outside the node.
 """
 
 import ast
+import functools
 import hashlib
 import json
 import logging
@@ -37,7 +38,6 @@ log = logging.getLogger("aspen.tool_server")
 AGENT_INTERNAL_SECRET = os.environ["AGENT_INTERNAL_SECRET"]
 PROJECTS_ROOT         = Path(os.environ["PROJECTS_ROOT"]).resolve()
 WORKSPACE_ROOT        = Path(os.environ["WORKSPACE_ROOT"]).resolve()
-APPTAINER_IMAGE       = os.environ["APPTAINER_IMAGE"]
 SQLITE_DB_ROOT        = Path(os.getenv("SQLITE_DB_ROOT", str(WORKSPACE_ROOT / "db"))).resolve()
 SQLITE_USE_WAL        = os.getenv("SQLITE_USE_WAL", "false").lower() == "true"
 
@@ -53,10 +53,54 @@ MAX_FIGURE_BYTES      = int(os.getenv("MAX_FIGURE_BYTES", str(5 * 1024 * 1024)))
 FIGURE_ARCHIVE_MAX    = int(os.getenv("FIGURE_ARCHIVE_MAX_BYTES", str(2 * 1024 ** 3)))
 FIGURE_ARCHIVE_TRIM   = int(os.getenv("FIGURE_ARCHIVE_TRIM_BYTES", str(int(1.5 * 1024 ** 3))))
 EXECUTION_TIMEOUT     = int(os.getenv("EXECUTION_TIMEOUT_SECONDS", "120"))
-# Hard per-task memory cap for the analysis sandbox. Enforced via Apptainer's
-# --memory/--memory-swap (needs cgroups v2 delegation, rootless, or root). Set to
-# an empty string to disable the cap.
-APPTAINER_MEMORY_LIMIT = os.getenv("APPTAINER_MEMORY_LIMIT", "1G")
+
+# --- Sandbox runtime: bubblewrap (bwrap) -----------------------------------
+# Analysis code runs under bwrap: no network, a minimal read-only filesystem, the
+# project mounted read-only, and only the workspace figures/cache writable. We
+# resolve the binaries to absolute paths because the sandbox is launched with a
+# scrubbed environment — the PATH in that env must not get to decide what runs.
+BWRAP_BIN   = shutil.which(os.getenv("BWRAP_BIN", "bwrap")) or "/usr/bin/bwrap"
+PRLIMIT_BIN = shutil.which("prlimit") or "/usr/bin/prlimit"
+# Python interpreter (a venv) holding the analysis libraries. start.sh bootstraps
+# this venv; the default matches its ANALYSIS_VENV path.
+ANALYSIS_PYTHON = os.getenv(
+    "ANALYSIS_PYTHON", str(WORKSPACE_ROOT / "analysis-venv" / "bin" / "python")
+)
+# Host paths bind-mounted read-only so the interpreter + its compiled deps resolve
+# their shared libraries. Deliberately NOT /home, /etc (beyond the loader files
+# bound below), other projects, or anything secret.
+ANALYSIS_RO_PATHS = [
+    p.strip() for p in
+    os.getenv("ANALYSIS_RO_PATHS", "/usr,/lib,/lib64,/bin,/sbin").split(",")
+    if p.strip()
+]
+# Hard per-task resource caps. bwrap has no cgroup/memory limits, and this host is
+# cgroups v1 (so rootless Apptainer --memory could not work either), so we enforce
+# caps with prlimit. RLIMIT_AS bounds *virtual* address space — set generously,
+# since BLAS/numpy reserve large virtual arenas; the wall-clock EXECUTION_TIMEOUT
+# is the primary backstop. Any limit set to 0 is disabled.
+ANALYSIS_AS_LIMIT_BYTES    = int(os.getenv("ANALYSIS_AS_LIMIT_BYTES", str(2 * 1024 ** 3)))
+ANALYSIS_FSIZE_LIMIT_BYTES = int(os.getenv("ANALYSIS_FSIZE_LIMIT_BYTES", str(512 * 1024 ** 2)))
+ANALYSIS_CPU_LIMIT_SECONDS = int(os.getenv("ANALYSIS_CPU_LIMIT_SECONDS", str(EXECUTION_TIMEOUT)))
+
+# Scrubbed environment for the sandboxed process (bwrap 0.4.0 has no --clearenv, so
+# we hand the subprocess only these vars; bwrap forwards exactly them). No secrets.
+SANDBOX_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/tmp",
+    "TMPDIR": "/tmp",
+    "MPLCONFIGDIR": "/tmp/mpl",   # matplotlib needs a writable config dir
+    "MPLBACKEND": "Agg",          # headless plotting
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONUNBUFFERED": "1",
+    "LC_ALL": "C.UTF-8",
+    "LANG": "C.UTF-8",
+    # Keep BLAS/OpenMP thread pools small so memory/CPU stay within the caps.
+    "OMP_NUM_THREADS": "2",
+    "OPENBLAS_NUM_THREADS": "2",
+    "MKL_NUM_THREADS": "2",
+    "NUMEXPR_NUM_THREADS": "2",
+}
 
 for _d in [FIGURES_DIR, FIGURE_ARCHIVE_DIR, CACHE_DIR, LOGS_DIR,
            GENERATED_CODE_DIR, SQLITE_DB_ROOT]:
@@ -252,11 +296,11 @@ def check_code_safety(code: str) -> Optional[str]:
 # Import hook injection
 # ---------------------------------------------------------------------------
 _HOOK_TEMPLATE = """\
-# ---- Aspen security hook (defense-in-depth; container is the real boundary) ----
-# Network isolation is enforced by --net --network none at the container level.
-# Project data is bind-mounted read-only. This hook only enforces the write-path
-# restriction within the writable workspace so generated code cannot overwrite
-# files outside the designated output directories.
+# ---- Aspen security hook (defense-in-depth; the bwrap jail is the real boundary) ----
+# Network isolation is enforced by bwrap's --unshare-all (no network namespace).
+# Project data is bind-mounted read-only and the rest of the filesystem is read-only
+# too; only the workspace figures/cache are writable. This hook is a redundant
+# write-path guard so generated code cannot write outside the designated outputs.
 import builtins as _builtins
 import os.path as _ospath
 

@@ -77,5 +77,5 @@ def test_handler_sends_reply_as_markdown_block(sut, say, monkeypatch):
     assert len(reply_calls) == 1
     block = reply_calls[0]["blocks"][0]
     assert block == {"type": "markdown", "text": "## Result\n\n**done**"}
-    # Thinking status stays a plain text post (no block).
-    assert "_Thinking…_" in say.texts
+    # The working indicator is now a native assistant status, not a posted message.
+    assert "_Thinking…_" not in say.texts

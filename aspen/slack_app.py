@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from slack_bolt import App
@@ -18,6 +19,14 @@ from slack_bolt import App
 from . import attachments, config, ratelimit, render, sessions, state
 
 log = logging.getLogger("aspen")
+
+# Native Slack "working" indicator for AI apps (assistant.threads.setStatus).
+# Slack renders it as "<App Name> <status>", so with the bot named "Aspen" this
+# shows up as "Aspen is typing…" beneath the thread compose box.
+_STATUS_TEXT = "is typing…"
+# Slack expires a status after ~2 minutes, but Aspen turns routinely run longer,
+# so a background thread re-asserts it well inside that window until the turn ends.
+_STATUS_REFRESH_SECONDS = 50
 
 # Each in-flight turn blocks a Bolt listener thread (it waits on the agent loop),
 # so size the pool above MAX_CONCURRENT — otherwise the pool, not the semaphore,
@@ -29,6 +38,56 @@ app = App(
 
 # Generous ceiling for a single turn (the analysis sandbox has its own timeout).
 _TURN_TIMEOUT = int(os.getenv("EXECUTION_TIMEOUT_SECONDS", "120")) + 600
+
+
+def _start_typing_status(client, channel: str, thread_ts: str, say):
+    """Show a native "Aspen is typing…" status for the duration of a turn.
+
+    Calls ``assistant.threads.setStatus`` and keeps it alive on a daemon thread
+    (the status expires after ~2 minutes; turns can run longer). Returns a
+    ``stop()`` callable that ends the refresher and clears the status.
+
+    The status only applies to *assistant* threads. For a channel @-mention — or
+    if the app lacks the scope / assistant feature — the first call raises, and we
+    fall back to posting the old ``_Thinking…_`` message so the user still sees
+    that Aspen is working. In that case ``stop()`` is a no-op.
+    """
+    def _set(status: str) -> None:
+        client.assistant_threads_setStatus(
+            channel_id=channel, thread_ts=thread_ts, status=status
+        )
+
+    try:
+        _set(_STATUS_TEXT)
+    except Exception:
+        log.debug("setStatus unavailable; falling back to a Thinking message", exc_info=True)
+        say(text="_Thinking…_", thread_ts=thread_ts)
+        return lambda: None
+
+    stop_event = threading.Event()
+
+    def _refresh() -> None:
+        while not stop_event.wait(_STATUS_REFRESH_SECONDS):
+            try:
+                _set(_STATUS_TEXT)
+            except Exception:
+                log.debug("setStatus refresh failed; giving up", exc_info=True)
+                return
+
+    refresher = threading.Thread(target=_refresh, name="aspen-status", daemon=True)
+    refresher.start()
+
+    def _stop() -> None:
+        stop_event.set()
+        refresher.join(timeout=1)
+        # Posting the reply auto-clears the status, but clear it explicitly first
+        # so the heartbeat can't re-assert it in the gap before the reply lands.
+        try:
+            _set("")
+        except Exception:
+            log.debug("setStatus clear failed", exc_info=True)
+
+    return _stop
 
 
 def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
@@ -62,7 +121,7 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
             say(text="Hi! Ask me anything about the calculations.", thread_ts=thread_ts)
             return
 
-        say(text="_Thinking…_", thread_ts=thread_ts)
+        stop_status = _start_typing_status(client, channel, thread_ts, say)
 
         key     = sessions._thread_key(event)
         context = {"user_id": uid, "username": "", "thread_ts": thread_ts or "", "attachments": []}
@@ -76,6 +135,8 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
         except Exception:
             log.exception("Unexpected error for user %s", uid)
             reply, atts = "Sorry, something went wrong on my end. Please try again.", []
+        finally:
+            stop_status()
 
         # Slack's text field speaks mrkdwn, not the GFM the agent emits; send the
         # reply through a markdown block so Slack renders it (render.slack_reply).

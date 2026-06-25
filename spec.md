@@ -195,7 +195,7 @@ Required OAuth Bot Token scopes:
 | Scope | Purpose |
 |---|---|
 | `app_mentions:read` | Respond only when @Aspen is mentioned |
-| `chat:write` | Post messages and results |
+| `chat:write` | Post messages and results; also drives the native "Aspen is typing…" status (`assistant.threads.setStatus`) |
 | `files:write` | Upload figures as Slack files |
 | `im:history` | Read DM threads for context |
 | `channels:history` | Read channel threads for context (only threads Aspen is in) |
