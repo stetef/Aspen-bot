@@ -39,9 +39,15 @@ MAX_ATTACHMENT_BYTES  = int(os.getenv("MAX_ATTACHMENT_BYTES", str(25 * 1024 * 10
 
 # Tool server (only needed when run_python_analysis is used)
 AGENT_INTERNAL_SECRET = os.getenv("AGENT_INTERNAL_SECRET", "")
-TOOL_SERVER_URL       = os.getenv("TOOL_SERVER_URL", "http://127.0.0.1:27195")
 WORKSPACE_ROOT        = Path(os.getenv("WORKSPACE_ROOT", "/aspen_workspace")).resolve()
 FIGURE_ARCHIVE_DIR    = WORKSPACE_ROOT / "figure_archive"
+# The bot talks to the tool server over a Unix-domain socket (a file), not a TCP
+# port — so it can't be reached by other users on a shared node. Keep the path
+# short (Linux caps socket paths at ~108 chars). tool_server.py binds this same
+# path inside a 0700 directory, which is what keeps other local users out (the
+# socket's own mode is 0666 from uvicorn, but a dir they can't enter makes it
+# unreachable).
+TOOL_SERVER_SOCKET    = os.getenv("ASPEN_TOOL_SERVER_SOCKET", str(WORKSPACE_ROOT / "run" / "tool.sock"))
 
 # ---------------------------------------------------------------------------
 # Claude Agent SDK backend

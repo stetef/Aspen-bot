@@ -713,6 +713,23 @@ if __name__ == "__main__":
         "Starting Aspen tool server  projects=%s  workspace=%s",
         PROJECTS_ROOT, WORKSPACE_ROOT,
     )
-    from urllib.parse import urlparse
-    _url = urlparse(os.getenv("TOOL_SERVER_URL", "http://127.0.0.1:27195"))
-    uvicorn.run(app, host=_url.hostname or "127.0.0.1", port=_url.port or 27195, workers=1)
+    # Listen on a Unix-domain socket (a file), not a TCP port: on a shared node a
+    # 127.0.0.1 port is reachable by every local user, whereas a socket in a 0700
+    # dir is reachable only by this user. The shared-secret header stays as a
+    # second layer (see run_python_analysis).
+    sock_path = Path(
+        os.getenv("ASPEN_TOOL_SERVER_SOCKET", str(WORKSPACE_ROOT / "run" / "tool.sock"))
+    )
+    sock_path.parent.mkdir(parents=True, exist_ok=True)
+    # The 0700 directory is the real access control. uvicorn always chmods the
+    # socket itself to 0666 (after bind, with no hook to override), but connecting
+    # to a unix socket also requires search permission on its parent dir — and no
+    # other user can enter a 0700 dir they don't own, so the socket is unreachable
+    # to them regardless of its own mode.
+    os.chmod(sock_path.parent, 0o700)
+    try:
+        sock_path.unlink()                   # remove a stale socket from a prior run
+    except FileNotFoundError:
+        pass
+    log.info("Tool server listening on unix socket %s", sock_path)
+    uvicorn.run(app, uds=str(sock_path), workers=1)

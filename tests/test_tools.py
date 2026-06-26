@@ -1,6 +1,6 @@
 """Characterization tests for the read-only file tools and the tool-server bridge."""
 
-import requests
+import httpx
 
 
 # --------------------------------------------------------------------------- #
@@ -238,7 +238,7 @@ def test_call_tool_server_unconfigured_secret(sut, monkeypatch):
 def test_call_tool_server_success(sut, monkeypatch):
     class FakeResp:
         status_code = 200
-        ok = True
+        is_success = True
 
         def json(self):
             return {
@@ -248,7 +248,7 @@ def test_call_tool_server_success(sut, monkeypatch):
                 "figures": ["/workspace/figures/a.png"],
             }
 
-    monkeypatch.setattr(sut.requests, "post", lambda *a, **k: FakeResp())
+    monkeypatch.setattr(sut, "_tool_server_post", lambda *a, **k: FakeResp())
     text, figs = sut._call_tool_server(
         {"project_name": "proj", "code": "x", "dataset": [], "question": "q"}, _ctx()
     )
@@ -260,13 +260,13 @@ def test_call_tool_server_success(sut, monkeypatch):
 def test_call_tool_server_bad_request(sut, monkeypatch):
     class FakeResp:
         status_code = 400
-        ok = False
+        is_success = False
         text = "bad request"
 
         def json(self):
             return {"detail": "your code is unsafe"}
 
-    monkeypatch.setattr(sut.requests, "post", lambda *a, **k: FakeResp())
+    monkeypatch.setattr(sut, "_tool_server_post", lambda *a, **k: FakeResp())
     text, figs = sut._call_tool_server({"project_name": "proj"}, _ctx())
     assert text == "Error: your code is unsafe"
     assert figs == []
@@ -274,9 +274,9 @@ def test_call_tool_server_bad_request(sut, monkeypatch):
 
 def test_call_tool_server_connection_error(sut, monkeypatch):
     def _boom(*a, **k):
-        raise requests.exceptions.ConnectionError()
+        raise httpx.ConnectError("socket not there")
 
-    monkeypatch.setattr(sut.requests, "post", _boom)
+    monkeypatch.setattr(sut, "_tool_server_post", _boom)
     text, figs = sut._call_tool_server({"project_name": "proj"}, _ctx())
     assert text.startswith("Error: tool server is not running")
     assert figs == []

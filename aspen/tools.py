@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import requests
+import httpx
 
 from . import config
 
@@ -179,9 +179,25 @@ def _write_metadata(project: str, content: str) -> str:
     return f"{verb} {rel} ({len(data)} bytes)."
 
 
+def _tool_server_post(path: str, payload: dict, timeout: int) -> httpx.Response:
+    """POST to the tool server over its Unix-domain socket — no TCP, no network.
+
+    httpx treats the socket as a first-class transport (``uds=``); the URL host is
+    only used for the Host header (ignored for the local connection), so any valid
+    authority works. Factored out so tests can stub the call without touching httpx.
+    """
+    transport = httpx.HTTPTransport(uds=str(config.TOOL_SERVER_SOCKET))
+    with httpx.Client(transport=transport, timeout=timeout) as client:
+        return client.post(
+            f"http://aspen-tool-server{path}",
+            json=payload,
+            headers={"x-agent-secret": config.AGENT_INTERNAL_SECRET},
+        )
+
+
 def _call_tool_server(inp: dict, context: dict) -> tuple[str, list[str]]:
     """
-    POST to the FastAPI tool server for run_python_analysis.
+    POST to the FastAPI tool server for run_python_analysis (over its UDS).
     Returns (tool_result_text, figure_paths).
     context: {user_id, username, thread_ts}
     """
@@ -197,17 +213,15 @@ def _call_tool_server(inp: dict, context: dict) -> tuple[str, list[str]]:
         "username":  context.get("username", ""),
         "thread_ts": context.get("thread_ts", ""),
     }
+    timeout = int(os.getenv("EXECUTION_TIMEOUT_SECONDS", "120")) + 10
     try:
-        resp = requests.post(
-            f"{config.TOOL_SERVER_URL}/run_python_analysis/{project_name}",
-            json=payload,
-            headers={"x-agent-secret": config.AGENT_INTERNAL_SECRET},
-            timeout=int(os.getenv("EXECUTION_TIMEOUT_SECONDS", "120")) + 10,
-        )
-    except requests.exceptions.ConnectionError:
+        resp = _tool_server_post(f"/run_python_analysis/{project_name}", payload, timeout)
+    except httpx.ConnectError:
         return ("Error: tool server is not running. Start it with: python tool_server.py", [])
-    except requests.exceptions.Timeout:
+    except httpx.TimeoutException:
         return ("Error: tool server request timed out.", [])
+    except httpx.RequestError as exc:
+        return (f"Error: could not reach tool server ({type(exc).__name__}).", [])
 
     if resp.status_code == 403:
         return ("Error: tool server authentication failed.", [])
@@ -217,7 +231,7 @@ def _call_tool_server(inp: dict, context: dict) -> tuple[str, list[str]]:
     if resp.status_code == 422:
         detail = resp.json().get("detail", resp.text)
         return (f"Setup required: {detail}", [])
-    if not resp.ok:
+    if not resp.is_success:
         return (f"Error: tool server returned HTTP {resp.status_code}.", [])
 
     data = resp.json()
