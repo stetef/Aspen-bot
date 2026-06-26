@@ -129,3 +129,36 @@ def test_mplconfigdir_is_in_hook_writable_area(ts):
 def test_fontconfig_dir_bound_read_only(ts):
     cmd = _build(ts)
     assert _adjacent(cmd, "--ro-bind-try", "/etc/fonts", "/etc/fonts")
+
+
+def test_seccomp_flag_present_when_fd_given(ts):
+    cmd = ts.build_sandbox_cmd(
+        Path("/ws/generated/abc.py"), "p", Path("/projects/p"), seccomp_fd=7
+    )
+    assert _adjacent(cmd, "--seccomp", "7")
+
+
+def test_no_seccomp_flag_without_fd(ts):
+    # The default build (no fd) must not emit --seccomp.
+    assert "--seccomp" not in _build(ts)
+
+
+def test_seccomp_denylist_contract(ts):
+    deny = ts._SECCOMP_DENY
+    # The escalation primitives we must always block...
+    for s in ("unshare", "setns", "keyctl", "add_key", "ptrace", "bpf",
+              "init_module", "io_uring_setup", "userfaultfd", "perf_event_open", "clone3"):
+        assert s in deny, f"{s} must be in the seccomp denylist"
+    # ...and the syscalls numeric Python needs, which must never be blocked.
+    for s in ("clone", "futex", "mmap", "mprotect", "read", "write", "openat"):
+        assert s not in deny, f"{s} must NOT be blocked"
+    # clone3/io_uring fall back via ENOSYS; the rest deny with EPERM.
+    assert deny["clone3"] == "ENOSYS"
+    assert deny["unshare"] == "EPERM"
+
+
+def test_seccomp_bpf_is_bytes_or_none(ts):
+    # Built once at import: bytes when pyseccomp is available, else None (no filter).
+    assert ts._SECCOMP_BPF is None or (
+        isinstance(ts._SECCOMP_BPF, bytes) and len(ts._SECCOMP_BPF) > 0
+    )

@@ -15,6 +15,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -104,6 +105,76 @@ SANDBOX_ENV = {
     "MKL_NUM_THREADS": "2",
     "NUMEXPR_NUM_THREADS": "2",
 }
+
+# --- Analysis jail seccomp filter (defense-in-depth on the kernel surface) -----
+# bwrap confines what the analysis code can *reach*; seccomp confines which
+# syscalls it can issue to the (old) kernel — blocking the obscure, never-needed
+# ones that are the usual road to kernel privilege-escalation. Default-ALLOW with a
+# denylist: a strict allowlist is too brittle for arbitrary numeric Python. The
+# compiled BPF is built ONCE at startup (needs pyseccomp + libseccomp); if the
+# binding is missing the jail still runs WITHOUT the filter (logged loudly) — the
+# bind-mount/namespace boundary is unaffected. Toggle with ANALYSIS_SECCOMP.
+ANALYSIS_SECCOMP = os.getenv("ANALYSIS_SECCOMP", "true").lower() in ("1", "true", "yes")
+
+# name -> errno on attempt. ENOSYS (not EPERM) for clone3/io_uring so glibc/libs
+# fall back cleanly rather than erroring; everything else EPERM. Names unknown on
+# this kernel/arch are skipped at build time. Verified transparent to
+# numpy/pandas/scipy/matplotlib/py3Dmol on this host.
+_SECCOMP_DENY = {
+    "clone3": "ENOSYS", "io_uring_setup": "ENOSYS",
+    "io_uring_enter": "ENOSYS", "io_uring_register": "ENOSYS",
+}
+_SECCOMP_DENY.update({s: "EPERM" for s in (
+    # new-identity / namespace / mount-escape primitives
+    "unshare", "setns", "mount", "umount2", "pivot_root", "chroot",
+    "move_mount", "open_tree", "fsopen", "fsconfig", "fsmount", "fspick",
+    # kernel keyrings (classic LPE foothold)
+    "add_key", "request_key", "keyctl",
+    # cross-process / debug
+    "ptrace", "process_vm_readv", "process_vm_writev",
+    # kernel modules / system control
+    "init_module", "finit_module", "delete_module", "kexec_load", "kexec_file_load",
+    "bpf", "perf_event_open", "reboot", "swapon", "swapoff",
+    "settimeofday", "clock_settime", "clock_adjtime", "adjtimex",
+    "sethostname", "setdomainname", "acct", "quotactl", "_sysctl",
+    # memory-corruption primitive
+    "userfaultfd",
+)})
+
+
+def _build_seccomp_bpf() -> Optional[bytes]:
+    """Compile the denylist to a BPF program once at startup. Returns the program
+    bytes, or None if seccomp is disabled or the binding is unavailable (the jail
+    then runs without the filter; the bind-mount/namespace boundary still holds).
+    Note: we only EXPORT the program — never ``load()`` it — so the tool server
+    process itself is not filtered."""
+    if not ANALYSIS_SECCOMP:
+        log.info("Analysis seccomp filter disabled via ANALYSIS_SECCOMP.")
+        return None
+    try:
+        import errno as _errno
+        import pyseccomp as _seccomp
+    except Exception as exc:
+        log.warning("pyseccomp unavailable (%s) — analysis jail runs WITHOUT a "
+                    "seccomp filter; bwrap/namespace isolation still applies.", exc)
+        return None
+    flt = _seccomp.SyscallFilter(defaction=_seccomp.ALLOW)
+    applied = 0
+    for name, errname in _SECCOMP_DENY.items():
+        try:
+            flt.add_rule(_seccomp.ERRNO(getattr(_errno, errname)), name)
+            applied += 1
+        except Exception:
+            pass  # syscall unknown on this kernel/arch — skip
+    with tempfile.TemporaryFile() as tf:
+        flt.export_bpf(tf)
+        tf.seek(0)
+        blob = tf.read()
+    log.info("Analysis seccomp filter compiled: %d rules, %d bytes.", applied, len(blob))
+    return blob
+
+
+_SECCOMP_BPF = _build_seccomp_bpf()
 
 for _d in [FIGURES_DIR, FIGURE_ARCHIVE_DIR, CACHE_DIR, LOGS_DIR,
            GENERATED_CODE_DIR, SQLITE_DB_ROOT]:
@@ -471,7 +542,8 @@ def _python_bind_paths() -> tuple[str, ...]:
     return tuple(paths)
 
 
-def build_sandbox_cmd(script_path: Path, project_name: str, project_path: Path) -> list[str]:
+def build_sandbox_cmd(script_path: Path, project_name: str, project_path: Path,
+                      seccomp_fd: Optional[int] = None) -> list[str]:
     """Assemble the ``prlimit`` + ``bwrap`` argv that runs the analysis script in a
     no-network, read-only-filesystem jail. Pure (no side effects) so it is unit-testable.
 
@@ -489,6 +561,11 @@ def build_sandbox_cmd(script_path: Path, project_name: str, project_path: Path) 
         "--dev", "/dev",
         "--tmpfs", "/tmp",
     ]
+    # Seccomp syscall filter (the kernel-surface guard). Applied to the analysis
+    # process after bwrap's own setup, so blocking unshare/mount/clone3 here doesn't
+    # hinder the jail itself. Omitted when no filter is available.
+    if seccomp_fd is not None:
+        bwrap += ["--seccomp", str(seccomp_fd)]
     # System libraries / interpreters, read-only. -try so a missing path is skipped
     # rather than fatal. No /home, no /etc secrets, no other projects.
     for p in ANALYSIS_RO_PATHS:
@@ -538,7 +615,21 @@ def run_in_bwrap(
     """
     figures_before = set(FIGURES_DIR.glob("*.png"))
 
-    cmd = build_sandbox_cmd(script_path, project_name, project_path)
+    # Materialize the compiled seccomp BPF into an inheritable fd for bwrap's
+    # --seccomp. A per-call file (not a shared one) so concurrent runs don't race
+    # on a single fd's read offset.
+    seccomp_file = None
+    seccomp_fd = None
+    if _SECCOMP_BPF is not None:
+        seccomp_file = tempfile.TemporaryFile()
+        seccomp_file.write(_SECCOMP_BPF)
+        seccomp_file.flush()
+        seccomp_file.seek(0)
+        os.set_inheritable(seccomp_file.fileno(), True)
+        seccomp_fd = seccomp_file.fileno()
+
+    cmd = build_sandbox_cmd(script_path, project_name, project_path, seccomp_fd=seccomp_fd)
+    pass_fds = (seccomp_fd,) if seccomp_fd is not None else ()
 
     log.info("Launching bwrap sandbox for project=%s script=%s", project_name, script_path.name)
     t0 = time.monotonic()
@@ -550,6 +641,7 @@ def run_in_bwrap(
             text=True,
             timeout=EXECUTION_TIMEOUT,
             env=SANDBOX_ENV,           # scrubbed env — bwrap forwards exactly these vars
+            pass_fds=pass_fds,         # hand bwrap the compiled seccomp BPF (if any)
         )
         duration = time.monotonic() - t0
         stdout = filter_secrets(proc.stdout)
@@ -571,6 +663,9 @@ def run_in_bwrap(
         stderr = filter_secrets(exc.stderr or "")
         status = "timeout"
         log.warning("bwrap sandbox timed out after %ds for project=%s", EXECUTION_TIMEOUT, project_name)
+    finally:
+        if seccomp_file is not None:
+            seccomp_file.close()
 
     # Collect any new figures produced
     figures_after = set(FIGURES_DIR.glob("*.png"))
