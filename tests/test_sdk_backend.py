@@ -167,6 +167,7 @@ def test_build_options_locks_down_tools(sut):
     assert opts.allowed_tools == [
         "mcp__aspen__list_directory",
         "mcp__aspen__read_file",
+        "mcp__aspen__search_files",
         "mcp__aspen__attach_file",
         "mcp__aspen__write_metadata",
         "mcp__aspen__run_python_analysis",
@@ -260,6 +261,7 @@ def test_bash_allowlist_override_flows_into_allowed_tools(sut, monkeypatch):
     assert opts.allowed_tools == [
         "mcp__aspen__list_directory",
         "mcp__aspen__read_file",
+        "mcp__aspen__search_files",
         "mcp__aspen__attach_file",
         "mcp__aspen__write_metadata",
         "mcp__aspen__run_python_analysis",

@@ -87,6 +87,63 @@ def test_read_file_outside_root(sut):
 
 
 # --------------------------------------------------------------------------- #
+# _search_files
+# --------------------------------------------------------------------------- #
+def test_search_files_finds_content_match(sut):
+    proj = sut.CALCULATIONS_ROOT / "srch"
+    proj.mkdir()
+    (proj / "a.log").write_text("line one\nSCF not converged\nline three\n")
+    (proj / "b.log").write_text("all good here\n")
+    out = sut._search_files("not converged", "srch")
+    assert "srch/a.log:2:" in out
+    assert "SCF not converged" in out
+    assert "b.log" not in out
+
+
+def test_search_files_no_match_reports_count(sut):
+    proj = sut.CALCULATIONS_ROOT / "srch_none"
+    proj.mkdir()
+    (proj / "x.txt").write_text("nothing interesting\n")
+    out = sut._search_files("zzz-absent", "srch_none")
+    assert out.startswith("No matches for 'zzz-absent'")
+
+
+def test_search_files_regex_mode(sut):
+    proj = sut.CALCULATIONS_ROOT / "srch_re"
+    proj.mkdir()
+    (proj / "e.txt").write_text("energy = -1234.56 eV\n")
+    out = sut._search_files(r"-\d+\.\d+", "srch_re", regex=True)
+    assert "e.txt:1:" in out
+
+
+def test_search_files_rejects_traversal(sut):
+    out = sut._search_files("anything", "../..")
+    assert "outside the allowed directory" in out
+
+
+def test_search_files_cannot_read_outside_root(sut, tmp_path):
+    # A secret outside the calculations root must never surface in results, even
+    # though the bot's user can read it — the tool is fenced to the root.
+    secret = tmp_path / "outside_secret.txt"
+    secret.write_text("TOPSECRET_TOKEN_42\n")
+    (sut.CALCULATIONS_ROOT / "inside.txt").write_text("ordinary data\n")
+    out = sut._search_files("TOPSECRET_TOKEN_42", ".")
+    # A no-match reply echoes the query, so check the secret FILE wasn't reached:
+    assert out.startswith("No matches")
+    assert "outside_secret" not in out
+
+
+def test_search_files_skips_binary(sut):
+    proj = sut.CALCULATIONS_ROOT / "srch_bin"
+    proj.mkdir()
+    (proj / "data.bin").write_bytes(b"\x00\x01PATTERN\x00")
+    (proj / "notes.txt").write_text("PATTERN here\n")
+    out = sut._search_files("PATTERN", "srch_bin")
+    assert "notes.txt:1:" in out
+    assert "data.bin" not in out
+
+
+# --------------------------------------------------------------------------- #
 # _attach_file
 # --------------------------------------------------------------------------- #
 def test_attach_file_returns_resolved_path(sut):

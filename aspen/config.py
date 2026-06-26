@@ -36,6 +36,10 @@ MAX_CONCURRENT        = int(os.getenv("MAX_CONCURRENT_EXECUTIONS", "5"))
 MAX_FILE_BYTES        = int(os.getenv("MAX_FILE_READ_BYTES", "50000"))
 # Cap on a single file the agent may attach to a reply via the attach_file tool.
 MAX_ATTACHMENT_BYTES  = int(os.getenv("MAX_ATTACHMENT_BYTES", str(25 * 1024 * 1024)))
+# search_files limits (in-process content search, confined to the calculations root).
+SEARCH_MAX_FILES      = int(os.getenv("ASPEN_SEARCH_MAX_FILES", "3000"))
+SEARCH_MAX_MATCHES    = int(os.getenv("ASPEN_SEARCH_MAX_MATCHES", "200"))
+SEARCH_MAX_FILE_BYTES = int(os.getenv("ASPEN_SEARCH_MAX_FILE_BYTES", str(2 * 1024 * 1024)))
 
 # Tool server (only needed when run_python_analysis is used)
 AGENT_INTERNAL_SECRET = os.getenv("AGENT_INTERNAL_SECRET", "")

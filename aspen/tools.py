@@ -13,6 +13,7 @@ in ``dispatch``.
 
 import logging
 import os
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,6 +78,94 @@ def _read_file(rel: str) -> str:
         return f"--- {rel} ---\n{content}{truncation_note}"
     except PermissionError:
         return f"Error: permission denied for '{rel}'."
+
+
+def _search_files(query: str, rel: str = ".", regex: bool = False,
+                  case_sensitive: bool = False) -> str:
+    """Search file *contents* for ``query`` under the calculations root.
+
+    Like grep, but safe by construction: the start path is fenced to
+    CALCULATIONS_ROOT (same ``_safe_path`` check as read_file), the walk does not
+    follow symlinked directories, and every file's real path is re-checked to be
+    inside the root — so it can never read ``~/.ssh``, ``.env``, or anything else
+    outside the tree. Pure in-process; it never shells out. Bounded by the
+    SEARCH_MAX_* caps so a huge tree can't hang or flood the reply.
+    """
+    if not query:
+        return "Error: search query is empty."
+    base = _safe_path(rel)
+    if base is None:
+        return f"Error: '{rel}' is outside the allowed directory."
+    if not base.exists():
+        return f"Error: '{rel}' does not exist."
+
+    flags = 0 if case_sensitive else re.IGNORECASE
+    try:
+        pattern = re.compile(query if regex else re.escape(query), flags)
+    except re.error as exc:
+        return f"Error: invalid regular expression: {exc}"
+
+    root = config.CALCULATIONS_ROOT
+    matches: list[str] = []
+    files_scanned = 0
+    files_capped = False
+    hit_match_cap = False
+
+    # A single file, or a directory walk (not following symlinked dirs).
+    if base.is_file():
+        candidates = [base]
+    else:
+        candidates = (
+            Path(dp) / fn
+            for dp, _dirs, files in os.walk(base, followlinks=False)
+            for fn in files
+        )
+
+    for fpath in candidates:
+        if files_scanned >= config.SEARCH_MAX_FILES:
+            files_capped = True
+            break
+        try:
+            if not fpath.is_file():
+                continue
+            # symlink safety: the real target must still be inside the root
+            if not fpath.resolve().is_relative_to(root):
+                continue
+        except OSError:
+            continue
+        files_scanned += 1
+        try:
+            with open(fpath, "rb") as fh:
+                raw = fh.read(config.SEARCH_MAX_FILE_BYTES)
+        except OSError:
+            continue
+        if b"\x00" in raw:
+            continue  # binary file — skip
+        text = raw.decode("utf-8", errors="replace")
+        try:
+            rel_name = fpath.relative_to(root)
+        except ValueError:
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if pattern.search(line):
+                snippet = line.strip()
+                if len(snippet) > 300:
+                    snippet = snippet[:300] + "…"
+                matches.append(f"{rel_name}:{lineno}: {snippet}")
+                if len(matches) >= config.SEARCH_MAX_MATCHES:
+                    hit_match_cap = True
+                    break
+        if hit_match_cap:
+            break
+
+    if not matches:
+        return f"No matches for {query!r} under '{rel}' ({files_scanned} file(s) searched)."
+    out = [f"{len(matches)} match(es) for {query!r} under '{rel}':", *matches]
+    if hit_match_cap:
+        out.append(f"(stopped at the {config.SEARCH_MAX_MATCHES}-match limit — narrow your query)")
+    if files_capped:
+        out.append(f"(stopped after scanning {config.SEARCH_MAX_FILES} files — narrow the path)")
+    return "\n".join(out)
 
 
 def _attach_file(rel: str) -> tuple[str, list[str]]:
@@ -302,6 +391,45 @@ TOOL_SPECS = [
             "required": ["path"],
         },
         "impl": lambda inp, _ctx: (_read_file(inp["path"]), []),
+    },
+    {
+        "name": "search_files",
+        "description": (
+            "Search file CONTENTS for a string or regex under the calculations root "
+            "— like grep, but safely confined to the calculations root. Returns "
+            "matching files with line numbers and the matching line. Use it to find "
+            "where a value, keyword, or setting appears across runs and logs. The "
+            "path is relative to the calculations root (default '.' = the whole tree)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Text to search for (a literal substring by default).",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Subdirectory or file under the calculations root to search. Default '.'",
+                },
+                "regex": {
+                    "type": "boolean",
+                    "description": "Treat query as a regular expression instead of a literal string. Default false.",
+                },
+                "case_sensitive": {
+                    "type": "boolean",
+                    "description": "Case-sensitive match. Default false.",
+                },
+            },
+            "required": ["query"],
+        },
+        "impl": lambda inp, _ctx: (
+            _search_files(
+                inp["query"], inp.get("path", "."),
+                bool(inp.get("regex", False)), bool(inp.get("case_sensitive", False)),
+            ),
+            [],
+        ),
     },
     {
         "name": "attach_file",
