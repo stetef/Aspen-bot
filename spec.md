@@ -98,6 +98,11 @@ no inbound ports, no public URL, no firewall exceptions on the cluster.
 
 ### App configuration
 
+> **Setup runbook.** The click-by-click app creation, scopes, events, install, and
+> reinstall steps — plus an importable manifest — live in
+> [`SLACK_SETUP.md`](SLACK_SETUP.md) / [`slack-app-manifest.yaml`](slack-app-manifest.yaml).
+> This section is the summary.
+
 - **Socket Mode:** enabled
 - **App-Level Token** (`connections:write`) → `SLACK_APP_TOKEN`
 - **Bot Token** (scopes below) → `SLACK_BOT_TOKEN`
@@ -110,13 +115,23 @@ no inbound ports, no public URL, no firewall exceptions on the cluster.
 | `files:write` | Upload figures and attached files |
 | `im:history` | Read DM threads for context |
 | `channels:history` | Read channel threads Aspen is in, for context |
+| `mpim:history` | Read group-DM (multi-person DM) threads Aspen is in, for context |
+| `mpim:read` | List a group DM's members — used by the participant gate (below) and to classify `app_mention`s as group DMs |
+| `users:read` | Resolve member IDs → display names and identify app/bot members, for the participant gate's membership check and its reply |
 
-Aspen has no `channels:read` or unrestricted history access — it only sees threads it was
-mentioned in.
+Aspen has no `channels:read` or unrestricted history access — it only sees conversations it
+was mentioned in (or DMed in). Adding/removing scopes requires reinstalling the app.
+
+> **Note — 1:1 human DMs can't include a bot.** Slack does not allow adding an app to an
+> existing direct message between two people. To message Aspen alongside another person,
+> create a **group DM** (a multi-person DM) that includes Aspen, then @-mention it there.
 
 ### Interaction model
 
-- Responds only to `@Aspen` mentions in channels or DMs; ignores non-mention messages.
+- Responds only to `@Aspen` mentions in channels, group DMs, or its own 1:1 DM;
+  ignores non-mention messages. (The `message` event is handled only for 1:1 DMs
+  (`channel_type == "im"`); channels and group DMs are driven by `app_mention`, so
+  Aspen stays silent unless explicitly tagged.)
 - While working, it shows Slack's native **"Aspen is typing…"** status via
   `assistant.threads.setStatus` (a daemon thread re-asserts it every ~50 s and clears it
   before the reply). On channel @-mentions where `setStatus` doesn't apply, it falls back
@@ -126,9 +141,35 @@ mentioned in.
 ### User allowlist
 
 Aspen acts only on Slack user IDs in `ASPEN_ALLOWED_SLACK_USER_IDS` (comma-separated).
-Anyone else is ignored with at most one "not authorized" reply. This check is the **first
-authorization gate**, before rate limiting and before any tool runs. In the current dev
-mode the allowlist must contain only the developer's own ID.
+Anyone else gets at most one "not authorized" reply that names the admin to contact. This
+check is the **first authorization gate**, before rate limiting and before any tool runs.
+In the current dev mode the allowlist must contain only the developer's own ID.
+
+**Admin.** The **first** ID in `ASPEN_ALLOWED_SLACK_USER_IDS` is presumed to be Aspen's
+admin and is @-mentioned in the "not authorized" and group-DM refusals so users know who
+to ask to be added. Override with `ASPEN_ADMIN_SLACK_USER_ID` if the admin isn't the first
+allowlisted user.
+
+### Participant gate (group DMs)
+
+In a **group DM**, the per-mentioner allowlist isn't sufficient: everyone in the room can
+read Aspen's answers and every message in the thread flows into the model's context. So
+before running a turn in a group DM, Aspen requires that **every human member be
+allowlisted**. If any aren't, it declines and posts a message naming them and pointing to
+the admin (allowlisted users can still DM Aspen directly). The check (in `_handle_event`):
+
+1. Classify the conversation — `channel_type == "mpim"`, or `conversations.info`'s
+   `is_mpim` for `app_mention`s (which omit `channel_type`). Non-group conversations skip
+   the gate.
+2. List members (`conversations.members`), drop Aspen itself and any **app/bot** members
+   (only humans must be allowlisted), and check the rest against the allowlist.
+3. **Fail closed** — if membership can't be verified (e.g. a missing scope), Aspen
+   declines rather than answering in a room it can't vet.
+
+The gate runs **after** the mentioner allowlist check and **before** rate limiting, so a
+blocked group DM consumes no rate-limit slot. It applies to group DMs only; channels keep
+the per-mentioner behavior (requiring every member of a public channel to be allowlisted
+isn't practical, and broad channel rollout waits for the service account — [§16.1](#161-production-deployment-service-account--systemd)).
 
 ---
 
@@ -351,7 +392,8 @@ See `.env.example` for the full annotated list. Key groups:
 ```bash
 # Slack / auth
 SLACK_BOT_TOKEN=xoxb-...      SLACK_APP_TOKEN=xapp-...
-ASPEN_ALLOWED_SLACK_USER_IDS=U0XXXXXXXXX        # dev mode: developer's ID only
+ASPEN_ALLOWED_SLACK_USER_IDS=U0XXXXXXXXX        # dev mode: developer's ID only; 1st = admin
+ASPEN_ADMIN_SLACK_USER_ID=                       # optional; default = first allowlisted ID
 ANTHROPIC_API_KEY=sk-ant-...                     # only if ASPEN_SDK_USE_SUBSCRIPTION=false
 ASPEN_SDK_USE_SUBSCRIPTION=true                  # default: use the Claude Code login
 ANTHROPIC_MODEL=claude-opus-4-8
@@ -394,7 +436,7 @@ Paths and identity-specific values are driven entirely from `.env` (no hardcoded
 
 | Layer | Protection |
 |---|---|
-| Authorization | Slack user-ID allowlist — first gate, before rate limiting |
+| Authorization | Slack user-ID allowlist — first gate, before rate limiting. In group DMs, a **participant gate** additionally requires *every* human member to be allowlisted (fail-closed) |
 | Slack connection | Socket Mode — outbound WebSocket only, no open ports |
 | Tool surface | Locked-down allowlist + `can_use_tool` deny; host settings ignored; Bash = Slurm read-only |
 | Read/search tools | Path-fenced in Python to the calculations root; can't read `~/.ssh`, `.env`, etc. |
@@ -410,8 +452,9 @@ Paths and identity-specific values are driven entirely from `.env` (no hardcoded
 A consolidated threat model (assets, actors, accepted interim risks, and the
 service-account cutover checklist) is in [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
-**Hard constraints — Aspen can never:** act for a non-allowlisted user; write any project
-file other than `metadata.md`; submit/cancel/inspect Slurm jobs (read-only investigation
+**Hard constraints — Aspen can never:** act for a non-allowlisted user; engage in a group
+DM that contains any non-allowlisted human (participant gate, fail-closed); write any
+project file other than `metadata.md`; submit/cancel/inspect Slurm jobs (read-only investigation
 only); reach files outside the calculations root / workspace; make network calls from
 inside the analysis jail.
 

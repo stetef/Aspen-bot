@@ -39,6 +39,69 @@ app = App(
 # Generous ceiling for a single turn (the analysis sandbox has its own timeout).
 _TURN_TIMEOUT = int(os.getenv("EXECUTION_TIMEOUT_SECONDS", "120")) + 600
 
+# Aspen's own Slack user ID, resolved once via auth.test and cached. Used to skip
+# the bot itself when checking who is present in a group DM.
+_bot_uid_cache: str | None = None
+
+
+def _bot_user_id(client) -> str:
+    global _bot_uid_cache
+    if _bot_uid_cache is None:
+        _bot_uid_cache = client.auth_test()["user_id"]
+    return _bot_uid_cache
+
+
+def _admin_mention() -> str:
+    """A Slack mention for the admin (``<@U…>``), or a generic phrase if unset.
+
+    Rendered in Slack as a clickable @-mention that pings the admin, so users in a
+    shared room can reach out to be added.
+    """
+    return f"<@{config.ADMIN_USER_ID}>" if config.ADMIN_USER_ID else "an Aspen admin"
+
+
+def _is_group_dm(event: dict, client, channel: str) -> bool:
+    """True only for multi-person DMs (``mpim``).
+
+    ``message`` events carry ``channel_type`` directly; ``app_mention`` events do
+    not, so fall back to ``conversations.info`` (readable for mpims via the
+    ``mpim:read`` scope). Any failure → treat as not-a-group-DM and fall through to
+    the existing per-mentioner behavior.
+    """
+    ctype = event.get("channel_type")
+    if ctype:
+        return ctype == "mpim"
+    try:
+        return bool(client.conversations_info(channel=channel)["channel"].get("is_mpim"))
+    except Exception:
+        log.debug("conversations_info failed for %s; treating as non-mpim", channel, exc_info=True)
+        return False
+
+
+def _unauthorized_group_members(client, channel: str) -> list[str]:
+    """Display names of *human* members of a group DM not on the allowlist.
+
+    Raises on Slack API failure so the caller can fail closed (decline rather than
+    answer in a room it can't vet). Only non-allowlisted members are resolved via
+    ``users.info`` (needs ``users:read``); bots/apps among them are skipped — only
+    humans must be on the allowlist. Group DMs cap at ~9 members, so no pagination.
+    """
+    members = client.conversations_members(channel=channel).get("members", [])
+    bot_uid = _bot_user_id(client)
+    outsiders: list[str] = []
+    for m in members:
+        if m == bot_uid or m in config.ALLOWED_USER_IDS:
+            continue
+        try:
+            info = client.users_info(user=m)["user"]
+        except Exception:
+            info = {}
+        if info.get("is_bot"):
+            continue  # other apps/bots needn't be on the human allowlist
+        prof = info.get("profile", {})
+        outsiders.append(prof.get("display_name") or prof.get("real_name") or m)
+    return outsiders
+
 
 def _start_typing_status(client, channel: str, thread_ts: str, say):
     """Show a native "Aspen is typing…" status for the duration of a turn.
@@ -96,10 +159,46 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
     thread_ts = event.get("thread_ts") or event.get("ts")
     channel   = event.get("channel", "")
 
-    # 1. Allowlist check — first gate
+    # 1. Allowlist check — first gate (the mentioner must be allowlisted)
     if uid not in config.ALLOWED_USER_IDS:
-        say(text="Sorry, you're not authorized to use Aspen.", thread_ts=thread_ts)
+        say(
+            text=(
+                f"Sorry, you're not authorized to use Aspen. Contact {_admin_mention()} "
+                "to be added to the approved-users list."
+            ),
+            thread_ts=thread_ts,
+        )
         return
+
+    # 1b. Participant gate — in a group DM, *every* human member must be
+    # allowlisted, not just the mentioner. This keeps Aspen's answers and the
+    # thread context it reads out of any room containing an unapproved person.
+    # Fail closed: if membership can't be verified, decline rather than answer.
+    if _is_group_dm(event, client, channel):
+        try:
+            outsiders = _unauthorized_group_members(client, channel)
+        except Exception:
+            log.exception("Could not verify group-DM membership for %s", channel)
+            say(
+                text=(
+                    "I couldn't verify everyone in this group, so I'm staying out to be "
+                    f"safe. Approved users can DM me directly, or contact {_admin_mention()}."
+                ),
+                thread_ts=thread_ts,
+            )
+            return
+        if outsiders:
+            names = ", ".join(f"*{n}*" for n in outsiders)
+            say(
+                text=(
+                    "I can only work in a group where everyone is on my approved-users "
+                    f"list. These members aren't yet: {names}. Please contact {_admin_mention()} "
+                    "to have them added. In the meantime, any approved user can DM me "
+                    "directly with questions."
+                ),
+                thread_ts=thread_ts,
+            )
+            return
 
     # 2. Per-user rate limit + concurrency check
     err = ratelimit._check_rate_limit(uid)

@@ -1,8 +1,8 @@
 # Aspen — Threat Model & Security Measures
 
-_Last updated: 2026-06-25. Scope: the system **as built** after the
-`security/interim-hardening` pass, plus the security work still owed (notably the
-move to a dedicated service account). Companion to [`spec.md`](spec.md) (design)
+_Last updated: 2026-06-29. Scope: the system **as built** after the
+`security/interim-hardening` pass and the group-DM participant gate (C7), plus the
+security work still owed (notably the move to a dedicated service account). Companion to [`spec.md`](spec.md) (design)
 and [`probe_isolation.sh`](probe_isolation.sh) (host-fact verification)._
 
 This document records **why** Aspen is locked down the way it is: the context it
@@ -17,7 +17,7 @@ tell a deliberate decision from an accident.
 
 | Dimension | Reality | Consequence |
 |---|---|---|
-| Users | The SMB/SSRL research group, via a **SLAC-managed (SSO) Slack** workspace | The user-ID allowlist is a *strong* auth gate; spoofing/external entry is low-risk |
+| Users | The SMB/SSRL research group, via a **SLAC-managed (SSO) Slack** workspace | The user-ID allowlist is a *strong* auth gate; spoofing/external entry is low-risk. Multi-user rooms (group DMs) are gated so the allowlist also bounds *who can read along*, not just who can invoke (C7) |
 | Data sensitivity | **Public / publishable** computational chemistry | Confidentiality is low priority; **integrity & availability** matter more |
 | Host | A **shared multi-user login node** (`sdfiana*`) | `127.0.0.1` ports and the bot's files are reachable/visible to other lab users |
 | Bot identity (interim) | Runs as a **developer's personal Unix account** with SSH keys + munge (job submission) + group data access | If any confinement is bypassed, the blast radius is that whole cluster identity — this is the dominant interim risk, fixed only by the service account (§7) |
@@ -38,7 +38,11 @@ tell a deliberate decision from an accident.
 ## 3. Trust boundaries
 
 - **Slack → bot** — Socket Mode, outbound WebSocket only; auth = SSO-backed
-  user-ID allowlist. Strong.
+  user-ID allowlist. Strong. In a **group DM**, the mentioner check is not enough
+  (every member reads the replies and the thread context feeds the model), so a
+  **participant gate** additionally requires *every human member* to be allowlisted,
+  fail-closed (C7). 1:1 human DMs can't contain a bot, so there's no equivalent
+  exposure there.
 - **Bot → tool server** — a **Unix-domain socket** in a `0700` directory (+ a
   shared-secret header). On a shared node this replaces a loopback TCP port that
   every local user could reach.
@@ -101,8 +105,9 @@ Two single-instance processes:
 | C4 | **`metadata.md` versioned backups** | `write_metadata` is a whole-file replace; careless overwrite is the top integrity risk. Prior version saved to `<workspace>/metadata_history/<project>/<UTC>.md` | `tools.py` |
 | C5 | **Bot ↔ tool server over a Unix socket** (was `127.0.0.1` TCP) | A loopback port is connectable by any local user; a socket in a `0700` dir is not | `tool_server.py`, `tools.py`, `config.py` |
 | C6 | **seccomp syscall denylist on the analysis jail** | The one lever on the kernel→root path from inside the jail on this old kernel; blocks namespace/mount/keyring/ptrace/module/bpf/io_uring/userfaultfd/etc. | `tool_server.py` |
+| C7 | **Group-DM participant gate** | In a group DM, the per-mentioner allowlist leaks Aspen's answers and the read thread context to *every* member — including people who could never DM it (a new prompt-injection + disclosure surface). Require **every human member** allowlisted; **fail closed** if membership can't be verified. App/bot members are exempt (only humans need approval). | `slack_app.py`, `config.py` |
 
-All controls are covered by the hermetic test suite (`pytest -q`, 95 tests),
+All controls are covered by the hermetic test suite (`pytest -q`, 102 tests),
 including contract tests that fail if a file-reader re-enters the allowlist or the
 seccomp denylist loses a key entry.
 

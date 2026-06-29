@@ -31,6 +31,7 @@ _MODMAP = {
     "RATE_LIMIT_REQUESTS": "aspen.config",
     "RATE_LIMIT_WINDOW": "aspen.config",
     "ALLOWED_USER_IDS": "aspen.config",
+    "ADMIN_USER_ID": "aspen.config",
     # prompts
     "SYSTEM_PROMPT": "aspen.prompts",
     # tools
@@ -62,6 +63,11 @@ _MODMAP = {
     "_handle_event": "aspen.slack_app",
     "_start_typing_status": "aspen.slack_app",
     "_STATUS_TEXT": "aspen.slack_app",
+    "_is_group_dm": "aspen.slack_app",
+    "_unauthorized_group_members": "aspen.slack_app",
+    "_bot_user_id": "aspen.slack_app",
+    "_bot_uid_cache": "aspen.slack_app",
+    "_admin_mention": "aspen.slack_app",
 }
 
 
@@ -131,6 +137,7 @@ def _reset_state(sut):
     sut._rate_data.clear()
     sut._user_active.clear()
     sut._global_sem = threading.Semaphore(sut.MAX_CONCURRENT)
+    sut._bot_uid_cache = None  # re-resolve the bot's own ID per test client
     sut.MANAGER.clear()
     yield
 
