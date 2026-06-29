@@ -13,10 +13,13 @@ in ``dispatch``.
 
 import logging
 import os
+import re
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import requests
+import httpx
 
 from . import config
 
@@ -77,6 +80,94 @@ def _read_file(rel: str) -> str:
         return f"Error: permission denied for '{rel}'."
 
 
+def _search_files(query: str, rel: str = ".", regex: bool = False,
+                  case_sensitive: bool = False) -> str:
+    """Search file *contents* for ``query`` under the calculations root.
+
+    Like grep, but safe by construction: the start path is fenced to
+    CALCULATIONS_ROOT (same ``_safe_path`` check as read_file), the walk does not
+    follow symlinked directories, and every file's real path is re-checked to be
+    inside the root — so it can never read ``~/.ssh``, ``.env``, or anything else
+    outside the tree. Pure in-process; it never shells out. Bounded by the
+    SEARCH_MAX_* caps so a huge tree can't hang or flood the reply.
+    """
+    if not query:
+        return "Error: search query is empty."
+    base = _safe_path(rel)
+    if base is None:
+        return f"Error: '{rel}' is outside the allowed directory."
+    if not base.exists():
+        return f"Error: '{rel}' does not exist."
+
+    flags = 0 if case_sensitive else re.IGNORECASE
+    try:
+        pattern = re.compile(query if regex else re.escape(query), flags)
+    except re.error as exc:
+        return f"Error: invalid regular expression: {exc}"
+
+    root = config.CALCULATIONS_ROOT
+    matches: list[str] = []
+    files_scanned = 0
+    files_capped = False
+    hit_match_cap = False
+
+    # A single file, or a directory walk (not following symlinked dirs).
+    if base.is_file():
+        candidates = [base]
+    else:
+        candidates = (
+            Path(dp) / fn
+            for dp, _dirs, files in os.walk(base, followlinks=False)
+            for fn in files
+        )
+
+    for fpath in candidates:
+        if files_scanned >= config.SEARCH_MAX_FILES:
+            files_capped = True
+            break
+        try:
+            if not fpath.is_file():
+                continue
+            # symlink safety: the real target must still be inside the root
+            if not fpath.resolve().is_relative_to(root):
+                continue
+        except OSError:
+            continue
+        files_scanned += 1
+        try:
+            with open(fpath, "rb") as fh:
+                raw = fh.read(config.SEARCH_MAX_FILE_BYTES)
+        except OSError:
+            continue
+        if b"\x00" in raw:
+            continue  # binary file — skip
+        text = raw.decode("utf-8", errors="replace")
+        try:
+            rel_name = fpath.relative_to(root)
+        except ValueError:
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if pattern.search(line):
+                snippet = line.strip()
+                if len(snippet) > 300:
+                    snippet = snippet[:300] + "…"
+                matches.append(f"{rel_name}:{lineno}: {snippet}")
+                if len(matches) >= config.SEARCH_MAX_MATCHES:
+                    hit_match_cap = True
+                    break
+        if hit_match_cap:
+            break
+
+    if not matches:
+        return f"No matches for {query!r} under '{rel}' ({files_scanned} file(s) searched)."
+    out = [f"{len(matches)} match(es) for {query!r} under '{rel}':", *matches]
+    if hit_match_cap:
+        out.append(f"(stopped at the {config.SEARCH_MAX_MATCHES}-match limit — narrow your query)")
+    if files_capped:
+        out.append(f"(stopped after scanning {config.SEARCH_MAX_FILES} files — narrow the path)")
+    return "\n".join(out)
+
+
 def _attach_file(rel: str) -> tuple[str, list[str]]:
     """Mark a calculations-root file for upload alongside the reply.
 
@@ -99,6 +190,25 @@ def _attach_file(rel: str) -> tuple[str, list[str]]:
             [],
         )
     return f"Attached '{rel}' — it will be uploaded with the reply.", [str(path)]
+
+
+def _backup_metadata(target: Path, project: str) -> None:
+    """Snapshot the current metadata.md before it is overwritten, so a careless
+    whole-file replace is recoverable. Best-effort — a backup failure never blocks
+    the write. History lives under the workspace (writable), one timestamped copy
+    per overwrite: ``<workspace>/metadata_history/<project>/<UTC>.md``."""
+    try:
+        hist_dir = config.WORKSPACE_ROOT / "metadata_history" / project
+        hist_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest = hist_dir / f"{ts}.md"
+        n = 1
+        while dest.exists():            # multiple overwrites within the same second
+            dest = hist_dir / f"{ts}-{n}.md"
+            n += 1
+        shutil.copy2(target, dest)
+    except Exception:
+        log.exception("metadata backup failed (non-fatal) for project %s", project)
 
 
 def _write_metadata(project: str, content: str) -> str:
@@ -142,6 +252,8 @@ def _write_metadata(project: str, content: str) -> str:
         )
 
     existed = target.exists()
+    if existed:
+        _backup_metadata(target, project)   # snapshot the version we're about to clobber
     try:
         # Atomic replace so an interrupted write can't leave a half-written file.
         tmp = target.with_suffix(".md.tmp")
@@ -156,9 +268,25 @@ def _write_metadata(project: str, content: str) -> str:
     return f"{verb} {rel} ({len(data)} bytes)."
 
 
+def _tool_server_post(path: str, payload: dict, timeout: int) -> httpx.Response:
+    """POST to the tool server over its Unix-domain socket — no TCP, no network.
+
+    httpx treats the socket as a first-class transport (``uds=``); the URL host is
+    only used for the Host header (ignored for the local connection), so any valid
+    authority works. Factored out so tests can stub the call without touching httpx.
+    """
+    transport = httpx.HTTPTransport(uds=str(config.TOOL_SERVER_SOCKET))
+    with httpx.Client(transport=transport, timeout=timeout) as client:
+        return client.post(
+            f"http://aspen-tool-server{path}",
+            json=payload,
+            headers={"x-agent-secret": config.AGENT_INTERNAL_SECRET},
+        )
+
+
 def _call_tool_server(inp: dict, context: dict) -> tuple[str, list[str]]:
     """
-    POST to the FastAPI tool server for run_python_analysis.
+    POST to the FastAPI tool server for run_python_analysis (over its UDS).
     Returns (tool_result_text, figure_paths).
     context: {user_id, username, thread_ts}
     """
@@ -174,17 +302,15 @@ def _call_tool_server(inp: dict, context: dict) -> tuple[str, list[str]]:
         "username":  context.get("username", ""),
         "thread_ts": context.get("thread_ts", ""),
     }
+    timeout = int(os.getenv("EXECUTION_TIMEOUT_SECONDS", "120")) + 10
     try:
-        resp = requests.post(
-            f"{config.TOOL_SERVER_URL}/run_python_analysis/{project_name}",
-            json=payload,
-            headers={"x-agent-secret": config.AGENT_INTERNAL_SECRET},
-            timeout=int(os.getenv("EXECUTION_TIMEOUT_SECONDS", "120")) + 10,
-        )
-    except requests.exceptions.ConnectionError:
+        resp = _tool_server_post(f"/run_python_analysis/{project_name}", payload, timeout)
+    except httpx.ConnectError:
         return ("Error: tool server is not running. Start it with: python tool_server.py", [])
-    except requests.exceptions.Timeout:
+    except httpx.TimeoutException:
         return ("Error: tool server request timed out.", [])
+    except httpx.RequestError as exc:
+        return (f"Error: could not reach tool server ({type(exc).__name__}).", [])
 
     if resp.status_code == 403:
         return ("Error: tool server authentication failed.", [])
@@ -194,7 +320,7 @@ def _call_tool_server(inp: dict, context: dict) -> tuple[str, list[str]]:
     if resp.status_code == 422:
         detail = resp.json().get("detail", resp.text)
         return (f"Setup required: {detail}", [])
-    if not resp.ok:
+    if not resp.is_success:
         return (f"Error: tool server returned HTTP {resp.status_code}.", [])
 
     data = resp.json()
@@ -265,6 +391,45 @@ TOOL_SPECS = [
             "required": ["path"],
         },
         "impl": lambda inp, _ctx: (_read_file(inp["path"]), []),
+    },
+    {
+        "name": "search_files",
+        "description": (
+            "Search file CONTENTS for a string or regex under the calculations root "
+            "— like grep, but safely confined to the calculations root. Returns "
+            "matching files with line numbers and the matching line. Use it to find "
+            "where a value, keyword, or setting appears across runs and logs. The "
+            "path is relative to the calculations root (default '.' = the whole tree)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Text to search for (a literal substring by default).",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Subdirectory or file under the calculations root to search. Default '.'",
+                },
+                "regex": {
+                    "type": "boolean",
+                    "description": "Treat query as a regular expression instead of a literal string. Default false.",
+                },
+                "case_sensitive": {
+                    "type": "boolean",
+                    "description": "Case-sensitive match. Default false.",
+                },
+            },
+            "required": ["query"],
+        },
+        "impl": lambda inp, _ctx: (
+            _search_files(
+                inp["query"], inp.get("path", "."),
+                bool(inp.get("regex", False)), bool(inp.get("case_sensitive", False)),
+            ),
+            [],
+        ),
     },
     {
         "name": "attach_file",

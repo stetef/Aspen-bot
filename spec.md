@@ -137,6 +137,7 @@ can't widen the bot.
 |---|---|---|
 | `list_directory` | read-only | List a directory under the calculations root |
 | `read_file` | read-only | Read a text file under the calculations root (size-capped) |
+| `search_files` | read-only | Grep file contents under the calculations root (path-confined, in-process) |
 | `attach_file` | read-only | Upload a calculations-root file alongside the Slack reply |
 | `write_metadata` | **write** | Create/overwrite **only** a project's top-level `metadata.md` |
 | `run_python_analysis` | sandboxed | Execute analysis code in the bwrap jail (via the tool server) |

@@ -3,6 +3,11 @@ python-dotenv>=1.0
 fastapi>=0.111
 uvicorn>=0.29
 pyyaml>=6.0
-requests>=2.31
+# HTTP client for the bot -> tool server call, over a Unix-domain socket
+# (httpx has first-class UDS support; it's the Encode/uvicorn-stack sibling).
+httpx>=0.27
+# Compiles the analysis jail's seccomp syscall denylist (links libseccomp, present
+# on the host). Tool-server only; if absent the jail runs without the filter.
+pyseccomp>=0.1.2
 # The agent backend. Also requires the Claude Code CLI binary on PATH.
 claude-agent-sdk>=0.2

@@ -36,12 +36,22 @@ MAX_CONCURRENT        = int(os.getenv("MAX_CONCURRENT_EXECUTIONS", "5"))
 MAX_FILE_BYTES        = int(os.getenv("MAX_FILE_READ_BYTES", "50000"))
 # Cap on a single file the agent may attach to a reply via the attach_file tool.
 MAX_ATTACHMENT_BYTES  = int(os.getenv("MAX_ATTACHMENT_BYTES", str(25 * 1024 * 1024)))
+# search_files limits (in-process content search, confined to the calculations root).
+SEARCH_MAX_FILES      = int(os.getenv("ASPEN_SEARCH_MAX_FILES", "3000"))
+SEARCH_MAX_MATCHES    = int(os.getenv("ASPEN_SEARCH_MAX_MATCHES", "200"))
+SEARCH_MAX_FILE_BYTES = int(os.getenv("ASPEN_SEARCH_MAX_FILE_BYTES", str(2 * 1024 * 1024)))
 
 # Tool server (only needed when run_python_analysis is used)
 AGENT_INTERNAL_SECRET = os.getenv("AGENT_INTERNAL_SECRET", "")
-TOOL_SERVER_URL       = os.getenv("TOOL_SERVER_URL", "http://127.0.0.1:27195")
 WORKSPACE_ROOT        = Path(os.getenv("WORKSPACE_ROOT", "/aspen_workspace")).resolve()
 FIGURE_ARCHIVE_DIR    = WORKSPACE_ROOT / "figure_archive"
+# The bot talks to the tool server over a Unix-domain socket (a file), not a TCP
+# port — so it can't be reached by other users on a shared node. Keep the path
+# short (Linux caps socket paths at ~108 chars). tool_server.py binds this same
+# path inside a 0700 directory, which is what keeps other local users out (the
+# socket's own mode is 0666 from uvicorn, but a dir they can't enter makes it
+# unreachable).
+TOOL_SERVER_SOCKET    = os.getenv("ASPEN_TOOL_SERVER_SOCKET", str(WORKSPACE_ROOT / "run" / "tool.sock"))
 
 # ---------------------------------------------------------------------------
 # Claude Agent SDK backend
@@ -59,19 +69,26 @@ CLAUDE_CLI_PATH       = os.getenv("CLAUDE_CLI_PATH", "")
 # use ANTHROPIC_API_KEY (API billing) instead.
 ASPEN_SDK_USE_SUBSCRIPTION = os.getenv("ASPEN_SDK_USE_SUBSCRIPTION", "true").lower() in ("1", "true", "yes")
 
-# Built-in Bash tool allowlist (HPC job investigation: squeue, sacct, grep, ...).
+# Built-in Bash tool allowlist (HPC job investigation: squeue, sacct, ...).
 # The SDK backend exposes Claude Code's *built-in* Bash tool, but only for the
 # command patterns listed here. Entries are Claude Code permission rules — the
 # "Bash(cmd:*)" form is a prefix match. The CLI's bash parser checks every
 # sub-command of a pipeline and refuses to auto-approve command substitution, so
-# "squeue | grep R" needs both squeue and grep allowlisted, and "squeue $(...)"
-# never auto-approves — matching commands run without prompting and everything
-# else is denied by the can_use_tool lockdown in agent.py.
+# a pipeline needs every command in it allowlisted and "squeue $(...)" never
+# auto-approves — matching commands run without prompting and everything else is
+# denied by the can_use_tool lockdown in agent.py.
 #
-# Defaults are read-only. Note: find (-exec/-delete), awk (system()), and sed
-# (w/e) are intentionally EXCLUDED — their flags can write files or run arbitrary
-# commands, which the prefix match cannot see. Only add such commands if you
-# accept that they escape the read-only intent.
+# SECURITY: the default is Slurm-ONLY. General text utilities (cat/head/tail/ls/
+# grep/wc/sort/uniq) are deliberately NOT in the default. With the OS Bash sandbox
+# off (SANDBOX_ENABLED=false, the default) the Bash tool runs as the bot's own
+# Unix user with no path restriction, so any allowlisted user could have the agent
+# read ANY file that user can — SSH private keys, this repo's .env (Slack tokens +
+# AGENT_INTERNAL_SECRET), ~/.claude credentials. Calculations-root files stay
+# available through the path-scoped read_file tool instead. Excluded for the same
+# can't-see-the-flags reason: find (-exec/-delete), awk (system()), sed (w/e).
+# Only widen this if you enable the OS sandbox with denyRead on the secret paths
+# (ASPEN_SANDBOX_DENY_READ_PATHS), or you accept those commands running unconfined
+# as the bot user.
 _DEFAULT_BASH_ALLOWLIST = [
     "Bash(squeue:*)",         # job queue
     "Bash(sacct:*)",          # job accounting / history
@@ -79,14 +96,6 @@ _DEFAULT_BASH_ALLOWLIST = [
     "Bash(sstat:*)",          # running-job stats
     "Bash(sprio:*)",          # job priorities
     "Bash(scontrol show:*)",  # read-only job/node detail (not bare scontrol)
-    "Bash(grep:*)",           # filter output (e.g. squeue | grep)
-    "Bash(ls:*)",
-    "Bash(cat:*)",
-    "Bash(head:*)",
-    "Bash(tail:*)",
-    "Bash(wc:*)",
-    "Bash(sort:*)",
-    "Bash(uniq:*)",
 ]
 BASH_ALLOWLIST = [
     p.strip()

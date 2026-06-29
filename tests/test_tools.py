@@ -1,6 +1,6 @@
 """Characterization tests for the read-only file tools and the tool-server bridge."""
 
-import requests
+import httpx
 
 
 # --------------------------------------------------------------------------- #
@@ -87,6 +87,63 @@ def test_read_file_outside_root(sut):
 
 
 # --------------------------------------------------------------------------- #
+# _search_files
+# --------------------------------------------------------------------------- #
+def test_search_files_finds_content_match(sut):
+    proj = sut.CALCULATIONS_ROOT / "srch"
+    proj.mkdir()
+    (proj / "a.log").write_text("line one\nSCF not converged\nline three\n")
+    (proj / "b.log").write_text("all good here\n")
+    out = sut._search_files("not converged", "srch")
+    assert "srch/a.log:2:" in out
+    assert "SCF not converged" in out
+    assert "b.log" not in out
+
+
+def test_search_files_no_match_reports_count(sut):
+    proj = sut.CALCULATIONS_ROOT / "srch_none"
+    proj.mkdir()
+    (proj / "x.txt").write_text("nothing interesting\n")
+    out = sut._search_files("zzz-absent", "srch_none")
+    assert out.startswith("No matches for 'zzz-absent'")
+
+
+def test_search_files_regex_mode(sut):
+    proj = sut.CALCULATIONS_ROOT / "srch_re"
+    proj.mkdir()
+    (proj / "e.txt").write_text("energy = -1234.56 eV\n")
+    out = sut._search_files(r"-\d+\.\d+", "srch_re", regex=True)
+    assert "e.txt:1:" in out
+
+
+def test_search_files_rejects_traversal(sut):
+    out = sut._search_files("anything", "../..")
+    assert "outside the allowed directory" in out
+
+
+def test_search_files_cannot_read_outside_root(sut, tmp_path):
+    # A secret outside the calculations root must never surface in results, even
+    # though the bot's user can read it — the tool is fenced to the root.
+    secret = tmp_path / "outside_secret.txt"
+    secret.write_text("TOPSECRET_TOKEN_42\n")
+    (sut.CALCULATIONS_ROOT / "inside.txt").write_text("ordinary data\n")
+    out = sut._search_files("TOPSECRET_TOKEN_42", ".")
+    # A no-match reply echoes the query, so check the secret FILE wasn't reached:
+    assert out.startswith("No matches")
+    assert "outside_secret" not in out
+
+
+def test_search_files_skips_binary(sut):
+    proj = sut.CALCULATIONS_ROOT / "srch_bin"
+    proj.mkdir()
+    (proj / "data.bin").write_bytes(b"\x00\x01PATTERN\x00")
+    (proj / "notes.txt").write_text("PATTERN here\n")
+    out = sut._search_files("PATTERN", "srch_bin")
+    assert "notes.txt:1:" in out
+    assert "data.bin" not in out
+
+
+# --------------------------------------------------------------------------- #
 # _attach_file
 # --------------------------------------------------------------------------- #
 def test_attach_file_returns_resolved_path(sut):
@@ -148,6 +205,28 @@ def test_write_metadata_overwrites_existing(sut):
     out = sut._write_metadata("proj_b", "new contents")
     assert out.startswith("Updated proj_b/metadata.md")
     assert (proj / "metadata.md").read_text() == "new contents"
+
+
+def test_write_metadata_backs_up_clobbered_version(sut):
+    """An overwrite snapshots the PRIOR content to the workspace history dir, so a
+    careless full-file replace is recoverable."""
+    proj = sut.CALCULATIONS_ROOT / "proj_hist"
+    proj.mkdir()
+    (proj / "metadata.md").write_text("important notes")
+    sut._write_metadata("proj_hist", "oops, replaced everything")
+
+    hist_dir = sut.WORKSPACE_ROOT / "metadata_history" / "proj_hist"
+    backups = list(hist_dir.glob("*.md"))
+    assert len(backups) == 1
+    assert backups[0].read_text() == "important notes"   # the clobbered version
+
+
+def test_write_metadata_create_does_not_back_up(sut):
+    """Creating a new metadata.md has nothing to clobber, so no backup is made."""
+    proj = sut.CALCULATIONS_ROOT / "proj_new"
+    proj.mkdir()
+    sut._write_metadata("proj_new", "# fresh\n")
+    assert not (sut.WORKSPACE_ROOT / "metadata_history" / "proj_new").exists()
 
 
 def test_write_metadata_rejects_missing_project(sut):
@@ -216,7 +295,7 @@ def test_call_tool_server_unconfigured_secret(sut, monkeypatch):
 def test_call_tool_server_success(sut, monkeypatch):
     class FakeResp:
         status_code = 200
-        ok = True
+        is_success = True
 
         def json(self):
             return {
@@ -226,7 +305,7 @@ def test_call_tool_server_success(sut, monkeypatch):
                 "figures": ["/workspace/figures/a.png"],
             }
 
-    monkeypatch.setattr(sut.requests, "post", lambda *a, **k: FakeResp())
+    monkeypatch.setattr(sut, "_tool_server_post", lambda *a, **k: FakeResp())
     text, figs = sut._call_tool_server(
         {"project_name": "proj", "code": "x", "dataset": [], "question": "q"}, _ctx()
     )
@@ -238,13 +317,13 @@ def test_call_tool_server_success(sut, monkeypatch):
 def test_call_tool_server_bad_request(sut, monkeypatch):
     class FakeResp:
         status_code = 400
-        ok = False
+        is_success = False
         text = "bad request"
 
         def json(self):
             return {"detail": "your code is unsafe"}
 
-    monkeypatch.setattr(sut.requests, "post", lambda *a, **k: FakeResp())
+    monkeypatch.setattr(sut, "_tool_server_post", lambda *a, **k: FakeResp())
     text, figs = sut._call_tool_server({"project_name": "proj"}, _ctx())
     assert text == "Error: your code is unsafe"
     assert figs == []
@@ -252,9 +331,9 @@ def test_call_tool_server_bad_request(sut, monkeypatch):
 
 def test_call_tool_server_connection_error(sut, monkeypatch):
     def _boom(*a, **k):
-        raise requests.exceptions.ConnectionError()
+        raise httpx.ConnectError("socket not there")
 
-    monkeypatch.setattr(sut.requests, "post", _boom)
+    monkeypatch.setattr(sut, "_tool_server_post", _boom)
     text, figs = sut._call_tool_server({"project_name": "proj"}, _ctx())
     assert text.startswith("Error: tool server is not running")
     assert figs == []
