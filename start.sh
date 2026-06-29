@@ -99,7 +99,7 @@ if ! ensure_analysis_venv; then
 fi
 
 # Start tool server in the background
-echo "Starting tool server on 127.0.0.1:8000 ..."
+echo "Starting tool server (listens on a Unix-domain socket; see its log for the path) ..."
 python tool_server.py &
 TOOL_SERVER_PID=$!
 
