@@ -26,7 +26,17 @@ SLACK_APP_TOKEN     = os.environ["SLACK_APP_TOKEN"]
 # Code CLI (via the subscription login, or the key passed to the CLI subprocess
 # when ASPEN_SDK_USE_SUBSCRIPTION=false) — see agent.py.
 CALCULATIONS_ROOT     = Path(os.environ["CALCULATIONS_ROOT"]).resolve()
-ALLOWED_USER_IDS      = set(os.environ["ASPEN_ALLOWED_SLACK_USER_IDS"].split(","))
+# Ordered list (declaration order preserved) so the FIRST entry can be treated as
+# Aspen's admin; membership checks use the set built from it.
+_ALLOWED_USER_ID_LIST = [u.strip() for u in os.environ["ASPEN_ALLOWED_SLACK_USER_IDS"].split(",") if u.strip()]
+ALLOWED_USER_IDS      = set(_ALLOWED_USER_ID_LIST)
+# The first allowlisted user is presumed to be Aspen's admin: Aspen @-mentions
+# this person in its "not authorized" and group-DM gate replies so users know who
+# to contact to be added. Override with ASPEN_ADMIN_SLACK_USER_ID when the admin
+# isn't the first allowlisted user. Empty only if the allowlist is empty.
+ADMIN_USER_ID         = os.getenv("ASPEN_ADMIN_SLACK_USER_ID", "").strip() or (
+    _ALLOWED_USER_ID_LIST[0] if _ALLOWED_USER_ID_LIST else ""
+)
 MODEL                 = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
 
 RATE_LIMIT_REQUESTS   = int(os.getenv("RATE_LIMIT_REQUESTS", "5"))

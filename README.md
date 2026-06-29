@@ -21,7 +21,11 @@ without leaving Slack.
   submit or cancel jobs.
 
 It responds only to `@Aspen` mentions from allowlisted users, keeps per-thread context,
-and shows a native "Aspen is typing…" status while working.
+and shows a native "Aspen is typing…" status while working. It works in channels, its own
+1:1 DM, and **group DMs** — in a group DM, *every* human member must be allowlisted or
+Aspen politely declines (the "participant gate"). The first allowlisted ID is treated as
+the admin and is named in refusals so users know who to ask to be added. (Slack doesn't
+allow a bot inside an existing 1:1 human DM — make a group DM that includes Aspen instead.)
 
 ## Architecture at a glance
 
