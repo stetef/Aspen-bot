@@ -110,8 +110,8 @@ seccomp denylist loses a key entry.
 
 The single largest residual risk is that the bot runs as a **personal, fully
 privileged cluster account**. A dedicated `aspen-agent` service account (created
-by SDF admins — minting a UID needs root) is the fix. This is blocked on admin
-availability (~3–6 months from 2026-06-25). **Until it lands, keep the Slack
+by SDF admins — minting a UID needs root) is the fix. This depends on admin
+protocols. **Until it lands, keep the Slack
 allowlist restricted to the developer only.**
 
 When the service account exists, do all of the following:
