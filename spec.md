@@ -23,13 +23,13 @@ aspen-bot.py / aspen.* package   (Slack Bolt app)
   │   └── warm Claude Agent SDK session per Slack thread (SDK retains context)
   │   └── per-user rate limits + global concurrency cap (in-memory)
   │   └── tool calls served in-process as MCP tools:
-  │         list_directory · read_file · attach_file · write_metadata
+  │         list_directory · read_file · search_files · attach_file · write_metadata
   │
-  ▼  run_python_analysis → HTTP POST to 127.0.0.1 with a shared-secret header
-FastAPI tool server  (tool_server.py, binds to 127.0.0.1 only)
+  ▼  run_python_analysis → HTTP POST over a Unix-domain socket + shared-secret header
+FastAPI tool server  (tool_server.py, binds a Unix socket in a 0700 dir)
   │
   ▼
-bwrap sandbox (bubblewrap, one jail per execution)
+bwrap sandbox (bubblewrap + seccomp filter, one jail per execution)
   │
   ├── /projects/<name>/                 [read-only bind]
   └── /aspen_workspace/                 [only figures/ and cache/ are writable]
@@ -43,11 +43,17 @@ Two processes, both single-instance:
   surface, and keeps a warm SDK session per Slack thread. The read-only browsing tools
   and `write_metadata` run **in-process**; `run_python_analysis` is the one tool that
   reaches out to the tool server.
-- **`tool_server.py`** — a FastAPI service bound to `127.0.0.1` that executes
-  LLM-generated analysis code inside a **bubblewrap (bwrap)** jail. It owns caching,
-  metadata parsing, the per-project SQLite index, figure handling, and audit logging.
+- **`tool_server.py`** — a FastAPI service bound to a **Unix-domain socket** (a file in
+  a `0700` directory, not a TCP port — so other users on a shared node can't reach it)
+  that executes LLM-generated analysis code inside a **bubblewrap (bwrap)** jail with a
+  **seccomp** syscall filter. It owns caching, metadata parsing, the per-project SQLite
+  index, figure handling, and audit logging.
 
 Each project has its own SQLite database file for metadata and run indexing.
+
+> **Security note.** A consolidated threat model — context, controls, deliberately
+> accepted interim risks, and the checklist of security work owed at the service-account
+> cutover — lives in [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
 > **Backend note.** Aspen is SDK-only. An earlier direct Anthropic Messages-API backend
 > was removed; all model interaction now goes through the Claude Agent SDK / Claude Code
@@ -145,16 +151,33 @@ can't widen the bot.
 `write_metadata` is the agent's **only** write surface. It is enforced in Python: the
 target must resolve to `<calculations-root>/<project>/metadata.md` (single path
 component, no traversal), the project dir must already exist, and nothing else can be
-written. All calculation inputs/outputs/data stay read-only.
+written. All calculation inputs/outputs/data stay read-only. Because the write replaces
+the whole file, the previous version is snapshotted to
+`<workspace>/metadata_history/<project>/<UTC>.md` first, so a careless overwrite is
+recoverable.
+
+The read/search tools (`list_directory`, `read_file`, `search_files`, `attach_file`) are
+**path-fenced in Python** to the calculations root (`_safe_path`): they resolve symlinks
+and reject anything outside the root, so they cannot read host files such as `~/.ssh` or
+`.env`. `search_files` greps file *contents* entirely in-process (it never shells out),
+with the same fence.
 
 ### Bash
 
-With the OS sandbox enabled, read-only Slurm investigation commands
-(`squeue`/`sacct`/`sinfo`/`sstat`/`sprio`/`scontrol show`) run directly against the
-cluster (they're excluded from the jail because they need cluster network + munge), and
-any other Bash runs inside Claude Code's own bwrap sandbox with an operator-defined write
-boundary. Job-control (`scancel`, `scontrol update`) and writes outside the boundary are
-blocked. Without the OS sandbox, only the fixed read-only allowlist is permitted.
+The Bash tool's default allowlist is **read-only Slurm investigation only**:
+`squeue`/`sacct`/`sinfo`/`sstat`/`sprio`/`scontrol show`. General file utilities
+(`cat`/`grep`/`head`/`tail`/`ls`/…) are deliberately **excluded**: with the OS sandbox
+off (the default) the Bash tool runs as the bot's Unix user with no path restriction, so
+those would let an allowlisted user read any file that user can (SSH keys, `.env`,
+`~/.claude`). Content search is provided instead by the path-fenced `search_files` tool.
+The `can_use_tool` backstop denies anything off the allowlist; job-control (`scancel`,
+`scontrol update`) is never permitted.
+
+If/when the agent is given a Bash **write/exec** surface, the Claude Code OS sandbox
+("Sandbox B") should be enabled **fail-closed** to confine it — see
+[`THREAT_MODEL.md`](THREAT_MODEL.md) §7. It is off today because it wraps only the Bash
+tool (not the in-process tools) and the Slurm commands are excluded from it anyway, so it
+would currently confine nothing.
 
 ---
 
@@ -208,6 +231,16 @@ The command is `prlimit … -- bwrap … <ANALYSIS_PYTHON> /aspen_script.py`, wi
   only a minimal `SANDBOX_ENV` (no secrets); `MPLBACKEND=Agg`, small BLAS/OpenMP thread
   pools, and `MPLCONFIGDIR` pointed at the writable cache.
 - **Hardening** — `--die-with-parent`, `--new-session`.
+- **seccomp syscall filter** — `--seccomp` loads a compiled BPF denylist (built once at
+  startup via `pyseccomp`, applied per run). It blocks the obscure, never-needed syscalls
+  that are the usual road to kernel privilege-escalation — namespace/mount-escape,
+  kernel keyrings, `ptrace`, module load, `bpf`, `io_uring`, `userfaultfd`,
+  `perf_event_open`, `clone3`, … — while leaving everything numeric Python needs. It is
+  the one lever on the kernel→root path on this pinned 4.18 kernel. Default-ALLOW with a
+  denylist (a strict allowlist is too brittle for arbitrary numeric code); toggle with
+  `ANALYSIS_SECCOMP`. If `pyseccomp` is unavailable the jail still runs (logged), as the
+  bind-mount/namespace boundary is unaffected. Only the BPF is *exported* — never
+  `load()`ed — so the tool server process itself is not filtered.
 - **Resource caps via `prlimit`** — bwrap has no cgroup limits, so per-task caps use
   `RLIMIT_AS` (virtual memory, default 2 GB — generous, since BLAS over-reserves),
   `RLIMIT_CPU` (defaults to the timeout), and `RLIMIT_FSIZE`. The **wall-clock timeout**
@@ -327,16 +360,21 @@ AGENT_INTERNAL_SECRET=<32-byte hex>              # shared secret, bot ↔ tool s
 # Paths
 CALCULATIONS_ROOT=/.../calculations      # browsing tools + write_metadata
 PROJECTS_ROOT=/.../calculations          # analysis (read-only mount)
-WORKSPACE_ROOT=/.../aspen_workspace      # figures, cache, logs, db, generated_code
+WORKSPACE_ROOT=/.../aspen_workspace      # figures, cache, logs, db, generated_code, metadata_history
 SQLITE_DB_ROOT=/tmp/aspen_db
-TOOL_SERVER_URL=http://127.0.0.1:27195
+ASPEN_TOOL_SERVER_SOCKET=                 # default $WORKSPACE_ROOT/run/tool.sock (Unix socket, 0700 dir)
+
+# Bash allowlist (default: Slurm read-only only — no general file readers; see §4)
+# ASPEN_BASH_ALLOWLIST=
 
 # Analysis sandbox (bwrap)
 ANALYSIS_PYTHON=                          # default $WORKSPACE_ROOT/analysis-venv/bin/python
 # ANALYSIS_VENV, BWRAP_BIN, ANALYSIS_RO_PATHS — optional, sane defaults
+ANALYSIS_SECCOMP=true                     # seccomp syscall denylist on the jail; false to disable
 ANALYSIS_AS_LIMIT_BYTES=2147483648        # RLIMIT_AS (memory); 0 disables
 ANALYSIS_FSIZE_LIMIT_BYTES=536870912
 # ANALYSIS_CPU_LIMIT_SECONDS — defaults to EXECUTION_TIMEOUT_SECONDS
+# ASPEN_SEARCH_MAX_FILES / _MATCHES / _FILE_BYTES — search_files caps (sane defaults)
 
 # Tuning
 AGENT_MAX_ROUNDS=25            MAX_OPEN_SESSIONS=20
@@ -358,15 +396,19 @@ Paths and identity-specific values are driven entirely from `.env` (no hardcoded
 |---|---|
 | Authorization | Slack user-ID allowlist — first gate, before rate limiting |
 | Slack connection | Socket Mode — outbound WebSocket only, no open ports |
-| Tool surface | Locked-down allowlist + `can_use_tool` deny; host settings ignored |
-| Write surface | Only `write_metadata` (one file per project) + the jail's `figures/`,`cache/` |
-| Tool server | Binds to `127.0.0.1`; shared secret on every request |
-| Analysis jail | bwrap: no network; read-only minimal FS; project read-only; scrubbed env; `prlimit` caps; 120 s timeout. The minimal jail + bind mounts are the boundary |
+| Tool surface | Locked-down allowlist + `can_use_tool` deny; host settings ignored; Bash = Slurm read-only |
+| Read/search tools | Path-fenced in Python to the calculations root; can't read `~/.ssh`, `.env`, etc. |
+| Write surface | Only `write_metadata` (one file per project, prior version snapshotted) + the jail's `figures/`,`cache/` |
+| Tool server | Binds a **Unix socket in a `0700` dir** (not a TCP port); shared secret on every request |
+| Analysis jail | bwrap: no network; read-only minimal FS; project read-only; scrubbed env; **seccomp syscall denylist**; `prlimit` caps; 120 s timeout. The jail + bind mounts + seccomp are the boundary |
 | Stdout/stderr | Redacted then truncated (10k/2k) before leaving the tool server |
 | Figures | 5 MB upload cap; archived, trimmed at 2 GB |
 | Rate limiting | 5 req / 10 min / user; 1 concurrent / user; global cap |
 | Logging | Structured JSON; secrets redacted |
 | Secrets | In `.env` (chmod 600); never logged or sent to Slack/model |
+
+A consolidated threat model (assets, actors, accepted interim risks, and the
+service-account cutover checklist) is in [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
 **Hard constraints — Aspen can never:** act for a non-allowlisted user; write any project
 file other than `metadata.md`; submit/cancel/inspect Slurm jobs (read-only investigation
