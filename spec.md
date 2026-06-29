@@ -98,6 +98,11 @@ no inbound ports, no public URL, no firewall exceptions on the cluster.
 
 ### App configuration
 
+> **Setup runbook.** The click-by-click app creation, scopes, events, install, and
+> reinstall steps — plus an importable manifest — live in
+> [`SLACK_SETUP.md`](SLACK_SETUP.md) / [`slack-app-manifest.yaml`](slack-app-manifest.yaml).
+> This section is the summary.
+
 - **Socket Mode:** enabled
 - **App-Level Token** (`connections:write`) → `SLACK_APP_TOKEN`
 - **Bot Token** (scopes below) → `SLACK_BOT_TOKEN`

@@ -47,8 +47,11 @@ The only place Aspen can write is each project's `metadata.md` (the prior versio
 snapshotted first) and the sandbox's `figures/`/`cache/` — all calculation inputs,
 outputs, and data stay read-only.
 
-See [`spec.md`](spec.md) for the full design, and [`THREAT_MODEL.md`](THREAT_MODEL.md)
-for the threat model, security measures, and the service-account cutover checklist.
+See [`spec.md`](spec.md) for the full design, [`THREAT_MODEL.md`](THREAT_MODEL.md)
+for the threat model, security measures, and the service-account cutover checklist,
+and [`SLACK_SETUP.md`](SLACK_SETUP.md) for the step-by-step Slack app setup (with an
+importable [`slack-app-manifest.yaml`](slack-app-manifest.yaml)) — for reinstalling
+or cloning Aspen into another workspace.
 
 ## Quickstart (development mode)
 

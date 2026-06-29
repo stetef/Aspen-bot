@@ -1,0 +1,37 @@
+# Slack app manifest for Aspen — see SLACK_SETUP.md for the full runbook.
+# Create from this at https://api.slack.com/apps → Create New App → From an app
+# manifest (YAML). It encodes the display name, bot scopes, subscribed events, and
+# Socket Mode. After creating: generate an app-level token with connections:write,
+# install to the workspace, and copy both tokens into .env. The native
+# "Aspen is typing…" status additionally needs the Agents & AI Apps feature enabled
+# in the dashboard (optional — Aspen falls back to a "Thinking…" message without it).
+display_information:
+  name: Aspen
+  description: HPC research assistant for the SMB/SSRL group at SSRL/SLAC.
+features:
+  bot_user:
+    display_name: Aspen
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read   # receive @Aspen mentions
+      - chat:write          # post replies + drive the typing status
+      - files:write         # upload figures / attached files
+      - im:history          # read its own 1:1 DM threads for context
+      - channels:history    # read public-channel threads it's in
+      - mpim:history        # read group-DM threads it's in
+      - mpim:read           # list group-DM members (participant gate + mpim detection)
+      - users:read          # resolve member names / spot bots (participant gate)
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention         # primary trigger in channels, group DMs, and DMs
+      - message.im          # messages in Aspen's own 1:1 DM (no @ needed there)
+      # message.mpim / message.channels are intentionally NOT subscribed: in those
+      # rooms Aspen responds only to app_mention.
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
