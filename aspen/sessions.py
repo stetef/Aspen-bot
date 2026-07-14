@@ -95,6 +95,16 @@ class SessionManager:
             _, e = self._entries.popitem(last=False)
             await e.session.aclose()
 
+    def has_session(self, key: str) -> bool:
+        """True if a live (non-evicted) session already exists for this thread.
+
+        Read from the Slack (Bolt) thread to decide whether an un-mentioned
+        group-DM reply belongs to a thread Aspen already joined. A plain dict
+        membership test — GIL-atomic — with only a benign race: an eviction right
+        after this returns True just makes the next turn start a fresh session.
+        """
+        return key in self._entries
+
     def clear(self) -> None:
         """Drop all sessions (used by tests; production relies on eviction)."""
         self._entries.clear()

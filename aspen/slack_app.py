@@ -60,6 +60,20 @@ def _admin_mention() -> str:
     return f"<@{config.ADMIN_USER_ID}>" if config.ADMIN_USER_ID else "an Aspen admin"
 
 
+def _find_member_id_steps() -> str:
+    """How to copy your own Slack member ID, to send to the admin.
+
+    Kept as a shared fragment so the "not authorized" refusal and the group-DM
+    participant-gate message give identical, correct instructions. Mirrors the
+    README's "Requesting access" section.
+    """
+    return (
+        "To find your Slack member ID: click your name or profile picture, choose "
+        "*View full profile*, then the *⋮ More* button → *Copy member ID* "
+        "(it looks like `U01AB2CD3EF`)."
+    )
+
+
 def _is_group_dm(event: dict, client, channel: str) -> bool:
     """True only for multi-person DMs (``mpim``).
 
@@ -163,8 +177,9 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
     if uid not in config.ALLOWED_USER_IDS:
         say(
             text=(
-                f"Sorry, you're not authorized to use Aspen. Contact {_admin_mention()} "
-                "to be added to the approved-users list."
+                f"Sorry, you're not authorized to use Aspen. To request access, send your "
+                f"Slack member ID to {_admin_mention()} and ask to be added to the "
+                f"approved-users list.\n\n{_find_member_id_steps()}"
             ),
             thread_ts=thread_ts,
         )
@@ -192,9 +207,9 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
             say(
                 text=(
                     "I can only work in a group where everyone is on my approved-users "
-                    f"list. These members aren't yet: {names}. Please contact {_admin_mention()} "
-                    "to have them added. In the meantime, any approved user can DM me "
-                    "directly with questions."
+                    f"list. These members aren't yet: {names}. To be added, each of them can "
+                    f"send their Slack member ID to {_admin_mention()}. {_find_member_id_steps()} "
+                    "In the meantime, any approved user can DM me directly with questions."
                 ),
                 thread_ts=thread_ts,
             )
@@ -256,11 +271,34 @@ def handle_mention(event: dict, say, client) -> None:
 
 
 @app.event("message")
-def handle_dm(event: dict, say, client) -> None:
-    """Respond to direct messages sent to the bot."""
-    # Only handle DMs; ignore bot messages and message subtypes (edits, deletions, etc.)
-    if event.get("channel_type") != "im":
-        return
+def handle_message(event: dict, say, client) -> None:
+    """Handle non-mention messages: 1:1 DMs, and follow-ups in group-DM threads.
+
+    Both ``message.im`` and ``message.mpim`` are delivered here (see the app
+    manifest). Ignore bot messages and subtypes (edits, deletions, etc.) in either.
+    """
     if event.get("subtype") or event.get("bot_id"):
         return
-    _handle_event(event, say, client, strip_mention=False)
+
+    ctype = event.get("channel_type")
+
+    # 1:1 DM: every message is for Aspen — no @-mention needed, ever.
+    if ctype == "im":
+        _handle_event(event, say, client, strip_mention=False)
+        return
+
+    # Group DM: only *continue* a thread Aspen already joined. A mention starts a
+    # thread (via app_mention); after that, plain replies in that thread reach it
+    # too. Everything else in a group DM still requires an @-mention.
+    if ctype == "mpim":
+        # A mention also arrives here as a message event — let app_mention own it,
+        # so the turn isn't handled twice.
+        if f"<@{_bot_user_id(client)}>" in event.get("text", ""):
+            return
+        # Only true thread replies, and only for a thread with a live session.
+        thread_ts = event.get("thread_ts")
+        if not thread_ts:
+            return
+        if not sessions.MANAGER.has_session(sessions._thread_key(event)):
+            return
+        _handle_event(event, say, client, strip_mention=True)

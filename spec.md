@@ -128,10 +128,15 @@ was mentioned in (or DMed in). Adding/removing scopes requires reinstalling the 
 
 ### Interaction model
 
-- Responds only to `@Aspen` mentions in channels, group DMs, or its own 1:1 DM;
-  ignores non-mention messages. (The `message` event is handled only for 1:1 DMs
-  (`channel_type == "im"`); channels and group DMs are driven by `app_mention`, so
-  Aspen stays silent unless explicitly tagged.)
+- An `@Aspen` mention starts a conversation in channels, group DMs, or its own 1:1
+  DM. Follow-ups don't always need one:
+  - **1:1 DM** (`message.im`): every message is handled — no mention needed.
+  - **Group DM** (`message.mpim`): a plain reply in a thread Aspen already has a live
+    session for is handled too, so a back-and-forth doesn't need a mention every turn.
+    A message that mentions Aspen is left to `app_mention` (so it isn't handled twice);
+    a group-DM message that is *not* a reply in an Aspen thread is ignored.
+  - **Channels**: `message.channels` is not subscribed, so Aspen stays silent unless
+    explicitly `@`-tagged.
 - While working, it shows Slack's native **"Aspen is typing…"** status via
   `assistant.threads.setStatus` (a daemon thread re-asserts it every ~50 s and clears it
   before the reply). On channel @-mentions where `setStatus` doesn't apply, it falls back

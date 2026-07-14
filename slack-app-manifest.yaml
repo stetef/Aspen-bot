@@ -28,8 +28,11 @@ settings:
     bot_events:
       - app_mention         # primary trigger in channels, group DMs, and DMs
       - message.im          # messages in Aspen's own 1:1 DM (no @ needed there)
-      # message.mpim / message.channels are intentionally NOT subscribed: in those
-      # rooms Aspen responds only to app_mention.
+      - message.mpim        # group-DM messages: continue a thread Aspen already
+                            # joined without re-@-mentioning (a mention still
+                            # starts the thread; other group-DM messages are ignored)
+      # message.channels is intentionally NOT subscribed: in public channels Aspen
+      # responds only to app_mention.
   interactivity:
     is_enabled: false
   org_deploy_enabled: false

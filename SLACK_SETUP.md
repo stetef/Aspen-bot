@@ -112,6 +112,8 @@ Find a user's ID: Slack → click their name → **View full profile → … →
 - **Group DM (multi-person DM):** start/open a group DM, type `@Aspen`, and confirm
   Slack's "Add to conversation?" prompt. **Every human member must be on the
   allowlist** or Aspen declines (the participant gate — [`spec.md` §3](spec.md#participant-gate-group-dms)).
+  Once Aspen has replied in a thread, you can keep the conversation going with plain
+  replies in that thread — no re-`@Aspen` needed (this uses the `message.mpim` event).
 - **1:1 with Aspen:** just open a DM with the app and message it (no `@` needed).
 - **1:1 between two people:** *not possible* — Slack does not allow adding a bot to
   an existing direct message between two humans. Use a group DM that includes Aspen.

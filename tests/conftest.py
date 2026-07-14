@@ -61,6 +61,8 @@ _MODMAP = {
     "_under": "aspen.attachments",
     # slack front-end
     "_handle_event": "aspen.slack_app",
+    "handle_message": "aspen.slack_app",
+    "handle_mention": "aspen.slack_app",
     "_start_typing_status": "aspen.slack_app",
     "_STATUS_TEXT": "aspen.slack_app",
     "_is_group_dm": "aspen.slack_app",

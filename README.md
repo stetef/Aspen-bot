@@ -20,12 +20,33 @@ without leaving Slack.
 - **Investigate jobs** — read-only Slurm queries (`squeue`/`sacct`/…). It does **not**
   submit or cancel jobs.
 
-It responds only to `@Aspen` mentions from allowlisted users, keeps per-thread context,
-and shows a native "Aspen is typing…" status while working. It works in channels, its own
+It responds to `@Aspen` mentions from allowlisted users, keeps per-thread context, and
+shows a native "Aspen is typing…" status while working. It works in channels, its own
 1:1 DM, and **group DMs** — in a group DM, *every* human member must be allowlisted or
 Aspen politely declines (the "participant gate"). The first allowlisted ID is treated as
 the admin and is named in refusals so users know who to ask to be added. (Slack doesn't
 allow a bot inside an existing 1:1 human DM — make a group DM that includes Aspen instead.)
+
+You only need to `@Aspen` to *start* a conversation: in its 1:1 DM every message reaches
+it, and in a group-DM thread it began (via a mention) it picks up your plain replies too,
+so a back-and-forth doesn't need a mention every turn. Other messages in a channel or
+group DM (not in a thread Aspen is already in) still require an `@Aspen`.
+
+## Requesting access
+
+Aspen only answers allowlisted users. If you're not on the list yet, it will reply
+with a short refusal and these same steps. To get added:
+
+1. **Copy your Slack member ID.** In Slack, click your name or profile picture →
+   **View full profile** → the **⋮ More** button → **Copy member ID**. It looks like
+   `U01AB2CD3EF` (not your `@handle`, which can change).
+2. **Send that ID to the admin** and ask to be added to the approved-users list. The
+   admin is the first ID in `ASPEN_ALLOWED_SLACK_USER_IDS` (or `ASPEN_ADMIN_SLACK_USER_ID`
+   if set), and Aspen @-mentions them in every refusal so you know who to ask.
+
+For **group DMs**, *every* human member must be allowlisted — so anyone in the room
+who isn't yet approved needs to do the same. Until then, approved users can DM Aspen
+directly.
 
 ## Architecture at a glance
 

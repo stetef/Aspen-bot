@@ -64,6 +64,15 @@ def test_unauthorized_message_names_the_admin(sut, say):
     assert any(f"<@{sut.ADMIN_USER_ID}>" in t for t in say.texts)
 
 
+def test_unauthorized_message_explains_how_to_get_member_id(sut, say):
+    # The refusal tells the user how to find their own Slack member ID to send to
+    # the admin, not just who to contact.
+    sut._handle_event(_event("UNKNOWN", "hello"), say, MagicMock(), strip_mention=False)
+    joined = " ".join(say.texts)
+    assert "member ID" in joined
+    assert "Copy member ID" in joined
+
+
 def test_admin_is_first_allowlisted_user(sut):
     assert sut.ADMIN_USER_ID == "U1"
 
@@ -83,6 +92,7 @@ def test_group_dm_with_outsider_is_blocked(sut, say, no_op_agent):
     assert "approved-users" in joined          # gate message
     assert "name-U7" in joined                 # the outsider is named
     assert f"<@{sut.ADMIN_USER_ID}>" in joined  # admin is tagged
+    assert "Copy member ID" in joined          # how outsiders get their ID
     # Gate runs before rate limiting, so no slot was consumed.
     assert "U1" not in sut._rate_data
 
@@ -111,6 +121,55 @@ def test_group_dm_detected_via_conversations_info(sut, say, no_op_agent):
     joined = " ".join(say.texts)
     assert "reply!" not in say.texts
     assert "name-U7" in joined
+
+
+def _mpim_msg(user, text, channel="Gmpim1", ts="2.0", thread_ts="1.0"):
+    """A non-mention ``message.mpim`` event (a plain reply inside a group-DM thread)."""
+    ev = {"user": user, "text": text, "channel": channel, "ts": ts, "channel_type": "mpim"}
+    if thread_ts is not None:
+        ev["thread_ts"] = thread_ts
+    return ev
+
+
+def test_group_dm_thread_reply_without_mention_is_handled(sut, say, no_op_agent, monkeypatch):
+    # Aspen already has a live session for this thread, so a plain (un-mentioned)
+    # reply continues the conversation.
+    monkeypatch.setattr(sut.MANAGER, "has_session", lambda key: True)
+    client = _mpim_client(members=["BOT123", "U1", "U2"])
+    sut.handle_message(_mpim_msg("U1", "and what about run 3?"), say, client)
+    assert "reply!" in say.texts
+
+
+def test_group_dm_reply_without_session_is_ignored(sut, say, no_op_agent):
+    # No live session for this thread → Aspen wasn't mentioned into it, so it stays
+    # silent and requires an @-mention to start.
+    client = _mpim_client(members=["BOT123", "U1", "U2"])
+    sut.handle_message(_mpim_msg("U1", "random chatter"), say, client)
+    assert say.texts == []
+
+
+def test_group_dm_mention_is_left_to_app_mention(sut, say, no_op_agent, monkeypatch):
+    # A message that mentions the bot also arrives as a message.mpim event; the
+    # message handler must ignore it so app_mention owns it (no double-handling).
+    monkeypatch.setattr(sut.MANAGER, "has_session", lambda key: True)
+    client = _mpim_client(members=["BOT123", "U1", "U2"])
+    sut.handle_message(_mpim_msg("U1", "<@BOT123> hi again"), say, client)
+    assert say.texts == []
+
+
+def test_group_dm_top_level_message_is_ignored(sut, say, no_op_agent, monkeypatch):
+    # Not a thread reply (no thread_ts) → ignored even with a session around.
+    monkeypatch.setattr(sut.MANAGER, "has_session", lambda key: True)
+    client = _mpim_client(members=["BOT123", "U1", "U2"])
+    sut.handle_message(_mpim_msg("U1", "hello room", thread_ts=None), say, client)
+    assert say.texts == []
+
+
+def test_dm_message_still_handled_without_mention(sut, say, no_op_agent):
+    # Regression: 1:1 DMs (message.im) are handled with no mention, as before.
+    ev = {"user": "U1", "text": "hi", "channel": "D1", "ts": "1.0", "channel_type": "im"}
+    sut.handle_message(ev, say, MagicMock())
+    assert "reply!" in say.texts
 
 
 def test_happy_path_strips_mention_and_replies(sut, say, no_op_agent):
