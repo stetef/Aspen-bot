@@ -2,9 +2,10 @@
 # Create from this at https://api.slack.com/apps → Create New App → From an app
 # manifest (YAML). It encodes the display name, bot scopes, subscribed events, and
 # Socket Mode. After creating: generate an app-level token with connections:write,
-# install to the workspace, and copy both tokens into .env. The native
-# "Aspen is typing…" status additionally needs the Agents & AI Apps feature enabled
-# in the dashboard (optional — Aspen falls back to a "Thinking…" message without it).
+# install to the workspace, and copy both tokens into .env. Two things are
+# dashboard-only (not in this manifest): enable the App Home Messages tab so users
+# can DM Aspen, and — for the native "Aspen is typing…" status — turn on Agents →
+# "Agent experience" (optional; Aspen falls back to a "Thinking…" message without it).
 display_information:
   name: Aspen
   description: HPC research assistant for the SMB/SSRL group at SSRL/SLAC.

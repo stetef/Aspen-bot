@@ -23,8 +23,9 @@ Slack can build the whole app config from a manifest in one step:
 3. Create the app, then jump to [**Tokens & install**](#tokens--install) below.
 
 The manifest captures the display name, bot scopes, subscribed events, and Socket
-Mode. The only things it can't do are mint the tokens and (optionally) flip on the
-Assistant/"is typing…" feature — both covered below.
+Mode. What it can't set — all covered below — is minting the tokens, enabling the
+App Home **Messages** tab so people can DM Aspen, and (optionally) turning on the
+**Agent experience** toggle for the native "is typing…" status.
 
 ---
 
@@ -70,25 +71,34 @@ delivers them over the WebSocket). Under **Subscribe to bot events** add:
 |---|---|
 | `app_mention` | `@Aspen` in channels, group DMs, and 1:1 DMs — the primary trigger |
 | `message.im` | Messages in Aspen's own 1:1 DM (so you can DM it without `@`) |
+| `message.mpim` | Follow-up messages in a group DM Aspen has already joined — so a thread can continue without re-`@`-mentioning it |
 
-You do **not** need `message.mpim` or `message.channels`: in channels and group DMs
-Aspen responds only to `app_mention`, and the `message` handler intentionally
-ignores everything except `channel_type == "im"` (see
-[`slack_app.py`](aspen/slack_app.py)). Subscribing to them would just deliver events
-the bot drops.
+`message.mpim` is subscribed but used narrowly: an `@Aspen` mention still *starts* a
+group-DM thread, and once Aspen has replied there, `message.mpim` lets later messages
+in that same thread reach it without another mention. Group-DM messages outside a
+thread Aspen has joined are ignored (see [`slack_app.py`](aspen/slack_app.py)).
 
-### 5. (Optional) Assistant feature — the native "Aspen is typing…" status
+You do **not** need `message.channels`: in public channels Aspen responds only to
+`app_mention`, so subscribing it would just deliver events the bot drops.
+
+### 5. (Optional) Agent experience — the native "Aspen is typing…" status
 
 The polished in-thread "Aspen is typing…" indicator uses
-`assistant.threads.setStatus`, which requires the app to have the **Agents & AI
-Apps / Assistant** feature enabled (**Features → Agents & AI Apps**). It's optional:
-without it, the first `setStatus` call fails and Aspen falls back to posting a plain
-`_Thinking…_` message — the code handles this gracefully, so nothing breaks.
+`assistant.threads.setStatus`, which requires the app's agent features to be on:
+**Features → Agents → turn on "Agent experience"** (a single toggle; this replaced
+the older "Agents & AI Apps / Assistant" panel). It's optional — without it, the
+first `setStatus` call fails and Aspen falls back to posting a plain `_Thinking…_`
+message, which the code handles gracefully, so nothing breaks.
 
-### 6. Display name
+### 6. App Home — display name and DM access
 
-**Features → App Home** (or basic info): set the bot display name to **Aspen** so
-the status shows as "Aspen is typing…".
+**Features → App Home:**
+
+- Set the bot display name to **Aspen** so the status shows as "Aspen is typing…".
+- Scroll to **Show Tabs → Messages Tab** and enable **"Allow users to send Slash
+  commands and messages from the messages tab."** Without this checkbox the Messages
+  tab is read-only: users can't DM the app, so the `message.im` event never fires and
+  1:1 DMs silently don't work.
 
 ---
 
@@ -135,7 +145,9 @@ Find a user's ID: Slack → click their name → **View full profile → … →
 
 1. Create app from [`slack-app-manifest.yaml`](slack-app-manifest.yaml) (or the manual steps above).
 2. Generate the app-level token (`connections:write`).
-3. (Optional) enable the Assistant feature for the typing status.
-4. Install to workspace; copy both tokens into `.env`.
-5. Set `ASPEN_ALLOWED_SLACK_USER_IDS` (first = admin).
-6. `bash start.sh`; in Slack, `@Aspen hello` in a DM to smoke-test.
+3. Enable the App Home **Messages** tab (App Home → Show Tabs → "Allow users to send
+   Slash commands and messages from the messages tab") so people can DM Aspen.
+4. (Optional) turn on **Agents → Agent experience** for the native typing status.
+5. Install to workspace; copy both tokens into `.env`.
+6. Set `ASPEN_ALLOWED_SLACK_USER_IDS` (first = admin).
+7. `bash start.sh`; in Slack, `@Aspen hello` in a DM to smoke-test.
