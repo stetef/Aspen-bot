@@ -12,8 +12,8 @@ instructions, and the sanctuary/donation pointer is REACTIVE only.
 
 from pathlib import Path
 
-# tests/ lives at the repo root, so its parent is the repo root.
-WOLF_FACTS = Path(__file__).resolve().parent.parent / "wolf_facts.md"
+# tests/ lives at the repo root; the facts file is package data under aspen/.
+WOLF_FACTS = Path(__file__).resolve().parent.parent / "aspen" / "wolf_facts.md"
 
 
 def test_wolf_facts_file_present_and_nonempty():

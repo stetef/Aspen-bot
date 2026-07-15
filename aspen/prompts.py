@@ -87,11 +87,12 @@ SYSTEM_PROMPT = (
 # Static, prompt-only. This appends AFTER the core operating instructions above
 # so work behavior stays highest-salience; the easter egg is a low-priority
 # add-on. The curated reference lives in the repo-root ``wolf_facts.md`` so it's
-# version-controlled and editable without code changes. If the file is missing
-# or empty we simply skip the easter egg — it must never break the core bot (a
-# CI test asserts the file is present, so an accidental removal fails loudly
-# there rather than silently at runtime).
-_WOLF_FACTS_PATH = Path(__file__).resolve().parent.parent / "wolf_facts.md"
+# version-controlled and editable without code changes. It lives inside the
+# package, next to this module, since it's data the code reads (not a doc). If
+# the file is missing or empty we simply skip the easter egg — it must never
+# break the core bot (a CI test asserts the file is present, so an accidental
+# removal fails loudly there rather than silently at runtime).
+_WOLF_FACTS_PATH = Path(__file__).resolve().parent / "wolf_facts.md"
 try:
     _WOLF_FACTS = _WOLF_FACTS_PATH.read_text(encoding="utf-8").strip()
 except OSError:
