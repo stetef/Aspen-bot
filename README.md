@@ -8,6 +8,11 @@
 
 *Explore, analyze, and plot your calculation results — without leaving Slack.*
 
+[![Tests](https://github.com/stetef/Aspen-bot/actions/workflows/tests.yml/badge.svg)](https://github.com/stetef/Aspen-bot/actions/workflows/tests.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Built with Claude Agent SDK](https://img.shields.io/badge/built%20with-Claude%20Agent%20SDK-d97757.svg)](https://github.com/anthropics/claude-agent-sdk-python)
+
 </div>
 
 ---
