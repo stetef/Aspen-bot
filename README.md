@@ -1,12 +1,24 @@
+<div align="center">
+
+<img src="assets/aspen.jpeg" alt="Aspen" width="200" height="200" />
+
 # Aspen
 
-Aspen is a Slack research assistant for HPC computational chemistry, built for the
-**Structural Molecular Biology (SMB) group at the Stanford Synchrotron Radiation
-Lightsource (SSRL)**, part of SLAC National Accelerator Laboratory at Stanford
-University. The SMB program studies biomolecular and bioinspired systems at the
-atomic-to-micron scale using synchrotron techniques (macromolecular crystallography,
-SAXS/WAXS, µXRF, XAS/XES). Aspen helps the group explore and analyze calculation results
-without leaving Slack.
+**A Slack research assistant for HPC computational chemistry.**
+
+*Explore, analyze, and plot your calculation results — without leaving Slack.*
+
+</div>
+
+---
+
+Aspen is built for the **Structural Molecular Biology (SMB) group at the Stanford
+Synchrotron Radiation Lightsource (SSRL)**, part of SLAC National Accelerator Laboratory
+at Stanford University. The SMB program studies biomolecular and bioinspired systems at
+the atomic-to-micron scale using synchrotron techniques (macromolecular crystallography,
+SAXS/WAXS, µXRF, XAS/XES). Aspen brings that group's calculation results into the
+conversation — browse the tree, run the analysis, and get the figure back, all in a
+thread.
 
 ## What Aspen does
 
@@ -112,3 +124,11 @@ Aspen is implemented and running in **developer mode** (under a personal account
 things remain on the [roadmap](spec.md#16-roadmap--not-yet-implemented): a production
 service account + systemd deployment, and letting the agent submit/manage its own
 Slurm/PBS jobs (the ORCA → CORVUS pipeline). Today its scheduler access is read-only.
+
+---
+
+<div align="center">
+
+Built for the <strong>SMB group</strong> at <strong>SSRL · SLAC · Stanford</strong>
+
+</div>
