@@ -9,11 +9,15 @@ event loop (``sessions._ensure_loop``) for its whole lifetime, as the SDK requir
 
 Tools are the shared impls wrapped as ``@tool`` and bundled with
 ``create_sdk_mcp_server`` (surfaced as ``mcp__aspen__*``). Tool access is layered:
-``allowed_tools`` auto-approves our MCP tools plus a read-only Bash allowlist
-(``config.BASH_ALLOWLIST``, e.g. ``Bash(squeue:*)``) for HPC job investigation,
-and the ``can_use_tool`` callback denies everything else. So beyond the read-only
-browsing + sandboxed-analysis surface the agent gets only the enumerated Bash
-commands — no file/web access via the CLI.
+``tools=["Bash"]`` is the *availability* gate — the only built-in tool the model
+is even shown is Bash, so Read/Write/Edit/Glob/Grep/Task/WebSearch/WebFetch/Skill
+never enter its context (smaller prompt, and no wasted round trips attempting a
+tool that would only be denied). On top of that ``allowed_tools`` auto-approves our
+MCP tools plus a read-only Bash allowlist (``config.BASH_ALLOWLIST``, e.g.
+``Bash(squeue:*)``) for HPC job investigation, and the ``can_use_tool`` callback
+denies everything else. So beyond the read-only browsing + sandboxed-analysis
+surface the agent gets only the enumerated Bash commands — no file/web access via
+the CLI.
 
 Optionally (``config.SANDBOX_ENABLED``) Bash runs inside Claude Code's OS-level
 sandbox (bubblewrap on Linux / Seatbelt on macOS) via the ``sandbox`` option. The
@@ -133,6 +137,20 @@ class SdkSession:
             system_prompt=prompts.SYSTEM_PROMPT,   # plain string -> replaces (no preset)
             model=config.MODEL,
             mcp_servers={_SERVER: server},
+            # Built-in tools: Bash ONLY. `allowed_tools` governs auto-approval, not
+            # availability — left unset, the model still *sees* Claude Code's whole
+            # toolset (Read/Write/Edit/Glob/Grep/Task/WebSearch/WebFetch/Skill/...)
+            # and burns a full round trip trying one before can_use_tool denies it.
+            # Measured: dropping them takes the per-turn prompt from ~20.2k to ~7.2k
+            # tokens. Our own tools are unaffected — they arrive via mcp_servers.
+            tools=["Bash"],
+            # Only the SDK server above; ignore any .mcp.json / operator-configured
+            # MCP servers the CLI would otherwise load (setting_sources doesn't cover
+            # MCP discovery). Keeps startup deterministic and the tool surface closed.
+            strict_mcp_config=True,
+            # No skills. Belt-and-braces: tools=["Bash"] already removes the Skill
+            # tool, but this also drops the inherited skill listing from the prompt.
+            skills=[],
             allowed_tools=allowed,                 # auto-approve our tools + Bash allowlist
             can_use_tool=self._can_use_tool,       # lockdown: deny anything not pre-approved
             # Ignore host settings (~/.claude, project) so the allowlist above is the
@@ -204,9 +222,14 @@ class SdkSession:
         return f"{text}\n\n{note}".strip() if text else note
 
     async def send(self, user_message: str, context: dict) -> tuple[str, list[str]]:
+        """Run one turn. ``context["on_progress"]``, if set, is called with each
+        ``(tool_name, tool_input)`` the agent invokes, so the front-end can show
+        what it's working on mid-turn. It runs on the agent loop, so it must not
+        block — the Slack side only stamps an in-memory holder."""
         import claude_agent_sdk as sdk
         context.setdefault("attachments", [])
         self._current = context
+        on_progress = context.get("on_progress")
         try:
             await self._ensure()
             await self._client.query(user_message)
@@ -215,7 +238,14 @@ class SdkSession:
             # Do NOT break out of receive_response early (SDK cleanup caveat).
             async for msg in self._client.receive_response():
                 if isinstance(msg, sdk.AssistantMessage):
-                    parts += [b.text for b in msg.content if isinstance(b, sdk.TextBlock)]
+                    for b in msg.content:
+                        if isinstance(b, sdk.TextBlock):
+                            parts.append(b.text)
+                        elif isinstance(b, sdk.ToolUseBlock) and on_progress is not None:
+                            try:
+                                on_progress(b.name, b.input or {})
+                            except Exception:   # progress is cosmetic; never fail a turn
+                                log.debug("on_progress callback failed", exc_info=True)
                 elif isinstance(msg, sdk.ResultMessage):
                     result_msg = msg
             text = "\n".join(p for p in parts if p).strip()

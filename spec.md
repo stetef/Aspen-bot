@@ -137,10 +137,15 @@ was mentioned in (or DMed in). Adding/removing scopes requires reinstalling the 
     a group-DM message that is *not* a reply in an Aspen thread is ignored.
   - **Channels**: `message.channels` is not subscribed, so Aspen stays silent unless
     explicitly `@`-tagged.
-- While working, it shows Slack's native **"Aspen is typing…"** status via
-  `assistant.threads.setStatus` (a daemon thread re-asserts it every ~50 s and clears it
-  before the reply). On channel @-mentions where `setStatus` doesn't apply, it falls back
-  to a posted "_Thinking…_" message.
+- While working, it shows a **live progress indicator** naming the tool the agent is
+  running right now — "Aspen is reading orca.out…", "Aspen is running squeue…" — via
+  `assistant.threads.setStatus`. It opens as "Aspen is typing…", then each tool call the
+  agent makes updates it (`SdkSession.send` reports tool uses through the
+  `context["on_progress"]` hook). A daemon thread owns every Slack call, re-asserting the
+  status every ~50 s (Slack expires it after ~2 min), coalescing bursts to at most one
+  push per `_STATUS_MIN_INTERVAL`, and clearing it before the reply. On channel
+  @-mentions, where `setStatus` doesn't apply, it falls back to posting a "_Thinking…_"
+  message and editing that in place instead, deleting it once the reply is ready.
 - Posts results (text + figures) as replies in the same thread.
 
 ### User allowlist
@@ -180,10 +185,15 @@ isn't practical, and broad channel rollout waits for the service account — [§
 
 ## 4. Tool Surface
 
-The agent is locked down: `allowed_tools` auto-approves exactly the MCP tools below plus a
-read-only Bash allowlist, and a `can_use_tool` backstop denies everything else. Host
-settings are ignored (`setting_sources=[]`) so an operator's personal Claude permissions
-can't widen the bot.
+The agent is locked down in layers. `tools=["Bash"]` is the *availability* gate: Bash is
+the only built-in Claude Code tool the model is even shown, so Read/Write/Edit/Glob/Grep/
+Task/WebSearch/WebFetch/Skill never enter its context — which both keeps the surface
+closed and cuts the per-turn prompt from ~20.2k to ~7.2k tokens (no round trips wasted
+attempting a tool that would only be denied). `strict_mcp_config=True` and `skills=[]`
+keep inherited MCP servers and skill listings out too. On top of that, `allowed_tools`
+auto-approves exactly the MCP tools below plus a read-only Bash allowlist, and a
+`can_use_tool` backstop denies everything else. Host settings are ignored
+(`setting_sources=[]`) so an operator's personal Claude permissions can't widen the bot.
 
 | Tool | Access | What it does |
 |---|---|---|
@@ -329,7 +339,17 @@ edit `analysis-requirements.txt` and rebuild the venv.
 Context is held by the **Claude Agent SDK's warm session**, one per Slack thread
 (`thread_ts`), parked between turns and reused — the SDK retains conversation state
 natively, so the bot does not maintain its own messages array. Sessions are bounded by
-`MAX_OPEN_SESSIONS` and expire after `CONTEXT_EXPIRY_SECONDS` (default 4 h). Each turn is
+`MAX_OPEN_SESSIONS` and expire after `CONTEXT_EXPIRY_SECONDS` (default 4 h).
+
+Connecting a session spawns the Claude Code CLI and waits on its init handshake (~1.7 s),
+which would otherwise land inside the first message of every new thread. The manager keeps
+`ASPEN_PREWARM_SESSIONS` already-connected spares on standby (default 1, counted against
+`MAX_OPEN_SESSIONS`, 0 to disable) and tops the pool back up in the background whenever one
+is adopted. Separately, `main.py` imports `claude_agent_sdk` on a boot thread — the lazy
+import in `agent.py` costs ~4 s (mostly `mcp`/`pydantic`, worse on a network filesystem)
+and would otherwise be paid by the first user after a restart.
+
+Each turn is
 capped at `AGENT_MAX_ROUNDS` agentic tool-call rounds (default 25); hitting it ends the
 turn with `error_max_turns`, and Aspen reports a soft pause ("reply *continue*…") while
 keeping the thread's context — it is **not** a hard error.

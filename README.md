@@ -38,7 +38,8 @@ thread.
   submit or cancel jobs.
 
 It responds to `@Aspen` mentions from allowlisted users, keeps per-thread context, and
-shows a native "Aspen is typing…" status while working. It works in channels, its own
+shows a live status naming what it's doing right now ("Aspen is reading orca.out…",
+"Aspen is running squeue…") as it works. It works in channels, its own
 1:1 DM, and **group DMs** — in a group DM, *every* human member must be allowlisted or
 Aspen politely declines (the "participant gate"). The first allowlisted ID is treated as
 the admin and is named in refusals so users know who to ask to be added. (Slack doesn't

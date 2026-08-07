@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from slack_bolt import App
@@ -27,6 +28,11 @@ _STATUS_TEXT = "is typing…"
 # Slack expires a status after ~2 minutes, but Aspen turns routinely run longer,
 # so a background thread re-asserts it well inside that window until the turn ends.
 _STATUS_REFRESH_SECONDS = 50
+# Floor between two status pushes. The agent can fire several tools a second and
+# these calls are rate-limited, so bursts coalesce onto the most recent one.
+_STATUS_MIN_INTERVAL = 1.5
+# Longest a path/pattern may be inside a progress line before it's shortened.
+_PROGRESS_MAX_DETAIL = 40
 
 # Each in-flight turn blocks a Bolt listener thread (it waits on the agent loop),
 # so size the pool above MAX_CONCURRENT — otherwise the pool, not the semaphore,
@@ -117,54 +123,158 @@ def _unauthorized_group_members(client, channel: str) -> list[str]:
     return outsiders
 
 
-def _start_typing_status(client, channel: str, thread_ts: str, say):
-    """Show a native "Aspen is typing…" status for the duration of a turn.
+def _shorten(value, limit: int = _PROGRESS_MAX_DETAIL) -> str:
+    """A path/pattern trimmed to fit a one-line progress indicator."""
+    text = str(value or "").strip().replace("\n", " ")
+    if len(text) <= limit:
+        return text
+    tail = text.rsplit("/", 1)[-1]          # a bare filename usually says enough
+    return tail if len(tail) <= limit else "…" + text[-(limit - 1):]
 
-    Calls ``assistant.threads.setStatus`` and keeps it alive on a daemon thread
-    (the status expires after ~2 minutes; turns can run longer). Returns a
-    ``stop()`` callable that ends the refresher and clears the status.
 
-    The status only applies to *assistant* threads. For a channel @-mention — or
-    if the app lacks the scope / assistant feature — the first call raises, and we
-    fall back to posting the old ``_Thinking…_`` message so the user still sees
-    that Aspen is working. In that case ``stop()`` is a no-op.
+def _progress_phrase(tool_name: str, tool_input: dict) -> str:
+    """A short gerund phrase for the tool the agent just invoked.
+
+    Rendered as "Aspen is <phrase>" in the thread status, so it must read as a
+    continuation of "is". Falls back to a generic phrase for anything unmapped —
+    a new tool must never produce a broken indicator.
     """
-    def _set(status: str) -> None:
-        client.assistant_threads_setStatus(
-            channel_id=channel, thread_ts=thread_ts, status=status
+    inp = tool_input or {}
+    name = tool_name.removeprefix("mcp__aspen__")
+
+    if name == "list_directory":
+        target = _shorten(inp.get("path")) or "the calculations"
+        return f"browsing {target}…"
+    if name == "read_file":
+        return f"reading {_shorten(inp.get('path')) or 'a file'}…"
+    if name == "search_files":
+        pattern = _shorten(inp.get("pattern") or inp.get("query"))
+        return f"searching for “{pattern}”…" if pattern else "searching the calculations…"
+    if name == "run_python_analysis":
+        return "running analysis code…"
+    if name == "attach_file":
+        return f"attaching {_shorten(inp.get('path')) or 'a file'}…"
+    if name == "write_metadata":
+        return "updating metadata.md…"
+    if tool_name == "Bash":
+        command = str(inp.get("command", "")).strip()
+        verb = command.split()[0] if command else ""
+        return f"running {verb}…" if verb else "checking the cluster…"
+    return "working…"
+
+
+class _Progress:
+    """Live "what Aspen is doing right now" indicator for one turn.
+
+    Preferred channel is the native ``assistant.threads.setStatus``, which Slack
+    renders as "Aspen is …" beneath the thread compose box — no message clutter.
+    That only applies to *assistant* threads, so for a channel @-mention (or an app
+    without the scope / assistant feature) the first call raises and we fall back to
+    posting a ``_Thinking…_`` message and editing it in place instead.
+
+    ``update()`` is called from the agent's event loop, so it only stamps an
+    in-memory phrase and pokes a daemon thread. That thread owns *every* Slack call,
+    which keeps the pushes serialized and rate-limit-friendly.
+    """
+
+    def __init__(self, client, channel: str, thread_ts: str, say):
+        self._client = client
+        self._channel = channel
+        self._thread_ts = thread_ts
+        self._status = _STATUS_TEXT          # current phrase, as an "is …" clause
+        self._msg_ts = None                  # set only in fallback (message) mode
+        self._mode = "status"                # "status" | "message" | "none"
+        self._wake = threading.Event()
+        self._stopped = threading.Event()
+        self._thread = None
+
+        try:
+            self._set_status(_STATUS_TEXT)
+        except Exception:
+            log.debug("setStatus unavailable; falling back to a Thinking message",
+                      exc_info=True)
+            self._msg_ts = self._post_placeholder(say)
+            # Without a ts there's nothing to edit — the turn keeps the single
+            # static "_Thinking…_" post (the pre-existing behavior) and we stay quiet.
+            self._mode = "message" if self._msg_ts else "none"
+            if self._mode == "none":
+                return
+        self._thread = threading.Thread(target=self._run, name="aspen-status", daemon=True)
+        self._thread.start()
+
+    # --- Slack calls (only ever from the indicator thread, or __init__) ------ #
+    def _set_status(self, status: str) -> None:
+        self._client.assistant_threads_setStatus(
+            channel_id=self._channel, thread_ts=self._thread_ts, status=status
         )
 
-    try:
-        _set(_STATUS_TEXT)
-    except Exception:
-        log.debug("setStatus unavailable; falling back to a Thinking message", exc_info=True)
-        say(text="_Thinking…_", thread_ts=thread_ts)
-        return lambda: None
-
-    stop_event = threading.Event()
-
-    def _refresh() -> None:
-        while not stop_event.wait(_STATUS_REFRESH_SECONDS):
-            try:
-                _set(_STATUS_TEXT)
-            except Exception:
-                log.debug("setStatus refresh failed; giving up", exc_info=True)
-                return
-
-    refresher = threading.Thread(target=_refresh, name="aspen-status", daemon=True)
-    refresher.start()
-
-    def _stop() -> None:
-        stop_event.set()
-        refresher.join(timeout=1)
-        # Posting the reply auto-clears the status, but clear it explicitly first
-        # so the heartbeat can't re-assert it in the gap before the reply lands.
+    def _post_placeholder(self, say):
+        """Post the fallback message and return its ``ts`` (None if unavailable)."""
         try:
-            _set("")
+            return (say(text="_Thinking…_", thread_ts=self._thread_ts) or {}).get("ts")
         except Exception:
-            log.debug("setStatus clear failed", exc_info=True)
+            log.debug("Could not post the fallback progress message", exc_info=True)
+            return None
 
-    return _stop
+    def _push(self, status: str) -> None:
+        if self._mode == "status":
+            self._set_status(status)
+        else:
+            # Standalone message: no app-name prefix from Slack, so drop the "is ".
+            phrase = status.removeprefix("is ")
+            self._client.chat_update(
+                channel=self._channel, ts=self._msg_ts,
+                text=f"_{phrase[:1].upper()}{phrase[1:]}_",
+            )
+
+    # --- indicator thread --------------------------------------------------- #
+    def _run(self) -> None:
+        last_push = time.monotonic()
+        while True:
+            woken = self._wake.wait(_STATUS_REFRESH_SECONDS)
+            if self._stopped.is_set():
+                return
+            if woken:
+                # Coalesce a burst of tool calls into one push of the latest phrase.
+                delay = _STATUS_MIN_INTERVAL - (time.monotonic() - last_push)
+                if delay > 0 and self._stopped.wait(delay):
+                    return
+                self._wake.clear()
+            try:
+                self._push(self._status)
+            except Exception:
+                log.debug("Progress update failed; giving up for this turn", exc_info=True)
+                return
+            last_push = time.monotonic()
+
+    # --- public API --------------------------------------------------------- #
+    def update(self, tool_name: str, tool_input: dict) -> None:
+        """Record what the agent is doing now (called from the agent loop)."""
+        self._status = "is " + _progress_phrase(tool_name, tool_input)
+        self._wake.set()
+
+    def stop(self) -> None:
+        """End the indicator and clear it, just before the reply is posted."""
+        self._stopped.set()
+        self._wake.set()                     # unblock the thread immediately
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+        try:
+            if self._mode == "status":
+                # Posting the reply auto-clears the status, but clear it explicitly
+                # first so nothing can re-assert it in the gap before the reply lands.
+                self._set_status("")
+            elif self._mode == "message":
+                # Remove the placeholder so a stale "Reading foo.out…" doesn't sit
+                # above the answer. If we can't delete it, leaving it is harmless.
+                self._client.chat_delete(channel=self._channel, ts=self._msg_ts)
+        except Exception:
+            log.debug("Clearing the progress indicator failed", exc_info=True)
+
+
+def _start_typing_status(client, channel: str, thread_ts: str, say) -> _Progress:
+    """Start the live progress indicator for a turn (see ``_Progress``)."""
+    return _Progress(client, channel, thread_ts, say)
 
 
 def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
@@ -235,10 +345,13 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
             say(text="Hi! Ask me anything about the calculations.", thread_ts=thread_ts)
             return
 
-        stop_status = _start_typing_status(client, channel, thread_ts, say)
+        progress = _start_typing_status(client, channel, thread_ts, say)
 
         key     = sessions._thread_key(event)
-        context = {"user_id": uid, "username": "", "thread_ts": thread_ts or "", "attachments": []}
+        # ``on_progress`` lets the agent report each tool call mid-turn, so the
+        # indicator tracks the actual work instead of a static "is typing…".
+        context = {"user_id": uid, "username": "", "thread_ts": thread_ts or "",
+                   "attachments": [], "on_progress": progress.update}
 
         try:
             loop = sessions._ensure_loop()
@@ -250,7 +363,7 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
             log.exception("Unexpected error for user %s", uid)
             reply, atts = "Sorry, something went wrong on my end. Please try again.", []
         finally:
-            stop_status()
+            progress.stop()
 
         # Slack's text field speaks mrkdwn, not the GFM the agent emits; send the
         # reply through a markdown block so Slack renders it (render.slack_reply).

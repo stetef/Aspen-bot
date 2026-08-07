@@ -63,10 +63,17 @@ class _Entry:
 
 
 class SessionManager:
-    """Keeps one parked SdkSession per conversation thread (lives on the loop)."""
+    """Keeps one parked SdkSession per conversation thread (lives on the loop).
+
+    Also keeps up to ``config.PREWARM_SESSIONS`` already-connected spares on
+    standby, so a brand-new Slack thread doesn't pay the CLI connect handshake
+    inside the user's first message.
+    """
 
     def __init__(self):
         self._entries: "OrderedDict[str, _Entry]" = OrderedDict()
+        self._spares: list = []            # connected SdkSessions awaiting a thread
+        self._warming = 0                  # warm tasks in flight (spares not yet ready)
 
     async def handle(self, key: str, user_message: str, context: dict) -> tuple[str, list[str]]:
         entry = await self._get_or_create(key)
@@ -79,10 +86,54 @@ class SessionManager:
         await self._evict()
         entry = self._entries.get(key)
         if entry is None:
-            from .agent import SdkSession
-            entry = _Entry(SdkSession(key))
+            entry = _Entry(self._claim_session(key))
             self._entries[key] = entry
+            self.warm()                    # top the pool back up in the background
         return entry
+
+    # --- pre-warming ------------------------------------------------------- #
+    def _claim_session(self, key: str):
+        """A session for ``key`` — a pre-connected spare if one is ready, else new."""
+        if self._spares:
+            session = self._spares.pop()
+            session.key = key              # spares are keyless until adopted
+            log.debug("Adopted pre-warmed session for %s", key)
+            return session
+        from .agent import SdkSession
+        return SdkSession(key)
+
+    def warm(self) -> None:
+        """Top the spare pool back up, connecting in the background (non-blocking).
+
+        Safe to call from anywhere on the loop; call it once at startup so the
+        very first message finds a spare waiting.
+        """
+        while self._pool_shortfall() > 0:
+            self._warming += 1
+            asyncio.get_running_loop().create_task(self._warm_one())
+
+    def _pool_shortfall(self) -> int:
+        """How many more spares to start, respecting the open-session cap."""
+        want = min(
+            config.PREWARM_SESSIONS,
+            config.MAX_OPEN_SESSIONS - len(self._entries),   # spares count against the cap
+        )
+        return want - len(self._spares) - self._warming
+
+    async def _warm_one(self) -> None:
+        from .agent import SdkSession
+        session = SdkSession("(spare)")
+        try:
+            await session._ensure()        # spawns + connects the CLI subprocess
+        except Exception:
+            # A spare that won't connect is not fatal — the next turn just creates
+            # its own session and surfaces the real error there.
+            log.warning("Pre-warm failed; continuing without a spare", exc_info=True)
+            await session.aclose()
+        else:
+            self._spares.append(session)
+        finally:
+            self._warming -= 1
 
     async def _evict(self) -> None:
         now = time.time()
@@ -106,8 +157,9 @@ class SessionManager:
         return key in self._entries
 
     def clear(self) -> None:
-        """Drop all sessions (used by tests; production relies on eviction)."""
+        """Drop all sessions and spares (used by tests; production relies on eviction)."""
         self._entries.clear()
+        self._spares.clear()
 
 
 MANAGER = SessionManager()

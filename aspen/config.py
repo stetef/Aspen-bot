@@ -71,6 +71,13 @@ AGENT_MAX_ROUNDS      = int(os.getenv("AGENT_MAX_ROUNDS", "25"))
 # Upper bound on concurrently parked conversation sessions (bounds warm SDK
 # CLI subprocesses).
 MAX_OPEN_SESSIONS     = int(os.getenv("MAX_OPEN_SESSIONS", "20"))
+# Pre-connected spare sessions kept on standby. Connecting an SDK client spawns
+# the Claude Code CLI and waits for its init handshake (~1.7 s measured), which
+# otherwise lands inside the first message of every new Slack thread. Warming
+# spares in the background moves that cost off the user's critical path. Each
+# spare is a live CLI subprocess, so this trades memory for latency; 0 disables.
+# Counts against MAX_OPEN_SESSIONS.
+PREWARM_SESSIONS      = max(0, int(os.getenv("ASPEN_PREWARM_SESSIONS", "1")))
 # Path to the Claude Code CLI binary. Empty = auto-discover "claude" on PATH;
 # set it when PATH is minimal (e.g. under systemd).
 CLAUDE_CLI_PATH       = os.getenv("CLAUDE_CLI_PATH", "")

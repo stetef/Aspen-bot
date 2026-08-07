@@ -140,6 +140,81 @@ def test_tool_handler_drains_attachments_into_sink(sut, monkeypatch):
     assert ctx["attachments"] == ["/w/x.png"]
 
 
+def test_tool_uses_are_reported_to_the_progress_hook(sut):
+    """Each tool the agent invokes is announced mid-turn, so the Slack front-end
+    can show what it's working on instead of a static "typing" indicator."""
+    from aspen.agent import SdkSession
+
+    def _tool_messages(prompt):
+        return [
+            sdk.AssistantMessage(
+                content=[
+                    sdk.TextBlock(text="looking"),
+                    sdk.ToolUseBlock(id="t1", name="mcp__aspen__read_file",
+                                     input={"path": "runs/orca.out"}),
+                ],
+                model="m",
+            ),
+            sdk.AssistantMessage(content=[sdk.TextBlock(text="found it")], model="m"),
+            _result("success"),
+        ]
+
+    FakeClient.responder = staticmethod(_tool_messages)
+    seen = []
+    reply, _ = asyncio.run(SdkSession("C:1").send(
+        "check", {"attachments": [], "on_progress": lambda n, i: seen.append((n, i))}
+    ))
+
+    assert seen == [("mcp__aspen__read_file", {"path": "runs/orca.out"})]
+    # Text from both messages still lands in the reply; tool blocks aren't text.
+    assert reply == "looking\nfound it"
+
+
+def test_progress_hook_failure_never_breaks_a_turn(sut):
+    """Progress is cosmetic — a raising callback must not lose the user's answer."""
+    from aspen.agent import SdkSession
+
+    def _tool_messages(prompt):
+        return [
+            sdk.AssistantMessage(
+                content=[sdk.ToolUseBlock(id="t1", name="Bash", input={"command": "squeue"})],
+                model="m",
+            ),
+            sdk.AssistantMessage(content=[sdk.TextBlock(text="all done")], model="m"),
+            _result("success"),
+        ]
+
+    def _boom(name, inp):
+        raise RuntimeError("slack exploded")
+
+    FakeClient.responder = staticmethod(_tool_messages)
+    reply, _ = asyncio.run(SdkSession("C:1").send(
+        "check", {"attachments": [], "on_progress": _boom}
+    ))
+
+    assert reply == "all done"
+
+
+def test_send_works_without_a_progress_hook(sut):
+    """The hook is optional — a context without one behaves exactly as before."""
+    from aspen.agent import SdkSession
+
+    def _tool_messages(prompt):
+        return [
+            sdk.AssistantMessage(
+                content=[sdk.ToolUseBlock(id="t1", name="Bash", input={"command": "squeue"}),
+                         sdk.TextBlock(text="queue is empty")],
+                model="m",
+            ),
+            _result("success"),
+        ]
+
+    FakeClient.responder = staticmethod(_tool_messages)
+    reply, _ = asyncio.run(SdkSession("C:1").send("check", {"attachments": []}))
+
+    assert reply == "queue is empty"
+
+
 def test_can_use_tool_allows_only_aspen_tools(sut):
     from aspen.agent import SdkSession
 
@@ -173,6 +248,13 @@ def test_build_options_locks_down_tools(sut):
         "mcp__aspen__run_python_analysis",
     ] + list(config.BASH_ALLOWLIST)
     assert "Bash(squeue:*)" in opts.allowed_tools
+    # Bash is the ONLY built-in tool the model is shown. allowed_tools governs
+    # auto-approval, not availability — without this the model still sees (and
+    # wastes a round trip attempting) Read/Write/Glob/Grep/WebSearch/Task/...
+    assert opts.tools == ["Bash"]
+    # No inherited MCP servers or skills: the tool surface is exactly what we pass.
+    assert opts.strict_mcp_config is True
+    assert opts.skills == []
     # Host settings are ignored so the allowlist is the sole permission authority.
     assert opts.setting_sources == []
     assert opts.can_use_tool == s._can_use_tool
