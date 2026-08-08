@@ -370,6 +370,13 @@ or another user's workflow directly and walk straight around both checks above. 
 creates the workflows root and `chmod 0700`s the state dir, so other users on a shared
 login node can't read or plant files there.
 
+`0700` is correct only while the bot user and the admin user are the same account. At the
+service-account cutover they split, and the state dir moves to group space with a
+read/write split — `0750` for the registry (writes need the service identity, so admission
+stays privileged) and `2770` for the workflows tree (users may edit their own file). That
+also needs `ensure_private_dir()` to take a configurable mode. Details and the traps are in
+[`THREAT_MODEL.md`](THREAT_MODEL.md) §7.
+
 ---
 
 ## 7. Project Metadata

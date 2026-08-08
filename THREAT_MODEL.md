@@ -133,8 +133,11 @@ seccomp denylist loses a key entry, or `write_workflow` grows an owner parameter
 The single largest residual risk is that the bot runs as a **personal, fully
 privileged cluster account**. A dedicated `aspen-agent` service account (created
 by SDF admins — minting a UID needs root) is the fix. This depends on admin
-protocols. **Until it lands, keep the Slack
-allowlist restricted to the developer only.**
+protocols. **Until it lands, keep the registry small and trusted** — the
+developer plus a few named beta testers, not the whole group. (Access is now
+managed with `./aspen-users`, not `ASPEN_ALLOWED_SLACK_USER_IDS`; see §5 of
+[`spec.md`](spec.md). Widening it does not change the blast radius, which stays
+the developer's full cluster identity until the service account lands.)
 
 When the service account exists, do all of the following:
 
@@ -144,6 +147,29 @@ When the service account exists, do all of the following:
 - [ ] **Scope its filesystem access**: read-only to the group projects path,
       read-write only to the workspace (shared group + setgid so dev-created files
       stay manageable after cutover).
+- [ ] **Relocate the state dir out of a personal home, and pick its mode
+      deliberately.** Today `ASPEN_STATE_DIR` defaults to `~/.aspen` at `0700`,
+      which works only because the bot user and the admin user are the same person.
+      At cutover they split, and `0700` in *either* home breaks the other half:
+      the bot can't read a registry in the admin's home, and the admin can't run
+      `aspen-users` against one in the service account's home. Move it to the
+      group space (`/sdf/data/ssrl/smb/dft/aspen/`, group `sdf-ssrl-dft`, setgid)
+      and split the two paths, which is why they are separate env vars:
+
+      | Path | Mode | Rationale |
+      |---|---|---|
+      | `ASPEN_USERS_FILE` dir | `0750`, owner `aspen-agent` | Group can `aspen-users list` / audit; **writes require being the service account**, so admission stays a privileged act (C8). |
+      | `ASPEN_WORKFLOWS_ROOT` | `2770`, group `sdf-ssrl-dft` | Users may reasonably edit their own `WORKFLOW.md` in `$EDITOR`; setgid keeps new files group-owned. |
+
+      Two traps. (1) The parent `/sdf/data/ssrl/smb/dft` is already `drwxrwsr-x`,
+      so a plain `mkdir` **inherits group-write** and silently gives every account
+      in `sdf-ssrl-dft` the ability to grant itself Aspen access — `chmod 0750`
+      the registry dir explicitly. (2) `registry.ensure_private_dir()` currently
+      hard-codes `0700` and would clamp the `2770` workflows tree back down on the
+      next write — **it needs a configurable mode before this layout will hold.**
+      Keep both outside `WORKSPACE_ROOT`, or `main._check_state_locations()` will
+      refuse to start (C11). Copy the existing `users.json` and `workflows/` over
+      as part of the move; nothing regenerates them.
 - [ ] **systemd unit** (`Type=simple`, `User=aspen-agent`, `EnvironmentFile`,
       `Restart=on-failure`) with hardening: `NoNewPrivileges=yes`,
       `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`,
@@ -162,9 +188,11 @@ When the service account exists, do all of the following:
       (not nested in a Claude session): run [`probe_isolation.sh`](probe_isolation.sh)
       and `verify_sandbox.sh`; confirm the bwrap jail starts, the seccomp filter
       compiles, and the UDS binds in a `0700` dir.
-- [ ] **Re-evaluate the user allowlist.** Only after the above, widen
-      `ASPEN_ALLOWED_SLACK_USER_IDS` beyond the developer (the dominant blast-radius
-      risk is gone). For the careful-insider model, also confirm the calculations
+- [ ] **Re-evaluate the user registry.** Only after the above, widen it beyond the
+      beta group with `./aspen-users add` (the dominant blast-radius risk is gone).
+      Drop the `ASPEN_ALLOWED_SLACK_USER_IDS` bootstrap from the new `.env` once the
+      registry is in place, so there is exactly one source of truth. For the
+      careful-insider model, also confirm the calculations
       tree's `metadata.md` files are backed up / version-controlled (C4 protects
       against in-bot overwrite; off-host backup protects against everything else).
 
