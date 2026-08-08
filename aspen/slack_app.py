@@ -14,10 +14,12 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FutureTimeout
 
 from slack_bolt import App
 
-from . import attachments, config, ratelimit, registry, render, sessions, state, workflows
+from . import (attachments, config, ratelimit, registry, render, sessions, state,
+               telemetry, workflows)
 
 log = logging.getLogger("aspen")
 
@@ -277,14 +279,37 @@ def _start_typing_status(client, channel: str, thread_ts: str, say) -> _Progress
     return _Progress(client, channel, thread_ts, say)
 
 
+def _clean_text(event: dict, strip_mention: bool) -> str:
+    """The user's message with any @-mentions removed."""
+    raw = event.get("text", "")
+    return re.sub(r"<@[A-Z0-9]+>", "", raw).strip() if strip_mention else raw.strip()
+
+
 def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
     """Shared dispatch logic for both channel mentions and DMs."""
     uid       = event.get("user", "")
     thread_ts = event.get("thread_ts") or event.get("ts")
     channel   = event.get("channel", "")
+    started   = time.monotonic()
+
+    def _record(outcome: str, **extra) -> None:
+        """One telemetry line for this turn, whichever way it ends.
+
+        Every exit path goes through here — the refusals as much as the answers,
+        since a rate limit or an allowlist gate is demand Aspen is turning away.
+        """
+        telemetry.record(
+            uid=uid,
+            outcome=outcome,
+            channel=event.get("channel_type", ""),
+            thread=sessions._thread_key(event),
+            latency_ms=int((time.monotonic() - started) * 1000),
+            **extra,
+        )
 
     # 1. Allowlist check — first gate (the mentioner must be allowlisted)
     if uid not in config.ALLOWED_USER_IDS:
+        _record("not_authorized")
         say(
             text=(
                 f"Sorry, you're not authorized to use Aspen. To request access, send your "
@@ -304,6 +329,7 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
             outsiders = _unauthorized_group_members(client, channel)
         except Exception:
             log.exception("Could not verify group-DM membership for %s", channel)
+            _record("group_gate")
             say(
                 text=(
                     "I couldn't verify everyone in this group, so I'm staying out to be "
@@ -313,6 +339,7 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
             )
             return
         if outsiders:
+            _record("group_gate")
             names = ", ".join(f"*{n}*" for n in outsiders)
             say(
                 text=(
@@ -328,31 +355,41 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
     # 2. Per-user rate limit + concurrency check
     err = ratelimit._check_rate_limit(uid)
     if err:
+        _record("rate_limited", text=_clean_text(event, strip_mention))
         say(text=err, thread_ts=thread_ts)
         return
 
     # 3. Global concurrency cap
     if not state._global_sem.acquire(blocking=False):
         ratelimit._release_user(uid)
+        _record("busy", text=_clean_text(event, strip_mention))
         say(text="Aspen is busy right now — please try again in a moment.", thread_ts=thread_ts)
         return
 
     try:
-        raw          = event.get("text", "")
-        user_message = re.sub(r"<@[A-Z0-9]+>", "", raw).strip() if strip_mention else raw.strip()
+        user_message = _clean_text(event, strip_mention)
 
         if not user_message:
+            _record("empty")
             say(text="Hi! Ask me anything about the calculations.", thread_ts=thread_ts)
             return
 
         progress = _start_typing_status(client, channel, thread_ts, say)
+
+        # Every tool the agent invokes, in call order — the repeated sequences are
+        # what tell you which multi-step task deserves a purpose-built tool.
+        tools_used: list[str] = []
+
+        def _on_progress(tool_name: str, tool_input: dict) -> None:
+            tools_used.append(tool_name)
+            progress.update(tool_name, tool_input)
 
         key     = sessions._thread_key(event)
         # ``on_progress`` lets the agent report each tool call mid-turn, so the
         # indicator tracks the actual work instead of a static "is typing…".
         context = {"user_id": uid, "username": registry.display_name(uid),
                    "thread_ts": thread_ts or "",
-                   "attachments": [], "on_progress": progress.update}
+                   "attachments": [], "on_progress": _on_progress}
 
         # Who is speaking, and what workflows exist, must ride on the *message*:
         # a session is keyed per thread and pre-warmed before the speaker is
@@ -365,17 +402,30 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
             log.exception("Could not build the workflow preamble for %s", uid)
             turn_message = user_message
 
+        outcome = "ok"
         try:
             loop = sessions._ensure_loop()
             fut = asyncio.run_coroutine_threadsafe(
                 sessions.MANAGER.handle(key, turn_message, context), loop
             )
             reply, atts = fut.result(timeout=_TURN_TIMEOUT)
+        except _FutureTimeout:
+            outcome = "timeout"
+            log.exception("Turn exceeded %ss for user %s", _TURN_TIMEOUT, uid)
+            reply, atts = "Sorry, something went wrong on my end. Please try again.", []
         except Exception:
+            outcome = "error"
             log.exception("Unexpected error for user %s", uid)
             reply, atts = "Sorry, something went wrong on my end. Please try again.", []
         finally:
             progress.stop()
+
+        # Recorded before the reply is posted, so the latency measured is the
+        # agent's — the number worth optimizing — and a failing say() can't cost
+        # us the record of a turn that actually ran.
+        _record(outcome, text=user_message, tools=tools_used,
+                reply_chars=len(reply or ""), attachments=len(atts),
+                meta=context.get("result_meta"))
 
         # Slack's text field speaks mrkdwn, not the GFM the agent emits; send the
         # reply through a markdown block so Slack renders it (render.slack_reply).

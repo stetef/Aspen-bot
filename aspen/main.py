@@ -7,7 +7,7 @@ from pathlib import Path
 
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from . import config, registry, sessions, slack_app
+from . import config, registry, sessions, slack_app, telemetry
 
 log = logging.getLogger("aspen")
 
@@ -20,31 +20,38 @@ def _under(path: Path, parent: Path) -> bool:
 
 
 def _check_state_locations() -> None:
-    """Fail loudly if the registry or the workflows tree sits somewhere the agent
-    can write by other means.
+    """Fail loudly if the registry, the workflows tree, or the telemetry log sits
+    somewhere the agent can write by other means.
 
     Admission and workflow ownership are enforced in Python, but that only holds
     if the files themselves aren't reachable through a writable path. The obvious
     footgun is putting them under WORKSPACE_ROOT (the analysis sandbox's writable
     area) or inside ASPEN_SANDBOX_WRITE_PATHS — either would let generated code
-    edit the allowlist or another user's workflow directly.
+    edit the allowlist or another user's workflow directly. The telemetry log and
+    its switch are held to the same rule: a record of what the agent did is worth
+    little if the agent can rewrite it, or quietly stop it being written.
     """
     danger = [config.WORKSPACE_ROOT] + [Path(p).expanduser() for p in config.SANDBOX_WRITE_PATHS]
-    for label, target in (("registry", config.USERS_FILE), ("workflows root", config.WORKFLOWS_ROOT)):
+    for label, target in (("registry", config.USERS_FILE),
+                          ("workflows root", config.WORKFLOWS_ROOT),
+                          ("telemetry log", config.TELEMETRY_DIR),
+                          ("telemetry switch", config.TELEMETRY_STATE_FILE)):
         for area in danger:
             if _under(target, area):
                 raise SystemExit(
                     f"FATAL: the {label} ({target}) is inside a sandbox-writable area "
                     f"({area}). Sandboxed code could then edit it directly, bypassing the "
                     "ownership and admission checks. Move it — set ASPEN_STATE_DIR (or "
-                    "ASPEN_USERS_FILE / ASPEN_WORKFLOWS_ROOT) to a path outside "
-                    "WORKSPACE_ROOT and ASPEN_SANDBOX_WRITE_PATHS."
+                    "ASPEN_USERS_FILE / ASPEN_WORKFLOWS_ROOT / ASPEN_TELEMETRY_DIR) to a "
+                    "path outside WORKSPACE_ROOT and ASPEN_SANDBOX_WRITE_PATHS."
                 )
 
     # 0700 against other users on the shared login node. The CLI does the same at
     # its own creation points, since it usually runs before the bot ever starts.
     registry.ensure_private_dir(config.STATE_DIR)
     registry.ensure_private_dir(config.WORKFLOWS_ROOT)
+    if config.TELEMETRY_ENABLED:
+        registry.ensure_private_dir(config.TELEMETRY_DIR)
 
     users = registry.users()
     if not users:
@@ -59,6 +66,21 @@ def _check_state_locations() -> None:
         )
     else:
         log.info("User registry: %d active user(s) from %s", len(users), config.USERS_FILE)
+
+    # Say plainly at every boot what is being recorded — a collection window that
+    # nobody can see is one nobody remembers to close.
+    tele = telemetry.effective()
+    if not tele["metrics"]:
+        log.info("Telemetry: off (%s)", tele.get("off_reason") or "switched off")
+    else:
+        detail = "metrics + question text" if tele["content"] else "metrics only"
+        if tele["content"] and tele["content_until"]:
+            detail += f" until {tele['content_until']}"
+        elif not tele["content"] and tele.get("off_reason"):
+            detail += f" ({tele['off_reason']})"
+        if tele["excluded_users"]:
+            detail += f"; {len(tele['excluded_users'])} user(s) excluded from text"
+        log.info("Telemetry: %s -> %s", detail, config.TELEMETRY_DIR)
 
 
 def _warm_sdk_import() -> None:

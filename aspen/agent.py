@@ -221,6 +221,41 @@ class SdkSession:
 
         return f"{text}\n\n{note}".strip() if text else note
 
+    @staticmethod
+    def _result_meta(result_msg) -> dict:
+        """The turn's cost/outcome facts, for the caller to record.
+
+        Handed back through ``context`` (the same channel attachments already use)
+        rather than the return value, so no signature changes: the front-end reads
+        ``context["result_meta"]`` after ``send`` returns. Everything here is
+        otherwise discarded once the reply is formatted.
+
+        ``denials`` is the interesting one — it is the list of commands users
+        wanted that the allowlist or sandbox refused, i.e. a feature backlog.
+        """
+        if result_msg is None:
+            return {}
+        usage = getattr(result_msg, "usage", None) or {}
+        if not isinstance(usage, dict):     # older/newer SDKs may hand back an object
+            usage = getattr(usage, "__dict__", {}) or {}
+        denials = []
+        for d in getattr(result_msg, "permission_denials", None) or []:
+            get = d.get if isinstance(d, dict) else lambda k, _d=d: getattr(_d, k, None)
+            tool_input = get("tool_input") or {}
+            denials.append({
+                "tool": get("tool_name"),
+                "command": str(tool_input.get("command", ""))[:200] if isinstance(tool_input, dict) else "",
+            })
+        return {
+            "result_subtype": getattr(result_msg, "subtype", None),
+            "num_turns": getattr(result_msg, "num_turns", None),
+            "denials": denials or None,
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "cost_usd": getattr(result_msg, "total_cost_usd", None),
+            "agent_ms": getattr(result_msg, "duration_ms", None),
+        }
+
     async def send(self, user_message: str, context: dict) -> tuple[str, list[str]]:
         """Run one turn. ``context["on_progress"]``, if set, is called with each
         ``(tool_name, tool_input)`` the agent invokes, so the front-end can show
@@ -249,9 +284,11 @@ class SdkSession:
                 elif isinstance(msg, sdk.ResultMessage):
                     result_msg = msg
             text = "\n".join(p for p in parts if p).strip()
+            context["result_meta"] = self._result_meta(result_msg)
             return self._format_result_reply(text, result_msg), list(context["attachments"])
         except sdk.ClaudeSDKError as exc:
             name = type(exc).__name__
+            context["result_meta"] = {"result_subtype": f"sdk_error:{name}"}
             log.error("SDK backend error: %s: %s", name, exc)
             await self.aclose()                    # reset; next turn reconnects
             hint = {

@@ -85,7 +85,9 @@ Two single-instance processes:
 
 - **bot** (`aspen/`) — Slack front-end + Claude Agent SDK. Serves the read/search
   /metadata/workflow tools **in-process**; the only outbound tool call is the
-  analysis bridge to the tool server.
+  analysis bridge to the tool server. Also appends the per-turn telemetry log
+  (`aspen/telemetry.py`), which no tool can read, write, or switch off — it is
+  configured only by `aspen-users telemetry`, from outside the agent, like admission.
 - **tool server** (`tool_server.py`) — runs LLM-generated analysis code in the
   bwrap jail; owns caching, metadata parsing, the SQLite index, audit logging.
 
@@ -160,6 +162,7 @@ When the service account exists, do all of the following:
       |---|---|---|
       | `ASPEN_USERS_FILE` dir | `0750`, owner `aspen-agent` | Group can `aspen-users list` / audit; **writes require being the service account**, so admission stays a privileged act (C8). |
       | `ASPEN_WORKFLOWS_ROOT` | `2770`, group `sdf-ssrl-dft` | Users may reasonably edit their own `WORKFLOW.md` in `$EDITOR`; setgid keeps new files group-owned. |
+      | `ASPEN_TELEMETRY_DIR` + state file | `0700`, owner `aspen-agent` | The turn log holds users' questions verbatim while a collection window is open. The bot appends; only the service account reads. **Not** group-readable — a colleague's questions are not group business. |
 
       Two traps. (1) The parent `/sdf/data/ssrl/smb/dft` is already `drwxrwsr-x`,
       so a plain `mkdir` **inherits group-write** and silently gives every account

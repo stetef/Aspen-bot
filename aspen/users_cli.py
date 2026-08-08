@@ -14,14 +14,23 @@ with no restart.
     python -m aspen.users_cli sync --apply
     python -m aspen.users_cli whois arun
 
+It also owns the turn-log switch (``aspen/telemetry.py``), which is admin-only for
+the same reason admission is — the agent must not be able to stop the record of
+what it did:
+
+    python -m aspen.users_cli telemetry status
+    python -m aspen.users_cli telemetry content on --days 30
+    python -m aspen.users_cli telemetry exclude arun
+
 ``./aspen-users`` is a thin wrapper that activates the venv and calls this.
 """
 
 import argparse
 import getpass
 import sys
+from datetime import date, timedelta
 
-from . import config, registry, workflows
+from . import config, registry, telemetry, workflows
 
 
 def _err(msg: str) -> int:
@@ -228,7 +237,6 @@ def cmd_remove(args) -> int:
         print("Aborted.")
         return 1
 
-    from datetime import date
     users = [
         dict(u, status="removed", removed=date.today().isoformat(), removed_by=_actor(args))
         if u["slack_user_id"] == uid else u
@@ -304,6 +312,110 @@ def cmd_init(args) -> int:
     return cmd_list(args)
 
 
+def _telemetry_summary() -> None:
+    """Print what is being recorded right now, and why."""
+    state = telemetry.effective()
+    print(f"metrics        {'on' if state['metrics'] else 'off'}")
+    content = "on" if state["content"] else "off"
+    if state["content"] and state["content_until"]:
+        content += f" (until {state['content_until']}, inclusive)"
+    elif not state["content"] and state.get("off_reason"):
+        content += f" ({state['off_reason']})"
+    print(f"question text  {content}")
+
+    excluded = state["excluded_users"]
+    if excluded:
+        print(f"excluded       {', '.join(registry.label(u) for u in excluded)}")
+    else:
+        print("excluded       (nobody)")
+    print(f"log            {config.TELEMETRY_DIR}")
+    print(f"settings       {config.TELEMETRY_STATE_FILE} ({state['source']})")
+    if state.get("updated"):
+        print(f"last change    {state['updated']} by {state.get('updated_by') or 'unknown'}")
+    if not config.TELEMETRY_ENABLED:
+        print("\nNOTE: ASPEN_TELEMETRY is off in .env — that overrides everything above. "
+              "Nothing is being recorded until it is turned back on (needs a restart).")
+
+    files = telemetry.log_files()
+    if files:
+        print(f"\n{len(files)} daily log(s), {files[0].stem} to {files[-1].stem}.")
+
+
+def _telemetry_write(args, **changes) -> int:
+    """Apply ``changes`` to the stored settings and re-print the summary."""
+    current = telemetry.load(force=True)
+    telemetry.save({**current, **changes}, actor=_actor(args))
+    print("Updated. Takes effect on the next message — no restart needed.\n")
+    _telemetry_summary()
+    return 0
+
+
+def cmd_telemetry_status(args) -> int:
+    _telemetry_summary()
+    return 0
+
+
+def cmd_telemetry_on(args) -> int:
+    return _telemetry_write(args, metrics=True)
+
+
+def cmd_telemetry_off(args) -> int:
+    """Stop recording entirely — no metrics, no text."""
+    return _telemetry_write(args, metrics=False, content=False)
+
+
+def cmd_telemetry_content(args) -> int:
+    """Turn question-text collection on (optionally time-boxed) or off."""
+    if args.state == "off":
+        return _telemetry_write(args, content=False, content_until="")
+
+    until = ""
+    if args.days is not None:
+        if args.days < 1:
+            return _err("--days must be at least 1")
+        # UTC, matching how telemetry.py reads the window back (one clock).
+        until = (telemetry.today() + timedelta(days=args.days)).isoformat()
+    elif args.until:
+        try:
+            until = date.fromisoformat(args.until).isoformat()
+        except ValueError:
+            return _err(f"'{args.until}' is not a YYYY-MM-DD date")
+        if date.fromisoformat(until) < telemetry.today():
+            return _err(f"{until} is in the past — that window is already closed")
+
+    # Metrics have to be on for anything at all to be written.
+    return _telemetry_write(args, metrics=True, content=True, content_until=until)
+
+
+def cmd_telemetry_exclude(args) -> int:
+    """Keep a person's metrics but never record their question text."""
+    user = registry.resolve(args.who)
+    if user is None:
+        return _err(f"no user matches '{args.who}'")
+    current = telemetry.load(force=True)
+    excluded = set(current["excluded_users"]) | {user["slack_user_id"]}
+    return _telemetry_write(args, excluded_users=sorted(excluded))
+
+
+def cmd_telemetry_include(args) -> int:
+    user = registry.resolve(args.who)
+    uid = user["slack_user_id"] if user else args.who.strip()
+    current = telemetry.load(force=True)
+    excluded = set(current["excluded_users"])
+    if uid not in excluded:
+        return _err(f"'{args.who}' is not excluded")
+    return _telemetry_write(args, excluded_users=sorted(excluded - {uid}))
+
+
+def cmd_telemetry_prune(args) -> int:
+    removed = telemetry.prune(args.older_than)
+    if not removed:
+        print(f"Nothing older than {args.older_than} days.")
+        return 0
+    print(f"Deleted {len(removed)} daily log(s): {', '.join(removed)}")
+    return 0
+
+
 def cmd_whois(args) -> int:
     user = registry.resolve(args.who)
     if user is None:
@@ -366,12 +478,58 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("whois", help="show one user's registry entry")
     s.add_argument("who", help="alias or Slack ID")
     s.set_defaults(func=cmd_whois)
+
+    # --- telemetry ---------------------------------------------------------- #
+    # Metrics and question text are switched separately on purpose: metrics stay
+    # useful indefinitely, while the text is what you collect for a few weeks to
+    # learn what people ask, then stop. See aspen/telemetry.py.
+    s = sub.add_parser(
+        "telemetry",
+        help="what Aspen records about how it is used",
+        description="Control Aspen's turn log. Changes apply on the next message.",
+    )
+    tsub = s.add_subparsers(dest="telemetry_command", required=True)
+
+    t = tsub.add_parser("status", help="show what is being recorded right now")
+    t.set_defaults(func=cmd_telemetry_status)
+
+    t = tsub.add_parser("on", help="resume recording metrics")
+    t.set_defaults(func=cmd_telemetry_on)
+
+    t = tsub.add_parser("off", help="stop recording entirely (metrics and text)")
+    t.set_defaults(func=cmd_telemetry_off)
+
+    t = tsub.add_parser(
+        "content",
+        help="collect the question text, optionally for a fixed window",
+        description="With --days/--until the window closes by itself, so a "
+                    "collection period doesn't outlive the reason for it.",
+    )
+    t.add_argument("state", choices=("on", "off"))
+    window = t.add_mutually_exclusive_group()
+    window.add_argument("--days", type=int, help="collect for N more days, then stop")
+    window.add_argument("--until", default="", help="collect through this date (YYYY-MM-DD)")
+    t.set_defaults(func=cmd_telemetry_content)
+
+    t = tsub.add_parser("exclude", help="never record one person's question text")
+    t.add_argument("who", help="alias or Slack ID")
+    t.set_defaults(func=cmd_telemetry_exclude)
+
+    t = tsub.add_parser("include", help="undo an exclude")
+    t.add_argument("who", help="alias or Slack ID")
+    t.set_defaults(func=cmd_telemetry_include)
+
+    t = tsub.add_parser("prune", help="delete old daily logs")
+    t.add_argument("--older-than", type=int, default=90, metavar="DAYS",
+                   help="delete logs older than this many days (default: 90)")
+    t.set_defaults(func=cmd_telemetry_prune)
     return p
 
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     registry.invalidate()          # always act on what's on disk right now
+    telemetry.invalidate()
     return args.func(args)
 
 

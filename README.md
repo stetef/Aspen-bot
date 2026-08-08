@@ -100,6 +100,7 @@ adds or removes a user, so no message — however phrased — can widen the allo
 | `remove` | `<alias\|id>` `--purge` `--purge-history` `--force` `-y/--yes` | Archives the workflow by default. `--force` is required to remove the admin. |
 | `sync` | `--apply` | Dry run by default: reports display-name changes and aliases that no longer match. |
 | `whois` | `<alias\|id>` | Registry entry plus the workflow path. |
+| `telemetry` | `status`, `on`, `off`, `content on\|off`, `exclude`, `include`, `prune` | What Aspen records about how it's used — see [What Aspen records](#what-aspen-records-aspen-users-telemetry). |
 
 Global: `--by <name>` records who made the change in `added_by`/`removed_by` (defaults to
 your Unix user).
@@ -139,6 +140,41 @@ user-authored text and is treated as untrusted, exactly like project data.
 Every overwrite snapshots the previous version to
 `$WORKSPACE_ROOT/workflow_history/<slack-id>/`.
 
+## What Aspen records (`aspen-users telemetry`)
+
+Aspen keeps a **turn log** — one JSON line per message — so its tools, prompt and
+workflows can be tuned for the tasks people actually bring it. It lives at
+`$ASPEN_STATE_DIR/telemetry/YYYYMMDD.jsonl`, `0600`, readable only by the account Aspen
+runs as.
+
+Two things are switched separately, because they have different useful lifetimes:
+
+- **Metrics** — who, when, which tools in what order, latency, outcome, tokens and cost.
+  Small and worth keeping: it's what shows which questions hit the per-turn round limit,
+  which commands the allowlist is refusing, and what a turn costs.
+- **The question text** — what you need to work out *what* people ask. Collect it for a
+  few weeks, then switch it off; `--days`/`--until` set a window that closes by itself.
+
+| Command | Effect |
+|---|---|
+| `telemetry status` | What is being recorded right now, and why |
+| `telemetry content on --days 30` | Collect question text for 30 more days, then stop |
+| `telemetry content off` | Metrics only |
+| `telemetry exclude <alias\|id>` | One person's text is never recorded (metrics stay) |
+| `telemetry off` | Record nothing at all |
+| `telemetry prune --older-than 90` | Delete old daily logs |
+
+Changes apply on the next message, no restart. Turning text off **narrows** a record
+rather than dropping it — the line is still written with `"text": null`, `"redacted":
+true` and the character count — so volume, latency and failure-rate series stay unbroken.
+The text of people who *aren't* on the allowlist is never recorded at all, whatever the
+setting: they haven't agreed to use Aspen. `ASPEN_TELEMETRY=false` in `.env` is a hard
+kill switch that overrides all of the above.
+
+The log and its switch sit under `ASPEN_STATE_DIR` for the same reason the registry does:
+outside the workspace and every sandbox-writable path, so generated analysis code can
+neither read the log nor stop its own recording. Aspen refuses to start if that's violated.
+
 ## Architecture at a glance
 
 - **`aspen-bot.py` / `aspen/`** — Slack Bolt front-end running the **Claude Agent SDK**
@@ -159,6 +195,9 @@ limits on this cgroups-v1 host).
   and the admission allowlist, hot-reloaded from `users.json`) and the per-user workflow
   store. Both live under `ASPEN_STATE_DIR`, deliberately outside the repo *and* outside
   any sandbox-writable path; the bot refuses to start if that's violated.
+- **`aspen/telemetry.py`** — the turn log and its switch, under `ASPEN_STATE_DIR` by the
+  same rule. Written by the bot, configured only by `aspen-users telemetry`; never
+  reachable from a tool, a prompt, or a Slack message.
 
 The only places Aspen can write are each project's `metadata.md`, the speaking user's own
 workflow file (prior versions of both are snapshotted first), and the sandbox's

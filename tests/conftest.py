@@ -69,6 +69,12 @@ _MODMAP = {
     "registry": "aspen",
     "workflows": "aspen",
     "_check_state_locations": "aspen.main",
+    # turn telemetry
+    "telemetry": "aspen",
+    "TELEMETRY_ENABLED": "aspen.config",
+    "TELEMETRY_DIR": "aspen.config",
+    "TELEMETRY_STATE_FILE": "aspen.config",
+    "TELEMETRY_MAX_TEXT": "aspen.config",
     # slack front-end
     "_handle_event": "aspen.slack_app",
     "handle_message": "aspen.slack_app",
@@ -159,6 +165,20 @@ def _reset_state(sut):
     sut.MANAGER.clear()
     sut.registry.invalidate()  # the registry is mtime-cached; don't leak across tests
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_telemetry(sut, tmp_path, monkeypatch):
+    """Point the turn log and its switch at a per-test directory.
+
+    Autouse because ``_handle_event`` records every turn now, so *any* test that
+    drives one would otherwise append into a location shared by the whole session.
+    """
+    monkeypatch.setattr(sut, "TELEMETRY_DIR", tmp_path / "telemetry")
+    monkeypatch.setattr(sut, "TELEMETRY_STATE_FILE", tmp_path / "telemetry.json")
+    sut.telemetry.invalidate()
+    yield
+    sut.telemetry.invalidate()
 
 
 class SayRecorder:

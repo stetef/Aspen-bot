@@ -204,6 +204,27 @@ SANDBOX_EXCLUDED_COMMANDS = _csv_env(
 
 
 # ---------------------------------------------------------------------------
+# Turn telemetry — one JSON line per turn, so the tool surface and prompt can be
+# tuned for the tasks people actually bring. See telemetry.py.
+#
+# This flag is the operator floor: false means nothing is recorded, whatever the
+# state file says. Day-to-day switching (metrics vs. question text, a time-boxed
+# collection window, per-person exclusions) lives in TELEMETRY_STATE_FILE and is
+# driven by `aspen-users telemetry`, so it hot-reloads without a restart.
+#
+# Both paths sit under STATE_DIR for the same reason the registry does: inside
+# WORKSPACE_ROOT or a sandbox-writable path, generated analysis code could read
+# the log or switch off its own recording (guarded in main._check_state_locations).
+# ---------------------------------------------------------------------------
+TELEMETRY_ENABLED     = _flag("ASPEN_TELEMETRY", "true")
+TELEMETRY_DIR         = Path(os.getenv("ASPEN_TELEMETRY_DIR", str(STATE_DIR / "telemetry"))).resolve()
+TELEMETRY_STATE_FILE  = Path(os.getenv("ASPEN_TELEMETRY_STATE_FILE", str(STATE_DIR / "telemetry.json"))).resolve()
+# Cap on the recorded question text — a pasted traceback shouldn't bloat the log
+# (the true length is kept separately as `chars`).
+TELEMETRY_MAX_TEXT    = int(os.getenv("ASPEN_TELEMETRY_MAX_TEXT", "4000"))
+
+
+# ---------------------------------------------------------------------------
 # Registry-backed values (PEP 562 module __getattr__)
 #
 # ``ALLOWED_USER_IDS`` and ``ADMIN_USER_ID`` used to be module constants computed
