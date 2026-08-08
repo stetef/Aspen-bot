@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from slack_bolt import App
 
-from . import attachments, config, ratelimit, render, sessions, state
+from . import attachments, config, ratelimit, registry, render, sessions, state, workflows
 
 log = logging.getLogger("aspen")
 
@@ -350,13 +350,25 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
         key     = sessions._thread_key(event)
         # ``on_progress`` lets the agent report each tool call mid-turn, so the
         # indicator tracks the actual work instead of a static "is typing…".
-        context = {"user_id": uid, "username": "", "thread_ts": thread_ts or "",
+        context = {"user_id": uid, "username": registry.display_name(uid),
+                   "thread_ts": thread_ts or "",
                    "attachments": [], "on_progress": progress.update}
+
+        # Who is speaking, and what workflows exist, must ride on the *message*:
+        # a session is keyed per thread and pre-warmed before the speaker is
+        # known, and a group DM has several speakers sharing one session — so
+        # this can't live in the system prompt. Cheap (frontmatter only) and
+        # bounded by the size of the registry.
+        try:
+            turn_message = workflows.turn_preamble(uid) + user_message
+        except Exception:      # context is an enhancement; never fail a turn for it
+            log.exception("Could not build the workflow preamble for %s", uid)
+            turn_message = user_message
 
         try:
             loop = sessions._ensure_loop()
             fut = asyncio.run_coroutine_threadsafe(
-                sessions.MANAGER.handle(key, user_message, context), loop
+                sessions.MANAGER.handle(key, turn_message, context), loop
             )
             reply, atts = fut.result(timeout=_TURN_TIMEOUT)
         except Exception:

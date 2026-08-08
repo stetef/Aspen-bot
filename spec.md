@@ -8,8 +8,8 @@ and summarizing data in a sandbox, and recording per-project notes.
 
 This document describes the system **as built**. Work that is designed but not yet
 implemented (production service account / systemd, the agent submitting its own Slurm
-jobs) is collected in [§16 Roadmap](#16-roadmap--not-yet-implemented). Magic numbers in
-this doc are defaults; the authority is `.env` (see [§13](#13-environment-variables-env)).
+jobs) is collected in [§18 Roadmap](#18-roadmap--not-yet-implemented). Magic numbers in
+this doc are defaults; the authority is `.env` (see [§15](#15-environment-variables-env)).
 
 ---
 
@@ -24,6 +24,7 @@ aspen-bot.py / aspen.* package   (Slack Bolt app)
   │   └── per-user rate limits + global concurrency cap (in-memory)
   │   └── tool calls served in-process as MCP tools:
   │         list_directory · read_file · search_files · attach_file · write_metadata
+  │         read_workflow · write_workflow
   │
   ▼  run_python_analysis → HTTP POST over a Unix-domain socket + shared-secret header
 FastAPI tool server  (tool_server.py, binds a Unix socket in a 0700 dir)
@@ -40,9 +41,9 @@ Two processes, both single-instance:
 
 - **`aspen-bot.py`** (the `aspen` package) — the Slack front-end and the agent. It runs
   the **Claude Agent SDK** against the Claude Code CLI, exposes a locked-down tool
-  surface, and keeps a warm SDK session per Slack thread. The read-only browsing tools
-  and `write_metadata` run **in-process**; `run_python_analysis` is the one tool that
-  reaches out to the tool server.
+  surface, and keeps a warm SDK session per Slack thread. The read-only browsing tools,
+  `write_metadata`, and the workflow tools run **in-process**; `run_python_analysis` is
+  the one tool that reaches out to the tool server.
 - **`tool_server.py`** — a FastAPI service bound to a **Unix-domain socket** (a file in
   a `0700` directory, not a TCP port — so other users on a shared node can't reach it)
   that executes LLM-generated analysis code inside a **bubblewrap (bwrap)** jail with a
@@ -72,7 +73,7 @@ or `tmux` session (not systemd). `start.sh`:
 1. activates the bot virtualenv,
 2. bootstraps `socat` into `~/.local/bin` if the Bash OS-sandbox is enabled (needs
    `bubblewrap` + `socat`),
-3. builds the **analysis venv** once (see [§6](#6-analysis-sandbox-bwrap)) — with `uv`
+3. builds the **analysis venv** once (see [§8](#8-analysis-sandbox-bwrap)) — with `uv`
    when available, falling back to `python -m venv` + `pip` — and exports
    `ANALYSIS_PYTHON`,
 4. launches `tool_server.py` in the background, then `aspen-bot.py` in the foreground.
@@ -80,7 +81,7 @@ or `tmux` session (not systemd). `start.sh`:
 In this mode every analysis request executes under the developer's Unix identity, so the
 Slack user allowlist ([§3](#3-slack-integration--socket-mode)) **must** contain only the
 developer's own user ID. Production deployment under a dedicated service account is
-[roadmap](#16-roadmap--not-yet-implemented).
+[roadmap](#18-roadmap--not-yet-implemented).
 
 ### Single-process requirement
 
@@ -150,15 +151,17 @@ was mentioned in (or DMed in). Adding/removing scopes requires reinstalling the 
 
 ### User allowlist
 
-Aspen acts only on Slack user IDs in `ASPEN_ALLOWED_SLACK_USER_IDS` (comma-separated).
-Anyone else gets at most one "not authorized" reply that names the admin to contact. This
-check is the **first authorization gate**, before rate limiting and before any tool runs.
-In the current dev mode the allowlist must contain only the developer's own ID.
+Aspen acts only on Slack user IDs marked `status: active` in the **user registry**
+([§5](#5-user-registry)). Anyone else gets at most one "not authorized" reply that names
+the admin to contact. This check is the **first authorization gate**, before rate limiting
+and before any tool runs. Until the registry file exists, the allowlist falls back to the
+`ASPEN_ALLOWED_SLACK_USER_IDS` bootstrap.
 
-**Admin.** The **first** ID in `ASPEN_ALLOWED_SLACK_USER_IDS` is presumed to be Aspen's
-admin and is @-mentioned in the "not authorized" and group-DM refusals so users know who
-to ask to be added. Override with `ASPEN_ADMIN_SLACK_USER_ID` if the admin isn't the first
-allowlisted user.
+**Admin.** Aspen's admin is `ASPEN_ADMIN_SLACK_USER_ID` if set, else the registry's first
+`role: admin` user, else the first active user (preserving the historical "first ID in the
+list" rule). They are @-mentioned in the "not authorized" and group-DM refusals so users
+know who to ask to be added, and they are the only user who may edit the shared `_group`
+workflow.
 
 ### Participant gate (group DMs)
 
@@ -179,7 +182,7 @@ the admin (allowlisted users can still DM Aspen directly). The check (in `_handl
 The gate runs **after** the mentioner allowlist check and **before** rate limiting, so a
 blocked group DM consumes no rate-limit slot. It applies to group DMs only; channels keep
 the per-mentioner behavior (requiring every member of a public channel to be allowlisted
-isn't practical, and broad channel rollout waits for the service account — [§16.1](#161-production-deployment-service-account--systemd)).
+isn't practical, and broad channel rollout waits for the service account — [§18.1](#181-production-deployment-service-account--systemd)).
 
 ---
 
@@ -202,15 +205,29 @@ auto-approves exactly the MCP tools below plus a read-only Bash allowlist, and a
 | `search_files` | read-only | Grep file contents under the calculations root (path-confined, in-process) |
 | `attach_file` | read-only | Upload a calculations-root file alongside the Slack reply |
 | `write_metadata` | **write** | Create/overwrite **only** a project's top-level `metadata.md` |
+| `read_workflow` | read-only | Open a user's workflow file (own, a colleague's, or `_group`) |
+| `write_workflow` | **write** | Create/overwrite **only the speaking user's own** workflow |
 | `run_python_analysis` | sandboxed | Execute analysis code in the bwrap jail (via the tool server) |
 
-`write_metadata` is the agent's **only** write surface. It is enforced in Python: the
-target must resolve to `<calculations-root>/<project>/metadata.md` (single path
-component, no traversal), the project dir must already exist, and nothing else can be
-written. All calculation inputs/outputs/data stay read-only. Because the write replaces
-the whole file, the previous version is snapshotted to
-`<workspace>/metadata_history/<project>/<UTC>.md` first, so a careless overwrite is
-recoverable.
+The agent has exactly **two** write surfaces, both enforced in Python and both narrow by
+construction.
+
+`write_metadata`: the target must resolve to `<calculations-root>/<project>/metadata.md`
+(single path component, no traversal), the project dir must already exist, and nothing
+else can be written. All calculation inputs/outputs/data stay read-only.
+
+`write_workflow`: the target is `<workflows-root>/<alias>__<slack-id>/WORKFLOW.md` for the
+**user who sent the message**. Note what the tool schema does *not* contain: an owner
+parameter. The destination is derived from `context["user_id"]` — the ID Slack itself
+attached to the event — so no wording in the conversation can redirect a write to someone
+else's file. A model can be talked into passing any argument it is told to; it cannot pass
+a value it never receives. The one exception is the shared `_group` workflow, gated on
+`uid == ADMIN_USER_ID` in the same function.
+
+Both writes replace the whole file, so the previous version is snapshotted first —
+`<workspace>/metadata_history/<project>/<UTC>.md` and
+`<workspace>/workflow_history/<slack-id>/<UTC>.md` respectively — making a careless
+overwrite recoverable.
 
 The read/search tools (`list_directory`, `read_file`, `search_files`, `attach_file`) are
 **path-fenced in Python** to the calculations root (`_safe_path`): they resolve symlinks
@@ -237,7 +254,125 @@ would currently confine nothing.
 
 ---
 
-## 5. Project Metadata
+## 5. User Registry
+
+Who may talk to Aspen, and what to call them, lives in a single JSON file —
+`ASPEN_USERS_FILE` (default `$ASPEN_STATE_DIR/users.json`, i.e. `~/.aspen/users.json`).
+
+```json
+{"version": 1, "users": [
+  {"slack_user_id": "U0SAM", "alias": "sam", "display_name": "Sam",
+   "role": "admin", "status": "active", "added": "2026-06-01", "added_by": "bootstrap"},
+  {"slack_user_id": "U01ARUN", "alias": "arun", "display_name": "Arun N.",
+   "role": "member", "status": "active", "added": "2026-08-07",
+   "added_by": "cli:sam", "notes": "beta"}
+]}
+```
+
+**Resolve by ID, display by alias.** `slack_user_id` is the durable key and the *only*
+thing that authorizes; `alias` is a kebab-case label for folder names and CLI arguments.
+An alias can be renamed at any time without breaking a lookup, and looking a user up by
+alias only ever *finds* them — admission is always `slack_user_id in ALLOWED_USER_IDS`
+against the ID Slack itself put on the event. Aliases match `^[a-z0-9]+(-[a-z0-9]+)*$`
+(≤32 chars), which structurally cannot produce the reserved `_group` / `_archive`
+directory names.
+
+**Hot reload.** `config.ALLOWED_USER_IDS` and `config.ADMIN_USER_ID` are no longer import-
+time constants: a PEP 562 module `__getattr__` routes them through `registry`, which
+re-reads the file whenever its mtime/size changes. Revoking access therefore takes effect
+on the offending user's **next message**, not at the next restart. The hook only fires for
+names absent from the module dict, so both existing call sites are unchanged and
+`monkeypatch.setattr` in the tests still shadows them as before.
+
+**Failure behavior — never widen.** A malformed file keeps the last good copy in memory
+(access is unchanged, the error is logged). Only if nothing good was ever loaded do we
+fall back to the `ASPEN_ALLOWED_SLACK_USER_IDS` bootstrap — operator-controlled, so it
+cannot grant more than was already configured, and it keeps a typo from locking the admin
+out. Individual malformed entries are dropped rather than failing the whole file.
+
+**Writes are CLI-only.** `aspen-users` (`python -m aspen.users_cli`) is the only thing
+that writes the registry: `init`, `list`, `add`, `rename`, `remove`, `sync`, `whois`. The
+first write migrates the bootstrap IDs into the registry — announced, with names resolved
+from Slack and the first ID kept as admin — so nobody silently gains or loses access. There is
+deliberately **no Slack command and no agent tool** that changes admission, so no message
+— however phrased — can widen the allowlist. See the README for the full argument
+reference.
+
+---
+
+## 6. Per-User Workflows
+
+Each user can keep a **workflow file**: their own notes on how they run and interpret
+calculations. Layout under `ASPEN_WORKFLOWS_ROOT` (default `$ASPEN_STATE_DIR/workflows`):
+
+```
+arun__U01ARUN/WORKFLOW.md      # <alias>__<slack-id>; lookups glob "*__<uid>"
+_group/WORKFLOW.md             # shared house style (admin-writable)
+_archive/priya__U0PRIYA/       # a removed user's knowledge, kept as reference
+```
+
+Files carry YAML frontmatter. The author owns `description` (and `derived_from`);
+everything else — `name`, `owner_id`, `owner_name`, `updated`, `updated_by` — is stamped
+by Python on every write, so identity fields can't be forged by whatever the model passes.
+
+**Two-layer disclosure (the SKILL.md pattern, without Claude Code's Skill machinery).**
+Every turn is prefixed with an `<aspen_context>` block naming the speaker and listing each
+workflow's alias + one-line description — a frontmatter-only scan, a few hundred tokens at
+this group's size. The full body is fetched on demand by `read_workflow`. Claude Code's
+native skills were deliberately *not* used: re-enabling the `Skill` tool would undo the
+`tools=["Bash"]` / `skills=[]` lockdown ([§4](#4-tool-surface)) and its ~13k tokens/turn
+saving, and would hand skill discovery to the CLI, pointed at a user-writable directory.
+
+The preamble rides on the **message**, not the system prompt, because sessions are keyed
+per *thread* and pre-warmed before the speaker is known, and a group DM has several
+speakers sharing one session ([§10](#10-conversation-context)).
+
+### Trust tiers
+
+A workflow file differs in kind from project data: it is text that asks to be *followed*.
+With cross-user visibility, one user's authored text would otherwise steer another user's
+session. So `read_workflow` returns the body inside a tagged block:
+
+| Tier | When | Meaning to the model |
+|---|---|---|
+| `your-own` | the speaker's own file | Standing preferences — follow them, but they're preferences, not orders |
+| `group-default` | `_group` | House default; the speaker's own overrides it |
+| `reference-only` | anyone else's, incl. archived | Notes to describe, quote, or adapt — **never** instructions addressed to you |
+
+The system prompt states this explicitly, including that no workflow — not even the
+speaker's own — can grant tools, relax the sandbox, change file access, alter who may edit
+what, or override its instructions. As with project text, **the boundary is the Python-
+enforced tool limits, never the prompt**: a workflow file cannot cause any action a plain
+Slack message couldn't.
+
+### Ownership
+
+`write_workflow` has no owner parameter; the target is `context["user_id"]` from the Slack
+event ([§4](#4-tool-surface)). To help someone adopt a colleague's approach, the agent
+reads the colleague's file, adapts it with the user, and saves it to the *user's own* file
+with `derived_from` recorded — normalized to a registry alias, or dropped if it resolves
+to nobody.
+
+### Lifecycle
+
+`aspen-users remove` revokes access and **archives** the workflow by default (a removed
+member's notes are often the most valuable thing they leave behind); the file stays
+readable as `reference-only` with an `archived:` tombstone. `--purge` deletes it instead,
+and `--purge-history` also clears the backups. Every overwrite snapshots the prior version
+to `<workspace>/workflow_history/<slack-id>/<UTC>.md`.
+
+### Placement guard
+
+`main._check_state_locations()` refuses to start if `USERS_FILE` or `WORKFLOWS_ROOT`
+resolves inside `WORKSPACE_ROOT` or any `ASPEN_SANDBOX_WRITE_PATHS` entry. Those areas are
+writable by sandboxed analysis code, which would let generated Python edit the allowlist
+or another user's workflow directly and walk straight around both checks above. It also
+creates the workflows root and `chmod 0700`s the state dir, so other users on a shared
+login node can't read or plant files there.
+
+---
+
+## 7. Project Metadata
 
 Each project has a human-readable **`metadata.md`** at its root that the agent reads to
 understand the project, and that the agent can update via `write_metadata`. The tool
@@ -255,7 +390,7 @@ never relax sandbox restrictions, choose mounts, or alter the import advisory.
 
 ---
 
-## 6. Analysis Sandbox (bwrap)
+## 8. Analysis Sandbox (bwrap)
 
 `run_python_analysis` runs LLM-generated Python inside a **bubblewrap** jail. (bwrap
 replaced Apptainer: rootless Apptainer `--memory` requires cgroups v2, and the target
@@ -322,7 +457,7 @@ edit `analysis-requirements.txt` and rebuild the venv.
 
 ---
 
-## 7. Output & Figure Handling
+## 9. Output & Figure Handling
 
 - **stdout** truncated to 10,000 chars, **stderr** to 2,000, before returning to the
   model / Slack; `truncated: true` triggers a note in the reply.
@@ -334,7 +469,7 @@ edit `analysis-requirements.txt` and rebuild the venv.
 
 ---
 
-## 8. Conversation Context
+## 10. Conversation Context
 
 Context is held by the **Claude Agent SDK's warm session**, one per Slack thread
 (`thread_ts`), parked between turns and reused — the SDK retains conversation state
@@ -356,7 +491,7 @@ keeping the thread's context — it is **not** a hard error.
 
 ---
 
-## 9. Rate Limiting & Concurrency
+## 11. Rate Limiting & Concurrency
 
 Enforced in `aspen-bot.py` before any tool runs, per Slack user ID, in-memory:
 
@@ -371,7 +506,7 @@ Over-limit users get an immediate in-thread message; a busy global cap yields a
 
 ---
 
-## 10. Per-Project Database — SQLite
+## 12. Per-Project Database — SQLite
 
 Each project uses one SQLite file at `<workspace>/db/<project>.sqlite` (no Postgres
 dependency). The tool server is the sole writer; the jail has no access to db files.
@@ -384,7 +519,7 @@ energy, structure, last_update) and a `datasets` table, with indexes on status/t
 
 ---
 
-## 11. Caching
+## 13. Caching
 
 Cache key = `SHA-256(question + sorted(dataset_ids) + max(file_mtimes))`, so new data in a
 run directory invalidates automatically. Entries are stored at
@@ -395,7 +530,7 @@ expiry.
 
 ---
 
-## 12. Logging, Auditing & Secret Redaction
+## 14. Logging, Auditing & Secret Redaction
 
 The tool server writes structured JSON logs to `<workspace>/logs/<project>/<date>.jsonl`
 after each execution (timestamp, user, thread, project, question, dataset, generated code,
@@ -410,15 +545,15 @@ figures, status, errors, duration, cache_hit).
 
 ---
 
-## 13. Environment Variables (`.env`)
+## 15. Environment Variables (`.env`)
 
 See `.env.example` for the full annotated list. Key groups:
 
 ```bash
 # Slack / auth
 SLACK_BOT_TOKEN=xoxb-...      SLACK_APP_TOKEN=xapp-...
-ASPEN_ALLOWED_SLACK_USER_IDS=U0XXXXXXXXX        # dev mode: developer's ID only; 1st = admin
-ASPEN_ADMIN_SLACK_USER_ID=                       # optional; default = first allowlisted ID
+ASPEN_ALLOWED_SLACK_USER_IDS=U0XXXXXXXXX        # BOOTSTRAP only — the registry (§5) rules
+ASPEN_ADMIN_SLACK_USER_ID=                       # optional; default = registry role:admin
 ANTHROPIC_API_KEY=sk-ant-...                     # only if ASPEN_SDK_USE_SUBSCRIPTION=false
 ASPEN_SDK_USE_SUBSCRIPTION=true                  # default: use the Claude Code login
 ANTHROPIC_MODEL=claude-opus-4-8
@@ -430,6 +565,13 @@ PROJECTS_ROOT=/.../calculations          # analysis (read-only mount)
 WORKSPACE_ROOT=/.../aspen_workspace      # figures, cache, logs, db, generated_code, metadata_history
 SQLITE_DB_ROOT=/tmp/aspen_db
 ASPEN_TOOL_SERVER_SOCKET=                 # default $WORKSPACE_ROOT/run/tool.sock (Unix socket, 0700 dir)
+
+# Users + workflows (§5, §6). MUST be outside WORKSPACE_ROOT and the sandbox's
+# writable paths — startup refuses otherwise.
+ASPEN_STATE_DIR=                          # default ~/.aspen (0700)
+ASPEN_USERS_FILE=                         # default $ASPEN_STATE_DIR/users.json
+ASPEN_WORKFLOWS_ROOT=                     # default $ASPEN_STATE_DIR/workflows
+ASPEN_MAX_WORKFLOW_BYTES=60000
 
 # Bash allowlist (default: Slurm read-only only — no general file readers; see §4)
 # ASPEN_BASH_ALLOWLIST=
@@ -457,7 +599,7 @@ Paths and identity-specific values are driven entirely from `.env` (no hardcoded
 
 ---
 
-## 14. Security Summary
+## 16. Security Summary
 
 | Layer | Protection |
 |---|---|
@@ -485,7 +627,7 @@ inside the analysis jail.
 
 ---
 
-## 15. Tests
+## 17. Tests
 
 A hermetic pytest suite runs without a live Slack connection, Claude CLI, or network
 (`pytest -q` from the repo root). Highlights:
@@ -507,11 +649,11 @@ package and neutralizes import-time side effects.
 
 ---
 
-## 16. Roadmap / Not Yet Implemented
+## 18. Roadmap / Not Yet Implemented
 
 These are designed or intended but **not** in the current build.
 
-### 16.1 Production deployment (service account + systemd)
+### 18.1 Production deployment (service account + systemd)
 
 Move from the dev-account model to a dedicated **`aspen-agent` service account** managed
 by **systemd**, required before opening Aspen to users beyond the developer. Outline:
@@ -529,7 +671,7 @@ by **systemd**, required before opening Aspen to users beyond the developer. Out
   the model endpoint, the analysis venv building, and the SQLite placement/journal choice
   validated on the actual filesystem.
 
-### 16.2 Agent-submitted Slurm/PBS jobs (ORCA → CORVUS pipeline)
+### 18.2 Agent-submitted Slurm/PBS jobs (ORCA → CORVUS pipeline)
 
 Today Aspen's scheduler access is **read-only investigation** only. A future capability
 would let it submit and cancel its own jobs via the `orca-pipeline` `submit-batch.py`
@@ -549,7 +691,7 @@ would let it submit and cancel its own jobs via the `orca-pipeline` `submit-batc
   without refactoring, the tool server stays structured so new routes/tools drop in
   without modifying existing ones.
 
-### 16.3 Other deferred items
+### 18.3 Other deferred items
 
 - LLM-assisted metadata/indexing suggestions.
 - Persistent conversation history across restarts.

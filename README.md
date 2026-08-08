@@ -34,6 +34,9 @@ thread.
   in a locked-down sandbox and uploads figures to the thread.
 - **Hand over files** — attaches data/structure/log files directly to its reply.
 - **Record project notes** — updates each project's top-level `metadata.md`.
+- **Work the way you work** — each user can keep a **workflow file** (their own notes on
+  functionals, what they check, what they extract). Aspen reads yours before planning a
+  calculation, and can show you a colleague's when you want to borrow their approach.
 - **Investigate jobs** — read-only Slurm queries (`squeue`/`sacct`/…). It does **not**
   submit or cancel jobs.
 
@@ -58,13 +61,83 @@ with a short refusal and these same steps. To get added:
 1. **Copy your Slack member ID.** In Slack, click your name or profile picture →
    **View full profile** → the **⋮ More** button → **Copy member ID**. It looks like
    `U01AB2CD3EF` (not your `@handle`, which can change).
-2. **Send that ID to the admin** and ask to be added to the approved-users list. The
-   admin is the first ID in `ASPEN_ALLOWED_SLACK_USER_IDS` (or `ASPEN_ADMIN_SLACK_USER_ID`
-   if set), and Aspen @-mentions them in every refusal so you know who to ask.
+2. **Send that ID to the admin** and ask to be added to the approved-users list. Aspen
+   @-mentions the admin in every refusal so you know who to ask.
 
 For **group DMs**, *every* human member must be allowlisted — so anyone in the room
 who isn't yet approved needs to do the same. Until then, approved users can DM Aspen
 directly.
+
+## Managing users (`aspen-users`)
+
+Who may talk to Aspen lives in a **user registry** (`$ASPEN_STATE_DIR/users.json`, default
+`~/.aspen/users.json`) that maps each Slack member ID to a human **alias**, so you can
+manage people by name instead of by `U01AB2CD3EF`. Changes take effect on the affected
+user's **next message — no restart**.
+
+The registry is written *only* by this CLI. Aspen has no tool and no Slack command that
+adds or removes a user, so no message — however phrased — can widen the allowlist.
+
+```bash
+./aspen-users init                                   # first run: migrate the .env bootstrap
+./aspen-users list                                   # who's registered
+./aspen-users list --all                             # include removed users
+./aspen-users add U01AB2CD3EF --alias arun --name "Arun N."
+./aspen-users add U01AB2CD3EF --notes beta           # alias/name looked up from Slack
+./aspen-users rename arun --to arun-n                # also renames their folder
+./aspen-users remove arun                            # revoke + archive their workflow
+./aspen-users remove arun --purge                    # revoke + delete their workflow
+./aspen-users sync --apply                           # refresh display names from Slack
+./aspen-users whois arun                             # one user's full entry
+```
+
+| Command | Arguments | Notes |
+|---|---|---|
+| `init` | — | Turns the `.env` bootstrap into a real registry (names looked up from Slack, first ID kept as admin). Runs automatically on the first `add`/`rename`/`remove`; this just does it deliberately. |
+| `list` | `--all` | `--all` includes removed users. Flags column marks admin / workflow. |
+| `add` | `<slack_id>` `--alias` `--name` `--role {member,admin}` `--notes` | Alias defaults to a kebab-case slug of their name; the name is looked up from Slack if omitted. Re-running `add` reinstates a removed user. |
+| `rename` | `<alias\|id>` `--to <new-alias>` | Aliases are cosmetic — lookups go by Slack ID, so this never breaks anything. |
+| `remove` | `<alias\|id>` `--purge` `--purge-history` `--force` `-y/--yes` | Archives the workflow by default. `--force` is required to remove the admin. |
+| `sync` | `--apply` | Dry run by default: reports display-name changes and aliases that no longer match. |
+| `whois` | `<alias\|id>` | Registry entry plus the workflow path. |
+
+Global: `--by <name>` records who made the change in `added_by`/`removed_by` (defaults to
+your Unix user).
+
+Until `users.json` exists, the allowlist falls back to `ASPEN_ALLOWED_SLACK_USER_IDS` in
+`.env` — that bootstrap is what keeps a fresh install (or a corrupt registry) from locking
+the admin out. The first write migrates those IDs into the registry (announced, with names
+resolved from Slack) and the registry takes over; nobody loses access in the process.
+
+## Per-user workflows
+
+Every user can keep a **workflow file** — their own notes on how they run and interpret
+calculations (favored functionals and basis sets, what they check and in what order, what
+they pull out of an output). Aspen reads yours before planning work it covers, and can
+read a colleague's when you ask how they'd do something.
+
+```
+$ASPEN_STATE_DIR/workflows/
+  arun__U01AB2CD3EF/WORKFLOW.md    # <alias>__<slack-id> — resolution is by ID
+  _group/WORKFLOW.md               # shared house style (admin-writable)
+  _archive/priya__U0PRIYA/         # removed users' knowledge is kept, not deleted
+```
+
+The easiest way to create one is to tell Aspen: paste your notes into a DM and ask it to
+save them as your workflow. It writes the frontmatter, shows you the file, and saves on
+your say-so. See [`examples/WORKFLOW.example.md`](examples/WORKFLOW.example.md) for the
+format — the one-line `description:` is the important part, since that is what gets
+indexed into every conversation.
+
+Aspen can only ever write **your own** workflow: the target comes from the Slack event,
+not from anything in the conversation. To adopt a colleague's approach, Aspen reads
+theirs, adapts it with you, and saves it to yours with `derived_from` recorded. Someone
+else's workflow is delivered to the model marked `trust="reference-only"` — material to
+quote and adapt, explicitly not instructions to follow — because a workflow file is
+user-authored text and is treated as untrusted, exactly like project data.
+
+Every overwrite snapshots the previous version to
+`$WORKSPACE_ROOT/workflow_history/<slack-id>/`.
 
 ## Architecture at a glance
 
@@ -82,9 +155,14 @@ Aspen is SDK-only (the older direct Anthropic Messages-API backend was removed),
 analysis sandbox is bwrap (it replaced Apptainer, which couldn't enforce rootless memory
 limits on this cgroups-v1 host).
 
-The only place Aspen can write is each project's `metadata.md` (the prior version is
-snapshotted first) and the sandbox's `figures/`/`cache/` — all calculation inputs,
-outputs, and data stay read-only.
+- **`aspen/registry.py` + `aspen/workflows.py`** — the user registry (Slack ID ↔ alias,
+  and the admission allowlist, hot-reloaded from `users.json`) and the per-user workflow
+  store. Both live under `ASPEN_STATE_DIR`, deliberately outside the repo *and* outside
+  any sandbox-writable path; the bot refuses to start if that's violated.
+
+The only places Aspen can write are each project's `metadata.md`, the speaking user's own
+workflow file (prior versions of both are snapshotted first), and the sandbox's
+`figures/`/`cache/` — all calculation inputs, outputs, and data stay read-only.
 
 See [`spec.md`](spec.md) for the full design, [`THREAT_MODEL.md`](THREAT_MODEL.md)
 for the threat model, security measures, and the service-account cutover checklist,
@@ -112,7 +190,7 @@ first launch — that needs network and takes a few minutes once.
 ### Configuration
 
 All paths, tokens, limits, and sandbox settings come from `.env` — see `.env.example` for
-the annotated list and [`spec.md` §13](spec.md#13-environment-variables-env) for details.
+the annotated list and [`spec.md` §15](spec.md#15-environment-variables-env) for details.
 By default the Claude Code CLI authenticates with the Claude Code login; set
 `ASPEN_SDK_USE_SUBSCRIPTION=false` to use `ANTHROPIC_API_KEY` instead.
 
@@ -127,7 +205,7 @@ A hermetic suite — no live Slack, Claude CLI, or network needed.
 ## Status
 
 Aspen is implemented and running in **developer mode** (under a personal account). Two
-things remain on the [roadmap](spec.md#16-roadmap--not-yet-implemented): a production
+things remain on the [roadmap](spec.md#18-roadmap--not-yet-implemented): a production
 service account + systemd deployment, and letting the agent submit/manage its own
 Slurm/PBS jobs (the ORCA → CORVUS pipeline). Today its scheduler access is read-only.
 

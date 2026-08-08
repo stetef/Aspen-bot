@@ -1,8 +1,9 @@
 # Aspen — Threat Model & Security Measures
 
-_Last updated: 2026-06-29. Scope: the system **as built** after the
-`security/interim-hardening` pass and the group-DM participant gate (C7), plus the
-security work still owed (notably the move to a dedicated service account). Companion to [`spec.md`](spec.md) (design)
+_Last updated: 2026-08-07. Scope: the system **as built** after the
+`security/interim-hardening` pass, the group-DM participant gate (C7), and the user
+registry + per-user workflows (C8–C11), plus the security work still owed (notably
+the move to a dedicated service account). Companion to [`spec.md`](spec.md) (design)
 and [`probe_isolation.sh`](probe_isolation.sh) (host-fact verification)._
 
 This document records **why** Aspen is locked down the way it is: the context it
@@ -53,6 +54,11 @@ tell a deliberate decision from an accident.
 - **Untrusted project text → model context** — prompt-injection boundary. Project
   metadata/files are untrusted input; the security boundary is always the jail and
   the Python-enforced tool limits, **never** the prompt.
+- **One user's authored text → another user's session** — per-user workflow files
+  are user-written text *intended to be followed*, and are readable across users
+  for knowledge transfer. Someone else's file is delivered `trust="reference-only"`
+  (C10), but as above the enforcing boundary is the tool surface: workflow text
+  cannot reach any action a plain Slack message couldn't.
 
 ## 4. Threat actors
 
@@ -64,6 +70,10 @@ tell a deliberate decision from an accident.
   user.
 - **Prompt-injection via project data** — content in the calculations tree trying
   to steer the agent. Bounded by the jail + fenced tools.
+- **Prompt-injection via a colleague's workflow file** — a member (or anyone who
+  could plant a file in the workflows tree) writing directives aimed at other
+  users' sessions. Bounded by C9–C11 and the same fenced tools; the `0700` state
+  dir keeps non-members from planting files out-of-band.
 - **External attacker** — minimal direct surface (no inbound ports); realistic
   path is secret theft or supply chain.
 - **Admins / root / backups** — trusted, out of scope (but note they *can* read
@@ -74,8 +84,8 @@ tell a deliberate decision from an accident.
 Two single-instance processes:
 
 - **bot** (`aspen/`) — Slack front-end + Claude Agent SDK. Serves the read/search
-  /metadata tools **in-process**; the only outbound tool call is the analysis
-  bridge to the tool server.
+  /metadata/workflow tools **in-process**; the only outbound tool call is the
+  analysis bridge to the tool server.
 - **tool server** (`tool_server.py`) — runs LLM-generated analysis code in the
   bwrap jail; owns caching, metadata parsing, the SQLite index, audit logging.
 
@@ -84,7 +94,9 @@ Two single-instance processes:
 | Tool | Bound by |
 |---|---|
 | `list_directory`, `read_file`, `search_files`, `attach_file` | In-process Python, **path-fenced to the calculations root** (`_safe_path`); cannot read outside it |
-| `write_metadata` | The agent's only write surface; one file (`<project>/metadata.md`), prior version snapshotted first |
+| `write_metadata` | One file (`<project>/metadata.md`), prior version snapshotted first |
+| `read_workflow` | In-process, path-fenced to the workflows root; another user's file is tagged `trust="reference-only"` (C10) |
+| `write_workflow` | Only the **speaking user's own** file — the destination is the Slack event's `user_id`, and the tool has no owner parameter (C9); `_group` gated on the admin; prior version snapshotted |
 | `run_python_analysis` | The **bwrap jail + seccomp** (no network, read-only project mount, only `figures/`+`cache/` writable, `prlimit` caps) |
 | `Bash` | A **Slurm read-only allowlist** + `can_use_tool` deny; everything else refused |
 
@@ -107,9 +119,14 @@ Two single-instance processes:
 | C6 | **seccomp syscall denylist on the analysis jail** | The one lever on the kernel→root path from inside the jail on this old kernel; blocks namespace/mount/keyring/ptrace/module/bpf/io_uring/userfaultfd/etc. | `tool_server.py` |
 | C7 | **Group-DM participant gate** | In a group DM, the per-mentioner allowlist leaks Aspen's answers and the read thread context to *every* member — including people who could never DM it (a new prompt-injection + disclosure surface). Require **every human member** allowlisted; **fail closed** if membership can't be verified. App/bot members are exempt (only humans need approval). | `slack_app.py`, `config.py` |
 
-All controls are covered by the hermetic test suite (`pytest -q`, 102 tests),
-including contract tests that fail if a file-reader re-enters the allowlist or the
-seccomp denylist loses a key entry.
+| C8 | **Admission out of the agent's reach** | The user registry is written *only* by the `aspen-users` CLI — no Slack command, no tool. Nothing the model can be told to do adds or removes a user. Reads are hot-reloaded, so a revocation applies on the target's next message rather than at the next restart. Failure never widens: a corrupt file keeps the last good copy. | `registry.py`, `config.py`, `users_cli.py` |
+| C9 | **Workflow ownership taken from the Slack event** | `write_workflow` has no owner parameter; the destination is `context["user_id"]`. A model can be argued into passing any argument it is given — it cannot pass a value it never receives. `_group` edits gate on `ADMIN_USER_ID`. Prior versions snapshotted like C4. | `tools.py`, `workflows.py` |
+| C10 | **Trust tiers on cross-user workflow text** | A workflow is user-authored text meant to be *followed*, so cross-user reading is a lateral prompt-injection path. Another user's file is delivered tagged `trust="reference-only"` with an explicit prompt rule that directives inside it are not addressed to the model, and that no workflow can grant tools, relax the sandbox, or change file access. Defense in depth only — the real limit stays the Python-enforced tool surface. | `workflows.py`, `prompts.py` |
+| C11 | **State-location guard at startup** | C8/C9 hold only if the registry and workflow tree aren't reachable through a writable path. Startup refuses if either resolves inside `WORKSPACE_ROOT` or `ASPEN_SANDBOX_WRITE_PATHS`, where sandboxed analysis code could edit them directly; the state dir is `chmod 0700` against other users on the shared node. | `main.py`, `config.py` |
+
+All controls are covered by the hermetic test suite (`pytest -q`, 215 tests),
+including contract tests that fail if a file-reader re-enters the allowlist, the
+seccomp denylist loses a key entry, or `write_workflow` grows an owner parameter.
 
 ## 7. ⭐ Security work owed at the service-account cutover
 

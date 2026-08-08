@@ -245,6 +245,8 @@ def test_build_options_locks_down_tools(sut):
         "mcp__aspen__search_files",
         "mcp__aspen__attach_file",
         "mcp__aspen__write_metadata",
+        "mcp__aspen__read_workflow",
+        "mcp__aspen__write_workflow",
         "mcp__aspen__run_python_analysis",
     ] + list(config.BASH_ALLOWLIST)
     assert "Bash(squeue:*)" in opts.allowed_tools
@@ -346,6 +348,8 @@ def test_bash_allowlist_override_flows_into_allowed_tools(sut, monkeypatch):
         "mcp__aspen__search_files",
         "mcp__aspen__attach_file",
         "mcp__aspen__write_metadata",
+        "mcp__aspen__read_workflow",
+        "mcp__aspen__write_workflow",
         "mcp__aspen__run_python_analysis",
         "Bash(squeue:*)",
         "Bash(sacct:*)",

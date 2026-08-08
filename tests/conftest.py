@@ -32,6 +32,12 @@ _MODMAP = {
     "RATE_LIMIT_WINDOW": "aspen.config",
     "ALLOWED_USER_IDS": "aspen.config",
     "ADMIN_USER_ID": "aspen.config",
+    "USERS_FILE": "aspen.config",
+    "WORKFLOWS_ROOT": "aspen.config",
+    "STATE_DIR": "aspen.config",
+    "MAX_WORKFLOW_BYTES": "aspen.config",
+    "BOOTSTRAP_USER_IDS": "aspen.config",
+    "ADMIN_OVERRIDE": "aspen.config",
     # prompts
     "SYSTEM_PROMPT": "aspen.prompts",
     # tools
@@ -59,6 +65,10 @@ _MODMAP = {
     # attachments
     "_upload_attachments": "aspen.attachments",
     "_under": "aspen.attachments",
+    # user registry
+    "registry": "aspen",
+    "workflows": "aspen",
+    "_check_state_locations": "aspen.main",
     # slack front-end
     "_handle_event": "aspen.slack_app",
     "handle_message": "aspen.slack_app",
@@ -116,14 +126,20 @@ def sut(tmp_path_factory):
     """Facade over the refactored ``aspen`` package (system under test)."""
     calc_root = tmp_path_factory.mktemp("calculations")
     workspace_root = tmp_path_factory.mktemp("workspace")
+    state_dir = tmp_path_factory.mktemp("state")
     os.environ.update(
         {
             "SLACK_BOT_TOKEN": "xoxb-test",
             "SLACK_APP_TOKEN": "xapp-test",
             "ANTHROPIC_API_KEY": "sk-ant-test",
             "CALCULATIONS_ROOT": str(calc_root),
+            # No registry file is created here, so the suite runs in bootstrap
+            # mode: the allowlist comes from this env var exactly as it used to,
+            # which is what keeps the pre-registry admission tests unchanged.
             "ASPEN_ALLOWED_SLACK_USER_IDS": "U1,U2,U3,U4,U5",
             "WORKSPACE_ROOT": str(workspace_root),
+            # Keep the registry and workflow tree inside tmp — never ~/.aspen.
+            "ASPEN_STATE_DIR": str(state_dir),
             "AGENT_INTERNAL_SECRET": "test-secret",
         }
     )
@@ -141,6 +157,7 @@ def _reset_state(sut):
     sut._global_sem = threading.Semaphore(sut.MAX_CONCURRENT)
     sut._bot_uid_cache = None  # re-resolve the bot's own ID per test client
     sut.MANAGER.clear()
+    sut.registry.invalidate()  # the registry is mtime-cached; don't leak across tests
     yield
 
 

@@ -220,3 +220,9 @@ __marimo__/
 
 # Claude Code (worktree isolation, local settings)
 .claude/
+
+# Aspen user registry / workflow state (normally under ~/.aspen, but never
+# commit them if ASPEN_STATE_DIR is pointed inside the repo).
+users.json
+users.json.tmp
+/workflows/

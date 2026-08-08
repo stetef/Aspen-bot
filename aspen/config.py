@@ -26,18 +26,35 @@ SLACK_APP_TOKEN     = os.environ["SLACK_APP_TOKEN"]
 # Code CLI (via the subscription login, or the key passed to the CLI subprocess
 # when ASPEN_SDK_USE_SUBSCRIPTION=false) — see agent.py.
 CALCULATIONS_ROOT     = Path(os.environ["CALCULATIONS_ROOT"]).resolve()
-# Ordered list (declaration order preserved) so the FIRST entry can be treated as
-# Aspen's admin; membership checks use the set built from it.
-_ALLOWED_USER_ID_LIST = [u.strip() for u in os.environ["ASPEN_ALLOWED_SLACK_USER_IDS"].split(",") if u.strip()]
-ALLOWED_USER_IDS      = set(_ALLOWED_USER_ID_LIST)
-# The first allowlisted user is presumed to be Aspen's admin: Aspen @-mentions
-# this person in its "not authorized" and group-DM gate replies so users know who
-# to contact to be added. Override with ASPEN_ADMIN_SLACK_USER_ID when the admin
-# isn't the first allowlisted user. Empty only if the allowlist is empty.
-ADMIN_USER_ID         = os.getenv("ASPEN_ADMIN_SLACK_USER_ID", "").strip() or (
-    _ALLOWED_USER_ID_LIST[0] if _ALLOWED_USER_ID_LIST else ""
-)
 MODEL                 = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
+
+# ---------------------------------------------------------------------------
+# Users and per-user workflows
+#
+# State that outlives a release but isn't code: the user registry (who may talk
+# to Aspen, and their alias) and each user's workflow file. Kept OUTSIDE both the
+# repo and WORKSPACE_ROOT on purpose — see the startup guard in main.py. The
+# workspace is the analysis sandbox's writable area, so a registry living there
+# would be writable by sandboxed code, turning "who is allowed" into something
+# the agent could edit.
+# ---------------------------------------------------------------------------
+STATE_DIR             = Path(os.getenv("ASPEN_STATE_DIR", str(Path.home() / ".aspen"))).resolve()
+# The user registry: Slack ID <-> alias/display name, plus the admission
+# allowlist. Written only by the `aspen-users` CLI, read (hot-reloaded) by the
+# bot. See registry.py.
+USERS_FILE            = Path(os.getenv("ASPEN_USERS_FILE", str(STATE_DIR / "users.json"))).resolve()
+# Per-user workflow files: <root>/<alias>__<slack-id>/WORKFLOW.md, plus the
+# shared _group/ and the _archive/ of removed users. See workflows.py.
+WORKFLOWS_ROOT        = Path(os.getenv("ASPEN_WORKFLOWS_ROOT", str(STATE_DIR / "workflows"))).resolve()
+# Cap on a single workflow file (they are prose, not data).
+MAX_WORKFLOW_BYTES    = int(os.getenv("ASPEN_MAX_WORKFLOW_BYTES", "60000"))
+# Bootstrap allowlist, used only until USERS_FILE exists (fresh install) or if it
+# can't be parsed and nothing good was ever cached. The registry is the real
+# source of truth; this is the operator-controlled floor that prevents lockout.
+BOOTSTRAP_USER_IDS    = [u.strip() for u in os.getenv("ASPEN_ALLOWED_SLACK_USER_IDS", "").split(",") if u.strip()]
+# Explicit admin override. Empty = the registry decides (first `role: admin`,
+# else the first active user — the historical "first ID in the list" rule).
+ADMIN_OVERRIDE        = os.getenv("ASPEN_ADMIN_SLACK_USER_ID", "").strip()
 
 RATE_LIMIT_REQUESTS   = int(os.getenv("RATE_LIMIT_REQUESTS", "10"))
 RATE_LIMIT_WINDOW     = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "300"))
@@ -184,3 +201,35 @@ SANDBOX_EXCLUDED_COMMANDS = _csv_env(
     "ASPEN_SANDBOX_EXCLUDED_COMMANDS",
     "squeue,sacct,sinfo,sstat,sprio,scontrol",
 )
+
+
+# ---------------------------------------------------------------------------
+# Registry-backed values (PEP 562 module __getattr__)
+#
+# ``ALLOWED_USER_IDS`` and ``ADMIN_USER_ID`` used to be module constants computed
+# at import. They now resolve through ``registry`` on every read, so a change made
+# by ``aspen-users`` takes effect on the offending user's NEXT message instead of
+# at the next restart — which is what makes revoking access actually prompt.
+#
+# A module ``__getattr__`` only fires for names NOT found in the module dict, so:
+#   * the three existing call sites (`config.ALLOWED_USER_IDS`, `config.ADMIN_USER_ID`)
+#     keep working verbatim — no change needed at the point of use;
+#   * ``monkeypatch.setattr(config, "ALLOWED_USER_IDS", ...)`` in the tests sets a
+#     real attribute, which shadows this hook, and ``monkeypatch.undo()`` removes
+#     it again. The existing test seam is unaffected.
+#
+# The import is deferred into the function body because ``registry`` imports this
+# module at its top level.
+# ---------------------------------------------------------------------------
+_REGISTRY_BACKED = {
+    "ALLOWED_USER_IDS": lambda r: r.allowed_ids(),
+    "ADMIN_USER_ID":    lambda r: r.admin_id(),
+}
+
+
+def __getattr__(name):
+    getter = _REGISTRY_BACKED.get(name)
+    if getter is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from . import registry
+    return getter(registry)
