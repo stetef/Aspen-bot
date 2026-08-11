@@ -63,6 +63,13 @@ Enabling Socket Mode prompts for an app-level token. Create one named e.g.
 No `channels:read` and no broad history scopes: Aspen only sees conversations it's
 been mentioned/DMed in.
 
+> **Upgrading an existing install?** `im:write` is the only scope added since the
+> original setup. It lets Aspen open a DM to the admin to relay access and
+> calculations-root requests. It is genuinely optional — without it Aspen posts to the
+> admin's user ID, which Slack delivers as long as a DM with the app already exists — but
+> granting it makes the notification reliable rather than dependent on that. Add it, then
+> **Reinstall to Workspace**; tokens and `.env` are unchanged.
+
 ### 4. Event Subscriptions
 
 **Event Subscriptions → Enable Events** (no Request URL needed — Socket Mode
@@ -152,3 +159,6 @@ Find a user's ID: Slack → click their name → **View full profile → … →
 5. Install to workspace; copy both tokens into `.env`.
 6. Set `ASPEN_ALLOWED_SLACK_USER_IDS` (first = admin).
 7. `bash start.sh`; in Slack, `@Aspen hello` in a DM to smoke-test.
+8. From another account, message Aspen once — you should be refused *and* receive a DM
+   with the `./aspen-users add …` command. That is the fastest check that `im:write` (or
+   the user-ID fallback) is working.

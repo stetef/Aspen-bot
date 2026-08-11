@@ -38,6 +38,11 @@ thread.
 - **Work the way you work** — each user can keep a **workflow file** (their own notes on
   functionals, what they check, what they extract). Aspen reads yours before planning a
   calculation, and can show you a colleague's when you want to borrow their approach.
+- **Everyone's calculations, by name** — each person can have their own tree, plus shared
+  group trees. Yours is the default; a colleague's is `@arun/thermolysin`. Reading is flat,
+  as on the shared filesystem, so "who else has run this?" is a normal question.
+- **Ask, without knowing who to ask** — turned away at the door, or want your own
+  calculations directory? Aspen files the request and DMs the admin the exact command.
 - **Investigate jobs** — read-only Slurm queries (`squeue`/`sacct`/…). It does **not**
   submit or cancel jobs.
 
@@ -302,16 +307,22 @@ analysis sandbox is bwrap (it replaced Apptainer, which couldn't enforce rootles
 limits on this cgroups-v1 host).
 
 - **`aspen/registry.py` + `aspen/workflows.py`** — the user registry (Slack ID ↔ alias,
-  and the admission allowlist, hot-reloaded from `users.json`) and the per-user workflow
-  store. Both live under `ASPEN_STATE_DIR`, deliberately outside the repo *and* outside
-  any sandbox-writable path; the bot refuses to start if that's violated.
+  and the admission allowlist, hot-reloaded from `users.json`), the per-user workflow
+  store, Aspen's project notes, and the pending-request queue. All live under
+  `ASPEN_STATE_DIR`, deliberately outside the repo *and* outside any sandbox-writable
+  path; the bot refuses to start if that's violated. Notes get that treatment for a second
+  reason: they are read back into the model's context later, so a sandbox-writable copy
+  would be a slow-loop injection path.
 - **`aspen/telemetry.py`** — the turn log and its switch, under `ASPEN_STATE_DIR` by the
   same rule. Written by the bot, configured only by `aspen-users telemetry`; never
   reachable from a tool, a prompt, or a Slack message.
 
-The only places Aspen can write are each project's `metadata.md`, the speaking user's own
-workflow file (prior versions of both are snapshotted first), and the sandbox's
-`figures/`/`cache/` — all calculation inputs, outputs, and data stay read-only.
+**Aspen writes nothing inside any calculations root** — not yours, not a colleague's, not
+a shared one. Its only writes are its own per-project notes and the speaking user's own
+workflow file, both under `ASPEN_STATE_DIR` with prior versions snapshotted, plus the
+sandbox's `figures/`/`cache/`. It also cannot grant anything: admission and calculations
+roots are set only by `aspen-users`, so the most a conversation can do is file a request
+for a human to approve.
 
 See [`spec.md`](spec.md) for the full design, [`THREAT_MODEL.md`](THREAT_MODEL.md)
 for the threat model, security measures, and the service-account cutover checklist,

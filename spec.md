@@ -39,7 +39,8 @@ bwrap sandbox (bubblewrap + seccomp filter, one jail per execution)
         ├── figures/        cache/       (+ generated_code/, figure_archive/, logs/, db/ on host)
 ```
 
-Two processes, both single-instance:
+Two long-running processes, both single-instance, plus a read-only viewer an operator
+starts on demand:
 
 - **`aspen-bot.py`** (the `aspen` package) — the Slack front-end and the agent. It runs
   the **Claude Agent SDK** against the Claude Code CLI, exposes a locked-down tool
@@ -53,6 +54,18 @@ Two processes, both single-instance:
   that executes LLM-generated analysis code inside a **bubblewrap (bwrap)** jail with a
   **seccomp** syscall filter. It owns caching, metadata parsing, the per-project SQLite
   index, figure handling, and audit logging.
+
+- **`aspen-dashboard`** (`dashboard/`) — a Streamlit view of the turn log (§14): volume and
+  tokens **per person** over time, the rate-limit and quota meters, the tool histogram and
+  repeated tool sequences, the failure panel (including commands the Bash allowlist
+  refused, which reads as a feature backlog), a latency breakdown separating Aspen's own
+  overhead from model time from tool time, and the questions themselves. Three properties
+  make it safe to have at all: it is **read-only**, it gets **its own venv** (a web
+  framework has no place in the dependency tree of the running Slack service), and its bind
+  address is **pinned to `127.0.0.1` in the launcher, not configurable** — Streamlit's
+  default listens on every interface, which on a shared login node would publish
+  colleagues' questions to every account on the machine and undo the `0600` on the log.
+  Reach it over an SSH tunnel; the launcher prints the command.
 
 Each project has its own SQLite database file for metadata and run indexing.
 
@@ -205,21 +218,29 @@ auto-approves exactly the MCP tools below plus a read-only Bash allowlist, and a
 
 | Tool | Access | What it does |
 |---|---|---|
-| `list_directory` | read-only | List a directory under the calculations root |
-| `read_file` | read-only | Read a text file under the calculations root (size-capped) |
-| `search_files` | read-only | Grep file contents under the calculations root (path-confined, in-process) |
-| `attach_file` | read-only | Upload a calculations-root file alongside the Slack reply |
-| `write_metadata` | **write** | Create/overwrite **only** a project's top-level `metadata.md` |
+| `list_directory` | read-only | List a directory in someone's calculations (`owner` = whose) |
+| `read_file` | read-only | Read a text file in someone's calculations (size-capped) |
+| `search_files` | read-only | Grep file contents — one root, or `everyone=true` across all |
+| `attach_file` | read-only | Upload a calculations file alongside the Slack reply |
+| `read_metadata` | read-only | Open Aspen's own notes on a project (attributed, from the sidecar) |
+| `write_metadata` | **write** | Record those notes — in Aspen's storage, never in a calculations tree |
 | `read_workflow` | read-only | Open a user's workflow file (own, a colleague's, or `_group`) |
 | `write_workflow` | **write** | Create/overwrite **only the speaking user's own** workflow |
+| `request_calc_root` | request | Ask an admin to set the speaker's calculations root — grants nothing |
+| `decline_setup` | preference | Record that the speaker doesn't want a workflow / a root of their own |
 | `run_python_analysis` | sandboxed | Execute analysis code in the bwrap jail (via the tool server) |
 
-The agent has exactly **two** write surfaces, both enforced in Python and both narrow by
-construction.
+Every path-taking tool takes an **`owner`** — a *name* (alias, Slack ID, or shared-root
+name), never a path. Reading is flat: any root may be read by anyone ([§5.1](#51-calculations-roots-aspenrootspy)).
 
-`write_metadata`: the target must resolve to `<calculations-root>/<project>/metadata.md`
-(single path component, no traversal), the project dir must already exist, and nothing
-else can be written. All calculation inputs/outputs/data stay read-only.
+**No tool writes inside any calculations root.** That is now absolute, not a narrow
+exception: the two write surfaces both land in Aspen's own storage.
+
+`write_metadata`: the target is derived entirely from (owner, project) and lands under
+`METADATA_ROOT` ([§7](#7-project-metadata)). The project directory must exist, the project
+name must be a single component, and the join is fenced — it is a *writable* location, so a
+traversal there would be worse than one into the read-only tree. Ownership decides who may
+write: your own projects and shared group ones, never a colleague's.
 
 `write_workflow`: the target is `<workflows-root>/<alias>__<slack-id>/WORKFLOW.md` for the
 **user who sent the message**. Note what the tool schema does *not* contain: an owner
@@ -229,16 +250,21 @@ else's file. A model can be talked into passing any argument it is told to; it c
 a value it never receives. The one exception is the shared `_group` workflow, gated on
 `uid == ADMIN_USER_ID` in the same function.
 
+`request_calc_root` and `decline_setup` are the same discipline applied to *asking*
+([§5.0](#50-getting-set-up-and-asking-for-things-aspensetuppy-aspenpendingpy)): both act
+on the speaker only, neither takes an owner, and neither grants anything — the first files
+a request for a human to approve, the second can only make Aspen quieter.
+
 Both writes replace the whole file, so the previous version is snapshotted first —
-`<workspace>/metadata_history/<project>/<UTC>.md` and
+`$ASPEN_METADATA_HISTORY_ROOT/<alias>__<slack-id>/<project>/<UTC>.md` and
 `<workspace>/workflow_history/<slack-id>/<UTC>.md` respectively — making a careless
 overwrite recoverable.
 
 The read/search tools (`list_directory`, `read_file`, `search_files`, `attach_file`) are
-**path-fenced in Python** to the calculations root (`_safe_path`): they resolve symlinks
-and reject anything outside the root, so they cannot read host files such as `~/.ssh` or
-`.env`. `search_files` greps file *contents* entirely in-process (it never shells out),
-with the same fence.
+**path-fenced in Python** to the resolved root (`roots.resolve`): they resolve symlinks and
+reject anything outside *that* root, so they cannot read host files such as `~/.ssh` or
+`.env`, and cannot hop between roots. `search_files` greps file *contents* entirely
+in-process (it never shells out), with the same fence per root.
 
 ### Bash
 
@@ -447,8 +473,9 @@ to `<workspace>/workflow_history/<slack-id>/<UTC>.md`.
 
 ### Placement guard
 
-`main._check_state_locations()` refuses to start if `USERS_FILE` or `WORKFLOWS_ROOT`
-resolves inside `WORKSPACE_ROOT` or any `ASPEN_SANDBOX_WRITE_PATHS` entry. Those areas are
+`main._check_state_locations()` refuses to start if `USERS_FILE`, `WORKFLOWS_ROOT`,
+`METADATA_ROOT`, `METADATA_HISTORY_ROOT`, `REQUESTS_FILE`, or the telemetry paths resolve
+inside `WORKSPACE_ROOT` or any `ASPEN_SANDBOX_WRITE_PATHS` entry. Those areas are
 writable by sandboxed analysis code, which would let generated Python edit the allowlist
 or another user's workflow directly and walk straight around both checks above. It also
 creates the workflows root and `chmod 0700`s the state dir, so other users on a shared
@@ -739,8 +766,10 @@ Paths and identity-specific values are driven entirely from `.env` (no hardcoded
 | Authorization | Slack user-ID allowlist — first gate, before rate limiting. In group DMs, a **participant gate** additionally requires *every* human member to be allowlisted (fail-closed) |
 | Slack connection | Socket Mode — outbound WebSocket only, no open ports |
 | Tool surface | Locked-down allowlist + `can_use_tool` deny; host settings ignored; Bash = Slurm read-only |
-| Read/search tools | Path-fenced in Python to the calculations root; can't read `~/.ssh`, `.env`, etc. |
-| Write surface | Only `write_metadata` (one file per project, prior version snapshotted) + the jail's `figures/`,`cache/` |
+| Read/search tools | Path-fenced in Python to the *resolved* root; can't read `~/.ssh`, `.env`, or hop between roots |
+| Calculations roots | One per user + shared; reads are flat by design, and the tool surface takes a **name**, never a path. Roots may not nest (startup refuses) |
+| Write surface | **Nothing inside any calculations root.** Metadata and workflows land in `$ASPEN_STATE_DIR`; the jail gets `figures/`,`cache/`. Prior versions snapshotted |
+| Granting | Admission and calculations roots are CLI-only. The agent can *request* (DM to the admin) and *decline*, never grant |
 | Tool server | Binds a **Unix socket in a `0700` dir** (not a TCP port); shared secret on every request |
 | Analysis jail | bwrap: no network; read-only minimal FS; project read-only; scrubbed env; **seccomp syscall denylist**; `prlimit` caps; 120 s timeout. The jail + bind mounts + seccomp are the boundary |
 | Stdout/stderr | Redacted then truncated (10k/2k) before leaving the tool server |
@@ -753,10 +782,11 @@ A consolidated threat model (assets, actors, accepted interim risks, and the
 service-account cutover checklist) is in [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
 **Hard constraints — Aspen can never:** act for a non-allowlisted user; engage in a group
-DM that contains any non-allowlisted human (participant gate, fail-closed); write any
-project file other than `metadata.md`; submit/cancel/inspect Slurm jobs (read-only investigation
-only); reach files outside the calculations root / workspace; make network calls from
-inside the analysis jail.
+DM that contains any non-allowlisted human (participant gate, fail-closed); write *any*
+file inside *any* calculations root; grant itself or anyone else access or a calculations
+root; write another user's workflow or metadata; submit/cancel Slurm jobs (read-only
+investigation only); reach files outside the configured roots / workspace / state dir;
+make network calls from inside the analysis jail.
 
 ---
 
@@ -766,7 +796,15 @@ A hermetic pytest suite runs without a live Slack connection, Claude CLI, or net
 (`pytest -q` from the repo root). Highlights:
 
 - **`tests/test_tools.py`** — read-only browsing tools, `write_metadata` (path safety,
-  metadata.md-only, existing-project-only), and the tool-server bridge (mocked HTTP).
+  existing-project-only, and that it adds nothing to the calculations tree), and the
+  tool-server bridge (mocked HTTP).
+- **`tests/test_roots.py`, `test_multiuser_tools.py`, `test_tool_server_roots.py`** —
+  per-user roots: name-not-path resolution, the `@alias/` grammar, the per-root fence,
+  nesting refusal, cross-root search with an honest truncation notice, and the tool
+  server's independent registry lookup (a path sent as `owner` resolves to nothing).
+- **`tests/test_setup.py`, `test_pending.py`** — the three-state setup model, one-nudge-per-
+  thread rationing, that a declined root turns unqualified paths into an error rather than
+  someone else's tree, and that requests are recorded and DM'd but never granted.
 - **`tests/test_tool_server_bwrap.py`** — the bwrap command builder: prlimit caps, network
   unshared, project read-only, only `figures/`/`cache/` writable, interpreter binds,
   scrubbed env, hook-writable `MPLCONFIGDIR`, `/etc/fonts` bound.
