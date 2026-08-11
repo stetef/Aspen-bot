@@ -310,8 +310,18 @@ def test_preamble_points_at_the_speakers_own_workflow(sut, wf):
     assert 'read_workflow(owner="arun")' in wf.turn_preamble("U01ARUN")
 
 
-def test_preamble_offers_to_create_a_missing_workflow(sut, wf):
-    assert "do NOT have a workflow file yet" in wf.turn_preamble("U01ARUN")
+def test_preamble_is_silent_about_a_missing_workflow(sut, wf):
+    """Offering to make one is a *nudge*, and nudges are rationed by setup.py —
+    the preamble used to carry that line in every turn, forever."""
+    out = wf.turn_preamble("U01ARUN")
+    assert "workflow file" not in out
+    assert "write_workflow" not in out
+
+
+def test_preamble_carries_whatever_nudge_it_is_handed(sut, wf):
+    out = wf.turn_preamble("U01ARUN", extra_lines=["Offer them a workflow, once."])
+    assert "Offer them a workflow, once." in out
+    assert out.rstrip().endswith("</aspen_context>")
 
 
 def test_preamble_indexes_other_workflows_by_description(sut, wf):

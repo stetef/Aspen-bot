@@ -173,6 +173,14 @@ def _normalize(raw: dict) -> dict:
                 # Their Unix account on the cluster. A Slack ID does not name
                 # one, and job submission on someone's behalf needs it.
                 "unix_user": str(entry.get("unix_user") or ""),
+                # Setup offers this person has turned down: {item: YYYY-MM-DD}.
+                # Written by the agent (setup.decline) because it can only ever
+                # make Aspen quieter — it grants nothing. See setup.py.
+                "declined": {
+                    str(k): str(v)
+                    for k, v in (entry.get("declined") or {}).items()
+                    if isinstance(entry.get("declined"), dict) and v
+                },
             }
         )
     return {"version": int(raw.get("version", 1) or 1), "source": "file", "users": users}
@@ -338,4 +346,5 @@ def new_user(uid: str, alias: str, display: str, role: str = "member",
         "notes": notes,
         "calc_root": calc_root,
         "unix_user": unix_user,
+        "declined": {},
     }

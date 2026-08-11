@@ -116,6 +116,18 @@ def scope_for_viewer(uid: str) -> dict:
             "owner_id": user["slack_user_id"], "label": user["display_name"]}
 
 
+def is_rootless(uid: str) -> bool:
+    """True for someone who has said they have no calculations of their own.
+
+    Read straight from the registry rather than through ``setup`` — that module
+    imports this one, and the check has to be available inside ``resolve``.
+    """
+    user = registry.by_id(uid)
+    if user is None or user.get("calc_root"):
+        return False
+    return bool((user.get("declined") or {}).get("calc_root"))
+
+
 def known_names() -> str:
     """Comma-separated roots, for error messages that have to teach."""
     return ", ".join(f"{PREFIX}{s['name']}" for s in scopes()) or "(none)"
@@ -179,6 +191,17 @@ def resolve(rel: str, owner: str, viewer_uid: str) -> tuple[Optional[Path], dict
             )
     else:
         scope = scope_for_viewer(viewer_uid)
+        # Someone who has said they have no calculations of their own — a reader
+        # rather than a runner — must not silently get the shared default, which
+        # is somebody else's work served to them as "your files". Make them say
+        # whose they mean instead of guessing wrong.
+        if is_rootless(viewer_uid):
+            return None, scope, (
+                f"Error: '{rel}' is unqualified, but this user has no calculations "
+                f"of their own — there is no default for them. Say whose files you "
+                f"mean: {PREFIX}<name>/{bare.lstrip('./') or '...'} or owner=<name>. "
+                f"Known roots: {known_names()}."
+            )
 
     root = scope["path"]
     try:

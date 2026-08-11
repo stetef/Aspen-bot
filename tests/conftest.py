@@ -74,6 +74,10 @@ _MODMAP = {
     "workflows": "aspen",
     "roots": "aspen",
     "metadata": "aspen",
+    "pending": "aspen",
+    "setup": "aspen",
+    "REQUESTS_FILE": "aspen.config",
+    "REQUEST_NOTIFY_COOLDOWN_HOURS": "aspen.config",
     "_read_metadata": "aspen.tools",
     "tools": "aspen",
     "_scoped": "aspen.tools",
@@ -95,6 +99,7 @@ _MODMAP = {
     "_bot_user_id": "aspen.slack_app",
     "_bot_uid_cache": "aspen.slack_app",
     "_admin_mention": "aspen.slack_app",
+    "_request_access": "aspen.slack_app",
 }
 
 

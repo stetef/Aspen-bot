@@ -18,8 +18,8 @@ from concurrent.futures import TimeoutError as _FutureTimeout
 
 from slack_bolt import App
 
-from . import (attachments, config, ratelimit, registry, render, sessions, state,
-               telemetry, workflows)
+from . import (attachments, config, pending, ratelimit, registry, render, sessions,
+               setup, state, telemetry, workflows)
 
 log = logging.getLogger("aspen")
 
@@ -80,6 +80,29 @@ def _find_member_id_steps() -> str:
         "*View full profile*, then the *⋮ More* button → *Copy member ID* "
         "(it looks like `U01AB2CD3EF`)."
     )
+
+
+def _request_access(uid: str, client) -> bool:
+    """Queue an access request for the admin and DM them. Never raises.
+
+    Returns whether the admin was actually reached, so the refusal can promise
+    only what happened: told, or told-them-yourself. Failing quietly and claiming
+    someone was notified would leave a person waiting on a message nobody got.
+    """
+    try:
+        display = ""
+        try:
+            info = client.users_info(user=uid)["user"]
+            profile = info.get("profile", {})
+            display = (profile.get("display_name") or profile.get("real_name")
+                       or info.get("real_name") or info.get("name") or "")
+        except Exception:
+            log.debug("users_info failed for %s; queueing without a name", uid, exc_info=True)
+        entry = pending.record("access", uid, display_name=display)
+        return pending.notify_admin(client, entry) or bool(entry.get("notified"))
+    except Exception:
+        log.warning("Could not queue an access request for %s", uid, exc_info=True)
+        return False
 
 
 def _is_group_dm(event: dict, client, channel: str) -> bool:
@@ -310,11 +333,19 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
     # 1. Allowlist check — first gate (the mentioner must be allowlisted)
     if uid not in config.ALLOWED_USER_IDS:
         _record("not_authorized")
+        # Being turned away IS the request. Nothing here grants anything — the
+        # admin still has to run a command — but they now get told, with the
+        # command in hand, instead of the user having to work out who to ask.
+        told = _request_access(uid, client)
         say(
             text=(
-                f"Sorry, you're not authorized to use Aspen. To request access, send your "
-                f"Slack member ID to {_admin_mention()} and ask to be added to the "
-                f"approved-users list.\n\n{_find_member_id_steps()}"
+                "Sorry, you're not authorized to use Aspen. "
+                + (f"I've let {_admin_mention()} know you'd like access — they'll "
+                   "need to approve it.\n\n"
+                   if told else
+                   f"To request access, send your Slack member ID to {_admin_mention()} "
+                   f"and ask to be added to the approved-users list.\n\n"
+                   f"{_find_member_id_steps()}")
             ),
             thread_ts=thread_ts,
         )
@@ -409,7 +440,15 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
         # ``on_interim`` carries the agent's own words out while it works.
         context = {"user_id": uid, "username": registry.display_name(uid),
                    "thread_ts": thread_ts or "",
-                   "attachments": [], "on_progress": _on_progress}
+                   "attachments": [], "on_progress": _on_progress,
+                   # So a tool can DM the admin about a request. Nothing the agent
+                   # can reach grants anything — the client is here to *ask*.
+                   "slack_client": client,
+                   # True only on the thread's first turn, which is the one place
+                   # a setup nudge is allowed to appear (setup.py). Read before
+                   # MANAGER.handle creates the session, so it is still absent.
+                   "first_turn": not sessions.MANAGER.has_session(
+                       sessions._thread_key(event))}
         if config.INTERIM_UPDATES:
             context["on_interim"] = _on_interim
 
@@ -419,7 +458,9 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
         # this can't live in the system prompt. Cheap (frontmatter only) and
         # bounded by the size of the registry.
         try:
-            turn_message = workflows.turn_preamble(uid) + user_message
+            turn_message = workflows.turn_preamble(
+                uid, extra_lines=setup.nudge_lines(uid, context["first_turn"])
+            ) + user_message
         except Exception:      # context is an enhancement; never fail a turn for it
             log.exception("Could not build the workflow preamble for %s", uid)
             turn_message = user_message

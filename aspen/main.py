@@ -36,6 +36,7 @@ def _check_state_locations() -> None:
                           ("workflows root", config.WORKFLOWS_ROOT),
                           ("metadata root", config.METADATA_ROOT),
                           ("metadata history", config.METADATA_HISTORY_ROOT),
+                          ("request queue", config.REQUESTS_FILE),
                           ("telemetry log", config.TELEMETRY_DIR),
                           ("telemetry switch", config.TELEMETRY_STATE_FILE)):
         for area in danger:

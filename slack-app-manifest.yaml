@@ -24,6 +24,9 @@ oauth_config:
       - mpim:history        # read group-DM threads it's in
       - mpim:read           # list group-DM members (participant gate + mpim detection)
       - users:read          # resolve member names / spot bots (participant gate)
+      - im:write            # open a DM to the admin for access/root requests
+                            # (optional: without it Aspen posts to the admin's
+                            #  user ID, which works once a DM already exists)
 settings:
   event_subscriptions:
     bot_events:

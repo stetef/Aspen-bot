@@ -218,7 +218,7 @@ def has_workflow(uid: str) -> bool:
     return bool(path and path.is_file())
 
 
-def turn_preamble(uid: str) -> str:
+def turn_preamble(uid: str, extra_lines: Optional[list] = None) -> str:
     """The per-turn context block prepended to the user's message.
 
     This has to be per-turn rather than part of the system prompt: sessions are
@@ -246,11 +246,9 @@ def turn_preamble(uid: str) -> str:
             f"They have a workflow file — read it with read_workflow(owner=\"{user['alias']}\") "
             "before planning or interpreting any calculation it might cover."
         )
-    else:
-        lines.append(
-            "They do NOT have a workflow file yet. If they describe how they like to work, "
-            "offer to save it with write_workflow."
-        )
+    # Nothing is said when they have none. Offering to make one is a *nudge*, and
+    # nudges are rationed by setup.py and passed in as extra_lines — a line in
+    # every turn forever is how a helpful offer becomes nagging.
 
     others = [e for e in entries if e["owner_id"] != uid]
     if others:
@@ -265,6 +263,7 @@ def turn_preamble(uid: str) -> str:
     )
     if roster:
         lines.append(f"Registered users: {roster}")
+    lines.extend(extra_lines or [])
     lines.append("</aspen_context>")
     return "\n".join(lines) + "\n\n"
 

@@ -58,6 +58,7 @@ Enabling Socket Mode prompts for an app-level token. Create one named e.g.
 | `mpim:history` | Read **group-DM** threads it's in, for context |
 | `mpim:read` | List a group DM's members — for the participant gate and to classify `app_mention`s as group DMs |
 | `users:read` | Resolve member IDs → display names and spot app/bot members, for the participant gate's check and its reply |
+| `im:write` | Open a DM to the admin to relay access / calculations-root requests (optional — without it Aspen posts to the admin's user ID, which works once a DM exists) |
 
 No `channels:read` and no broad history scopes: Aspen only sees conversations it's
 been mentioned/DMed in.

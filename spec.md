@@ -123,6 +123,7 @@ no inbound ports, no public URL, no firewall exceptions on the cluster.
 | `mpim:history` | Read group-DM (multi-person DM) threads Aspen is in, for context |
 | `mpim:read` | List a group DM's members — used by the participant gate (below) and to classify `app_mention`s as group DMs |
 | `users:read` | Resolve member IDs → display names and identify app/bot members, for the participant gate's membership check and its reply |
+| `im:write` | Open a DM to the admin to relay access / calculations-root requests (optional — without it Aspen posts to the admin's user ID, which works once a DM exists) |
 
 Aspen has no `channels:read` or unrestricted history access — it only sees conversations it
 was mentioned in (or DMed in). Adding/removing scopes requires reinstalling the app.
@@ -295,6 +296,40 @@ names absent from the module dict, so both existing call sites are unchanged and
 fall back to the `ASPEN_ALLOWED_SLACK_USER_IDS` bootstrap — operator-controlled, so it
 cannot grant more than was already configured, and it keeps a typo from locking the admin
 out. Individual malformed entries are dropped rather than failing the whole file.
+
+### 5.0 Getting set up, and asking for things (`aspen/setup.py`, `aspen/pending.py`)
+
+Each person can have two optional things: a **workflow** (§6) and a **calculations root**
+(§5.1). The mix is the point — a PI reading across the group may want neither, a student
+both, most people one before the other — so each is a three-state question: *has it*
+(derived from reality), *declined* (stored), *neither* (the only case worth raising).
+
+Only the decline is stored; recording "done" would duplicate state that can desync.
+
+- **The agent may record a decline** (`decline_setup`), because that field can only make
+  Aspen *quieter*. The worst a confused or injected agent achieves is fewer offers — a
+  reduction in behavior, not an escalation. Everything that *grants* stays CLI-only.
+- **The agent may not set a root.** The read surface rests on *the model passes a name,
+  never a path*; a tool that wrote a path into the registry would reinstate exactly the
+  surface that removes, and validation cannot save it — pointing someone at a colleague's
+  tree passes every check while silently relabelling whose work is whose. Instead
+  `request_calc_root` records the ask.
+- **Declining a root changes resolution, not just volume.** Someone with no tree of their
+  own would otherwise fall back to `CALCULATIONS_ROOT` — somebody else's work served to
+  them as "your files". Once declined, an unqualified path is an error naming the
+  alternatives, which is the correct model of a reader who owns nothing.
+- **Nudges are rationed**: at most one item, on a thread's first turn only. The preamble
+  previously carried the workflow offer in *every* turn, forever.
+
+`pending.py` is the queue behind both asks. Being turned away at the allowlist gate **is**
+an access request: it is recorded, and the admin is DM'd the exact command
+(`./aspen-users add U0… --alias …`). Nothing is granted — the human still runs it — but
+nobody has to work out who to ask or what to type. Notifications are de-duplicated and
+rate-limited (`ASPEN_REQUEST_NOTIFY_COOLDOWN_HOURS`, default 12) so repeat messages are
+one request rather than a pager, a failed DM is logged rather than raised (it must never
+break the refusal the user is waiting on), and the refusal text promises only what
+actually happened. `aspen-users requests` is the same queue on the terminal, and it drops
+asks that reality has already answered.
 
 ### 5.1 Calculations roots (`aspen/roots.py`)
 

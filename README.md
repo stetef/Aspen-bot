@@ -33,7 +33,8 @@ thread.
 - **Analyze & plot** — runs LLM-generated Python (numpy/pandas/matplotlib/scipy/py3Dmol)
   in a locked-down sandbox and uploads figures to the thread.
 - **Hand over files** — attaches data/structure/log files directly to its reply.
-- **Record project notes** — updates each project's top-level `metadata.md`.
+- **Record project notes** — keeps its own notes per project, stored outside the
+  calculations tree (it never writes into anyone's files).
 - **Work the way you work** — each user can keep a **workflow file** (their own notes on
   functionals, what they check, what they extract). Aspen reads yours before planning a
   calculation, and can show you a colleague's when you want to borrow their approach.
@@ -61,8 +62,9 @@ with a short refusal and these same steps. To get added:
 1. **Copy your Slack member ID.** In Slack, click your name or profile picture →
    **View full profile** → the **⋮ More** button → **Copy member ID**. It looks like
    `U01AB2CD3EF` (not your `@handle`, which can change).
-2. **Send that ID to the admin** and ask to be added to the approved-users list. Aspen
-   @-mentions the admin in every refusal so you know who to ask.
+2. **Message Aspen anyway.** Being turned away files the request for you: Aspen DMs
+   the admin your name and ID with the command to approve it. It also @-mentions the
+   admin in the refusal, so you know who to nudge if nothing happens.
 
 For **group DMs**, *every* human member must be allowlisted — so anyone in the room
 who isn't yet approved needs to do the same. Until then, approved users can DM Aspen
@@ -105,6 +107,8 @@ adds or removes a user, so no message — however phrased — can widen the allo
 | `workflow` | `import`, `describe`, `list`, `show` | File and maintain workflow documents on someone's behalf — see [Per-user workflows](#per-user-workflows). |
 | `set-root` | `<alias\|id>` `<path>` `--clear` `--unix-user` | Point someone at their own calculations tree — see [Whose calculations](#whose-calculations). Validated when you set it. |
 | `roots` | — | Every calculations root and whether it is actually readable. |
+| `requests` | `--clear` | Who has asked for access or a root, with the command that grants it. |
+| `setup` | `<alias\|id>` `--reset <item>` | Who has a workflow / their own root, and who declined. |
 | `telemetry` | `status`, `on`, `off`, `content on\|off`, `exclude`, `include`, `prune` | What Aspen records about how it's used — see [What Aspen records](#what-aspen-records-aspen-users-telemetry). |
 
 Global: `--by <name>` records who made the change in `added_by`/`removed_by` (defaults to
@@ -145,6 +149,27 @@ are readable but theirs.
 Aspen runs as**, and never contain (or sit inside) another root — containment is how the
 security fence works, so a nested root would silently enclose someone else's files. Aspen
 re-checks at startup and refuses to boot if a root has since gone missing or unreadable.
+
+### Requests, and being asked once
+
+Aspen cannot add a user or set a root — those stay CLI-only so that no message can widen
+access. It can, however, do the paperwork: someone turned away at the door has an access
+request filed automatically, and Aspen DMs you the exact command. Same for a root, when
+someone tells it where their calculations live.
+
+```bash
+./aspen-users requests            # who's waiting, and the command for each
+./aspen-users setup               # who has a workflow / a root, and who declined
+./aspen-users setup pi --reset calc_root   # ask them again after all
+```
+
+Nothing in that queue grants anything — running the printed command does.
+
+On the other side, Aspen offers to set these up **once per thread, one item at a time**,
+and only when the conversation gives it an opening. If someone says no, it records that
+and never asks again. Declining a calculations root also says something true about that
+person: they read colleagues' work rather than running their own, so Aspen stops guessing
+whose files an unqualified path means and asks instead.
 
 ## Per-user workflows
 

@@ -43,7 +43,7 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
-from . import config, registry, roots, telemetry, workflows
+from . import config, pending, registry, roots, setup, telemetry, workflows
 
 
 def _err(msg: str) -> int:
@@ -506,6 +506,62 @@ def cmd_roots(args) -> int:
     return 0
 
 
+def cmd_requests(args) -> int:
+    """What people have asked for, and the command that grants it."""
+    satisfied = pending.resolve_satisfied()
+    for entry in satisfied:
+        print(f"(already done, dropping: {pending.describe(entry)})")
+
+    queued = pending.load()
+    if args.clear:
+        for entry in queued:
+            pending.resolve(entry["kind"], entry["slack_user_id"])
+        print(f"Cleared {len(queued)} request(s). Nobody was granted anything by this.")
+        return 0
+    if not queued:
+        print("Nothing waiting.")
+        return 0
+
+    for entry in queued:
+        print(f"\n{pending.describe(entry)}")
+        print(f"  first asked  {entry['first_seen']}")
+        print(f"  run          {pending.command_for(entry)}")
+    print(f"\n{len(queued)} request(s). Running the command is what grants it — "
+          "this list only remembers who asked.")
+    return 0
+
+
+def cmd_setup(args) -> int:
+    """What each person has set up, and what they've said no to."""
+    if args.who:
+        user = registry.resolve(args.who)
+        if user is None:
+            return _err(f"no user matches '{args.who}'")
+        users = [user]
+    else:
+        users = registry.users()
+
+    if args.reset:
+        if not args.who:
+            return _err("--reset needs a user")
+        if not setup.undecline(users[0]["slack_user_id"], args.reset):
+            return _err(f"{users[0]['alias']} hasn't declined {args.reset}")
+        print(f"{users[0]['alias']} will be offered {args.reset} again.")
+        return 0
+
+    rows = [(u["alias"],) + tuple(setup.state(u["slack_user_id"], item) for item in setup.ITEMS)
+            for u in users]
+    header = ("WHO",) + setup.ITEMS
+    widths = [max(len(r[i]) for r in [header] + rows) for i in range(len(header))]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*header))
+    for row in rows:
+        print(fmt.format(*row))
+    print("\n'declined' means they said no and Aspen won't ask again — "
+          "`aspen-users setup <who> --reset <item>` undoes that.")
+    return 0
+
+
 def cmd_whois(args) -> int:
     user = registry.resolve(args.who)
     if user is None:
@@ -516,8 +572,13 @@ def cmd_whois(args) -> int:
         if user.get(field):
             print(f"{field:<15} {user[field]}")
     root = roots.for_user(uid)
-    suffix = "" if user.get("calc_root") else "  (shared default)"
-    print(f"{'calculations':<15} {root}{suffix}")
+    if roots.is_rootless(uid):
+        print(f"{'calculations':<15} (none — declined; unqualified paths are an error)")
+    else:
+        suffix = "" if user.get("calc_root") else "  (shared default)"
+        print(f"{'calculations':<15} {root}{suffix}")
+    declined = ", ".join(sorted((user.get("declined") or {}))) or "-"
+    print(f"{'declined':<15} {declined}")
     directory = workflows.dir_for(uid, include_archived=True)
     print(f"{'workflow':<15} {directory or '(none)'}")
     if uid == config.ADMIN_USER_ID:
@@ -841,6 +902,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("roots", help="list every calculations root and its state")
     s.set_defaults(func=cmd_roots)
+
+    s = sub.add_parser(
+        "setup",
+        help="who has a workflow / their own root, and who declined",
+        description="Aspen offers each once, on a thread's first turn, and stops "
+                    "for good when someone says no. This is that state.",
+    )
+    s.add_argument("who", nargs="?", default="", help="one user (default: everyone)")
+    s.add_argument("--reset", choices=setup.ITEMS, default="",
+                   help="clear a decline so they get asked again")
+    s.set_defaults(func=cmd_setup)
+
+    s = sub.add_parser(
+        "requests",
+        help="who has asked for access or a root, and the command to grant it",
+        description="Aspen cannot grant either — it records the ask and DMs you. "
+                    "This is that queue; running the printed command is what "
+                    "actually grants anything.",
+    )
+    s.add_argument("--clear", action="store_true", help="forget every pending request")
+    s.set_defaults(func=cmd_requests)
 
     # --- workflows ---------------------------------------------------------- #
     # Filing on someone's behalf, for when they hand you a document instead of

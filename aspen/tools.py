@@ -21,7 +21,7 @@ from typing import Optional
 
 import httpx
 
-from . import config, metadata, roots, workflows
+from . import config, metadata, roots, setup, workflows
 
 log = logging.getLogger("aspen")
 
@@ -313,6 +313,25 @@ def _write_workflow(inp: dict, context: dict) -> tuple[str, list[str]]:
     """
     return workflows.write(
         context.get("user_id", ""), inp.get("content", ""), inp.get("target", "")
+    ), []
+
+
+# --------------------------------------------------------------------------- #
+# Getting set up (and being told to stop asking)
+# --------------------------------------------------------------------------- #
+def _decline_setup(inp: dict, context: dict) -> tuple[str, list[str]]:
+    return setup.decline(context.get("user_id", ""), inp.get("item", "")), []
+
+
+def _request_calc_root(inp: dict, context: dict) -> tuple[str, list[str]]:
+    """Ask the admin for a calculations root. Records and notifies; grants nothing.
+
+    The target is ``context["user_id"]`` — the ID Slack put on the message — so a
+    request is always *for the speaker*, whatever the conversation says.
+    """
+    return setup.request_root(
+        context.get("user_id", ""), inp.get("path", ""),
+        client=context.get("slack_client"),
     ), []
 
 
@@ -669,6 +688,56 @@ TOOL_SPECS = [
             "required": ["content"],
         },
         "impl": _write_workflow,
+    },
+    {
+        "name": "request_calc_root",
+        "description": (
+            "Ask an admin to point Aspen at the speaker's own calculations "
+            "directory. Use it when someone who has no directory of their own "
+            "tells you where their calculations live. You CANNOT set it yourself "
+            "— this records the request and messages the admin with the command "
+            "to run, so say that it needs their approval rather than implying it "
+            "is done. It always applies to the person you are talking to."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Absolute path to their calculations directory, if they "
+                        "told you. Leave empty to just register interest."
+                    ),
+                }
+            },
+            "required": [],
+        },
+        "impl": _request_calc_root,
+    },
+    {
+        "name": "decline_setup",
+        "description": (
+            "Record that the person you're talking to does NOT want something set "
+            "up, so Aspen stops offering it. Call this as soon as they say no, or "
+            "that it doesn't apply to them — otherwise they'll be asked again in "
+            "the next conversation. Use item='workflow' when they don't want to "
+            "record how they work, and item='calc_root' when they have no "
+            "calculations of their own (someone who reads colleagues' work rather "
+            "than running their own). It only ever makes Aspen quieter; it grants "
+            "and removes nothing, and they can change their mind later."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "item": {
+                    "type": "string",
+                    "enum": ["workflow", "calc_root"],
+                    "description": "What they don't want set up.",
+                }
+            },
+            "required": ["item"],
+        },
+        "impl": _decline_setup,
     },
     {
         "name": "run_python_analysis",

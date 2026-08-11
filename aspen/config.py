@@ -81,6 +81,13 @@ METADATA_ROOT         = Path(os.getenv("ASPEN_METADATA_ROOT", str(STATE_DIR / "m
 METADATA_HISTORY_ROOT = Path(
     os.getenv("ASPEN_METADATA_HISTORY_ROOT", str(STATE_DIR / "metadata_history"))
 ).resolve()
+# Pending asks for the admin: who wants access, who wants a calculations root.
+# Aspen can't grant either — it records the ask and DMs the admin the exact
+# command. Beside the registry for the same reason: sandboxed code must not be
+# able to fabricate a request the operator might act on. See pending.py.
+REQUESTS_FILE         = Path(os.getenv("ASPEN_REQUESTS_FILE", str(STATE_DIR / "requests.json"))).resolve()
+# Don't re-DM the admin about the same pending ask more often than this.
+REQUEST_NOTIFY_COOLDOWN_HOURS = float(os.getenv("ASPEN_REQUEST_NOTIFY_COOLDOWN_HOURS", "12"))
 # Bootstrap allowlist, used only until USERS_FILE exists (fresh install) or if it
 # can't be parsed and nothing good was ever cached. The registry is the real
 # source of truth; this is the operator-controlled floor that prevents lockout.
