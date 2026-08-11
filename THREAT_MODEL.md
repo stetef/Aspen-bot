@@ -54,6 +54,16 @@ tell a deliberate decision from an accident.
 - **Untrusted project text → model context** — prompt-injection boundary. Project
   metadata/files are untrusted input; the security boundary is always the jail and
   the Python-enforced tool limits, **never** the prompt.
+- **Non-user → the agent (DEMO)** — the one path that deliberately runs *before*
+  the allowlist gate, so the boundary cannot be identity; it is **scope**. A demo
+  session resolves to the demo root and nothing else, in `roots.resolve` and
+  again in `tools._distinct_scopes` (the cross-root sweep reads the roster
+  directly and escaped the first fence during development — caught by the
+  isolation tests, which is the argument for having written them first). It
+  writes nothing, not even a temporary registry entry, so admission stays "no
+  message can widen the allowlist". Reviewing that boundary means reviewing
+  `tests/test_demo.py`: every negative case is asserted against the real tool
+  surface rather than against `demo.py` alone.
 - **One user's authored text → another user's session** — per-user workflow files
   are user-written text *intended to be followed*, and are readable across users
   for knowledge transfer. Someone else's file is delivered `trust="reference-only"`
@@ -74,6 +84,11 @@ tell a deliberate decision from an accident.
   could plant a file in the workflows tree) writing directives aimed at other
   users' sessions. Bounded by C9–C11 and the same fenced tools; the `0700` state
   dir keeps non-members from planting files out-of-band.
+- **Unauthenticated workspace member (DEMO)** *(new surface)* — anyone in the
+  Slack workspace can reach the agent by DMing `DEMO`, ahead of the allowlist
+  gate. Bounded by demo scope isolation (§5), and note what it is *not* bounded
+  by: they are not on the allowlist, so nothing about their identity restricts
+  them — only the code path does.
 - **External attacker** — minimal direct surface (no inbound ports); realistic
   path is secret theft or supply chain.
 - **Admins / root / backups** — trusted, out of scope (but note they *can* read
@@ -225,6 +240,13 @@ Slurm-submission roadmap), additionally:
   in-process tools), and the only allowlisted Bash commands (Slurm) are *excluded*
   from it by necessity (they need cluster network/munge), so it would currently
   confine nothing. Enable it (fail-closed) when Bash gains a write/exec surface — §7.
+- **DEMO spends model budget for people who are not users.** Anyone in the
+  workspace can trigger a walkthrough, and it runs the real agent. Accepted
+  because it is capped three ways (per session, per day across everyone, and by
+  the ordinary rate limiter), reads only fabricated data, and writes nothing —
+  and because the alternative, a scripted slideshow, does not demonstrate the
+  thing being demonstrated. `ASPEN_DEMO_ENABLED=false` turns it off outright.
+  Watch the demo rows in `aspen-dashboard` if the workspace is large.
 - **UDS socket mode is `0666`** (uvicorn fixes it and offers no override hook); the
   enclosing **`0700` directory** is the actual access control and is sufficient.
 - **Kernel→root via an unpatched kernel bug** — not fully eliminable on the pinned

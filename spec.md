@@ -156,6 +156,10 @@ was mentioned in (or DMed in). Adding/removing scopes requires reinstalling the 
     a group-DM message that is *not* a reply in an Aspen thread is ignored.
   - **Channels**: `message.channels` is not subscribed, so Aspen stays silent unless
     explicitly `@`-tagged.
+- **`DEMO`** in a DM starts a walkthrough for someone who is not a user yet, ahead of
+  the allowlist gate ([§5.2](#52-demo-mode-aspendemopy)). The trigger is the whole
+  message and nothing else, so "can you show me a demo of the thermolysin runs?" is a
+  question, not a trigger.
 - While working, it shows a **live progress indicator** naming the tool the agent is
   running right now — "Aspen is reading orca.out…", "Aspen is running squeue…" — via
   `assistant.threads.setStatus`. It opens as "Aspen is typing…", then each tool call the
@@ -228,6 +232,8 @@ auto-approves exactly the MCP tools below plus a read-only Bash allowlist, and a
 | `write_workflow` | **write** | Create/overwrite **only the speaking user's own** workflow |
 | `request_calc_root` | request | Ask an admin to set the speaker's calculations root — grants nothing |
 | `decline_setup` | preference | Record that the speaker doesn't want a workflow / a root of their own |
+| `demo_request_card` | demo-only | Render the admin request into the thread (never sends) — [§5.2](#52-demo-mode-aspendemopy) |
+| `demo_approve` | demo-only | Advance the demo walkthrough; grants nothing to anyone |
 | `run_python_analysis` | sandboxed | Execute analysis code in the bwrap jail (via the tool server) |
 
 Every path-taking tool takes an **`owner`** — a *name* (alias, Slack ID, or shared-root
@@ -799,6 +805,7 @@ Paths and identity-specific values are driven entirely from `.env` (no hardcoded
 | Calculations roots | One per user + shared; reads are flat by design, and the tool surface takes a **name**, never a path. Roots may not nest (startup refuses) |
 | Write surface | **Nothing inside any calculations root.** Metadata and workflows land in `$ASPEN_STATE_DIR`; the jail gets `figures/`,`cache/`. Prior versions snapshotted |
 | Granting | Admission and calculations roots are CLI-only. The agent can *request* (DM to the admin) and *decline*, never grant |
+| DEMO | Runs ahead of the allowlist gate for non-users, so the boundary is **scope**: the demo root only, enforced in two places; writes nothing; renders the admin request instead of sending it; capped per session and per day |
 | Tool server | Binds a **Unix socket in a `0700` dir** (not a TCP port); shared secret on every request |
 | Analysis jail | bwrap: no network; read-only minimal FS; project read-only; scrubbed env; **seccomp syscall denylist**; `prlimit` caps; 120 s timeout. The jail + bind mounts + seccomp are the boundary |
 | Stdout/stderr | Redacted then truncated (10k/2k) before leaving the tool server |
@@ -831,6 +838,14 @@ A hermetic pytest suite runs without a live Slack connection, Claude CLI, or net
   per-user roots: name-not-path resolution, the `@alias/` grammar, the per-root fence,
   nesting refusal, cross-root search with an honest truncation notice, and the tool
   server's independent registry lookup (a path sent as `owner` resolves to nothing).
+- **`tests/test_demo.py`** — the demo boundary, asserted against the real tool
+  surface: a visitor cannot reach a real root by name, by `@alias/` path, by
+  traversal or by a cross-root sweep; nothing is written (no registry entry, no
+  workflow file, no sidecar, no queued request); nothing is sent to the admin.
+  Plus the walkthrough over the fabricated ORCA output, including that the scan
+  really does have its minimum where the demo says it does.
+- **`tests/test_startup.py`** — the boot guards: state refused inside any
+  sandbox-writable area, and roots refused when nested, missing or unreadable.
 - **`tests/test_setup.py`, `test_pending.py`** — the three-state setup model, one-nudge-per-
   thread rationing, that a declined root turns unqualified paths into an error rather than
   someone else's tree, and that requests are recorded and DM'd but never granted.

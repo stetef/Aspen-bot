@@ -43,6 +43,8 @@ thread.
   as on the shared filesystem, so "who else has run this?" is a normal question.
 - **Ask, without knowing who to ask** — turned away at the door, or want your own
   calculations directory? Aspen files the request and DMs the admin the exact command.
+- **Show itself off** — anyone can DM `DEMO` for a guided walkthrough over fabricated
+  data, without being added as a user ([below](#try-it-without-being-a-user-demo)).
 - **Investigate jobs** — read-only Slurm queries (`squeue`/`sacct`/…). It does **not**
   submit or cancel jobs.
 
