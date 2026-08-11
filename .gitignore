@@ -57,6 +57,9 @@ cover/
 
 # Django stuff:
 *.log
+# ...except the demo's fabricated ORCA output, which is the whole point of the
+# demo tree — without the logs there is nothing to read, grep, or plot.
+!examples/demo-calculations/**/*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal

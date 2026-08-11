@@ -1,0 +1,19 @@
+! B97-3c CPCM(WATER) OPT
+
+# Synthetic demo input — not a real calculation.
+%pal nprocs 16
+  end
+
+%geom Constraints
+  {B 0 1 1.95 C}   # Fe-O distance held at 1.95 Angstrom
+  end
+  end
+
+* xyz 0 5
+Fe   0.000000   0.000000   0.000000
+O    0.000000   0.000000   1.950000
+N    2.010000   0.000000   0.000000
+N   -2.010000   0.000000   0.000000
+N    0.000000   2.010000   0.000000
+N    0.000000  -2.010000   0.000000
+*

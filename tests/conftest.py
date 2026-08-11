@@ -81,6 +81,12 @@ _MODMAP = {
     "metadata": "aspen",
     "pending": "aspen",
     "setup": "aspen",
+    "demo": "aspen",
+    "DEMO_ENABLED": "aspen.config",
+    "DEMO_ROOT": "aspen.config",
+    "DEMO_MAX_TURNS": "aspen.config",
+    "DEMO_MAX_STARTS_PER_DAY": "aspen.config",
+    "DEMO_SESSION_TTL": "aspen.config",
     "tools": "aspen",
     # startup guards
     "_check_state_locations": "aspen.main",
@@ -214,6 +220,7 @@ def _reset_state(sut):
     sut._bot_uid_cache = None  # re-resolve the bot's own ID per test client
     sut.MANAGER.clear()
     sut.registry.invalidate()  # the registry is mtime-cached; don't leak across tests
+    sut.demo.clear()           # demo sessions are process-global too
     _unshadow_hook_backed()
     yield
     # After monkeypatch.undo(), which is what leaves the shadow behind.

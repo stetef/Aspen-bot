@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from . import config, registry, roots
+from . import config, demo, registry, roots
 
 log = logging.getLogger("aspen")
 
@@ -139,6 +139,9 @@ def exists(project: str, scope: dict) -> bool:
 # --------------------------------------------------------------------------- #
 def read(project: str, owner: str, viewer_uid: str) -> str:
     """Return a project's metadata, saying plainly that Aspen wrote it."""
+    session = demo.active_for(viewer_uid)
+    if session is not None:
+        return demo.read_notes(session, project)
     target, scope, error = path_for(project, owner, viewer_uid)
     if error:
         return error
@@ -217,6 +220,11 @@ def write(project: str, owner: str, content: str, viewer_uid: str, actor: str = 
     ``viewer_uid`` comes from the Slack event, never from a tool argument — the
     same property that makes workflow ownership unspoofable.
     """
+    session = demo.active_for(viewer_uid)
+    if session is not None:
+        _target, _scope, error = path_for(project, owner, viewer_uid)
+        return error or demo.save_notes(session, project, content)
+
     target, scope, error = path_for(project, owner, viewer_uid)
     if error:
         return error

@@ -1,0 +1,28 @@
+                                 *****************
+                                 * O   R   C   A *
+                                 *****************
+                    (synthetic output generated for the Aspen demo)
+
+INPUT FILE
+================================================================================
+NAME = feo-2p30.in
+|  1> ! B97-3c CPCM(WATER) OPT
+|  2> %geom Constraints {B 0 1 2.30 C} end end
+
+                       ORCA SCF
+------------------------------------------------------------------------------
+Total Charge           Charge          ....    0
+Multiplicity           Mult            ....    5
+Number of Electrons    NEL             ....   72
+
+               *****************************************************
+               *                     ERROR                         *
+               *        SCF NOT CONVERGED AFTER  125 CYCLES        *
+               *****************************************************
+
+The geometry optimization did not converge. Last energy change was
+2.7e-04 Eh over the final 20 cycles, and the Fe-O distance drifted by
+0.08 Angstrom while constrained — check the constraint definition.
+
+                             ****ORCA TERMINATED ABNORMALLY****
+TOTAL RUN TIME: 0 days 4 hours 12 minutes 8 seconds

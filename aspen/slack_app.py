@@ -18,8 +18,8 @@ from concurrent.futures import TimeoutError as _FutureTimeout
 
 from slack_bolt import App
 
-from . import (attachments, config, pending, ratelimit, registry, render, sessions,
-               setup, state, telemetry, workflows)
+from . import (attachments, config, demo, pending, ratelimit, registry, render,
+               sessions, setup, state, telemetry, workflows)
 
 log = logging.getLogger("aspen")
 
@@ -330,8 +330,30 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
             **extra,
         )
 
+    # 0. DEMO — a walkthrough for people who are not users yet (demo.py).
+    #
+    # Ahead of the allowlist gate on purpose: the whole point is to be usable by
+    # someone who would be refused. It is not a hole in admission, because a demo
+    # session can only ever read the demo tree, writes nothing, and never enters
+    # the registry — the visitor is still not authorized for anything else, on
+    # this turn or any other.
+    text_in = (event.get("text") or "")
+    demo_session = demo.get(sessions._thread_key(event))
+    if demo_session is None and demo.is_trigger(re.sub(r"<@[^>]+>", "", text_in)):
+        demo_session, refusal = demo.start(uid, sessions._thread_key(event))
+        if demo_session is None:
+            _record("demo_refused")
+            say(text=refusal, thread_ts=thread_ts)
+            return
+    if demo_session is not None:
+        over = demo.note_turn(demo_session)
+        if over:
+            _record("demo_ended")
+            say(text=over, thread_ts=thread_ts)
+            return
+
     # 1. Allowlist check — first gate (the mentioner must be allowlisted)
-    if uid not in config.ALLOWED_USER_IDS:
+    if demo_session is None and uid not in config.ALLOWED_USER_IDS:
         _record("not_authorized")
         # Being turned away IS the request. Nothing here grants anything — the
         # admin still has to run a command — but they now get told, with the
@@ -444,6 +466,7 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
                    # So a tool can DM the admin about a request. Nothing the agent
                    # can reach grants anything — the client is here to *ask*.
                    "slack_client": client,
+                   "demo": demo_session is not None,
                    # True only on the thread's first turn, which is the one place
                    # a setup nudge is allowed to appear (setup.py). Read before
                    # MANAGER.handle creates the session, so it is still absent.
@@ -458,9 +481,13 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
         # this can't live in the system prompt. Cheap (frontmatter only) and
         # bounded by the size of the registry.
         try:
-            turn_message = workflows.turn_preamble(
-                uid, extra_lines=setup.nudge_lines(uid, context["first_turn"])
-            ) + user_message
+            if demo_session is not None:
+                turn_message = ("\n".join(demo.guidance_lines(demo_session))
+                                + "\n\n" + user_message)
+            else:
+                turn_message = workflows.turn_preamble(
+                    uid, extra_lines=setup.nudge_lines(uid, context["first_turn"])
+                ) + user_message
         except Exception:      # context is an enhancement; never fail a turn for it
             log.exception("Could not build the workflow preamble for %s", uid)
             turn_message = user_message

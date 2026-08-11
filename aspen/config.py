@@ -29,6 +29,12 @@ CALCULATIONS_ROOT     = Path(os.environ["CALCULATIONS_ROOT"]).resolve()
 MODEL                 = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
 
 
+def _flag_early(name: str, default: str) -> bool:
+    """``_flag`` is defined further down (with the sandbox settings); this is the
+    same thing for the handful of flags that have to be read up here."""
+    return os.getenv(name, default).lower() in ("1", "true", "yes")
+
+
 def _named_paths(name: str) -> dict:
     """``"smb=/data/smb,legacy=/data/old"`` -> ``{"smb": "/data/smb", ...}``."""
     out = {}
@@ -48,6 +54,28 @@ def _named_paths(name: str) -> dict:
 # above is the fallback for anyone without one, which is what keeps a
 # single-root deployment behaving exactly as it did. See roots.py.
 SHARED_CALC_ROOTS     = _named_paths("ASPEN_SHARED_CALC_ROOTS")
+
+# ---------------------------------------------------------------------------
+# DEMO mode — a walkthrough for people who are not users yet (see demo.py).
+#
+# Safe to expose to a whole workspace because a demo session is scope-isolated
+# (the demo root is the ONLY thing it can read), writes nothing — not even a
+# temporary registry entry — and renders the admin request into the thread
+# instead of sending it. What it does cost is model time, so it is capped three
+# ways: per session, per day across everyone, and by the ordinary rate limiter.
+# ---------------------------------------------------------------------------
+DEMO_ENABLED          = _flag_early("ASPEN_DEMO_ENABLED", "true")
+DEMO_ROOT             = Path(os.getenv(
+    "ASPEN_DEMO_ROOT", str(Path(__file__).resolve().parent.parent / "examples" / "demo-calculations")
+)).resolve()
+# One walkthrough is ~10 turns; the cap is generous enough to wander.
+DEMO_MAX_TURNS        = int(os.getenv("ASPEN_DEMO_MAX_TURNS", "30"))
+DEMO_MAX_SESSIONS     = int(os.getenv("ASPEN_DEMO_MAX_SESSIONS", "10"))
+DEMO_MAX_STARTS_PER_DAY = int(os.getenv("ASPEN_DEMO_MAX_STARTS_PER_DAY", "20"))
+DEMO_SESSION_TTL      = int(os.getenv("ASPEN_DEMO_SESSION_TTL_SECONDS", "3600"))
+# Actually DM the admin during a demo. Off by default: a demo anyone can trigger
+# must not be able to page a human.
+DEMO_REAL_ADMIN_DM    = _flag_early("ASPEN_DEMO_REAL_ADMIN_DM", "false")
 
 # ---------------------------------------------------------------------------
 # Users and per-user workflows

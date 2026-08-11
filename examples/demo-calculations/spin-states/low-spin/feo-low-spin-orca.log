@@ -1,0 +1,52 @@
+                                 *****************
+                                 * O   R   C   A *
+                                 *****************
+                    (synthetic output generated for the Aspen demo)
+
+INPUT FILE
+================================================================================
+NAME = feo-low-spin.in
+|  1> ! B97-3c CPCM(WATER) OPT
+|  2> %geom Constraints {B 0 1 1.95 C} end end
+
+                       ORCA SCF
+------------------------------------------------------------------------------
+Total Charge           Charge          ....    0
+Multiplicity           Mult            ....    1
+Number of Electrons    NEL             ....   72
+
+               *****************************************************
+               *           SCF CONVERGED AFTER  23 CYCLES          *
+               *****************************************************
+
+----------------
+TOTAL SCF ENERGY
+----------------
+Total Energy       :   -4038.83015600000 Eh   -109902.22291 eV
+
+-----------------------
+MULLIKEN ATOMIC CHARGES
+-----------------------
+   0 Fe:   1.620000    3.840000
+   1 O :  -0.742318   0.121004
+   2 N :  -0.418772   0.033911
+   3 N :  -0.418640   0.033894
+   4 N :  -0.418701   0.033902
+   5 N :  -0.418655   0.033898
+Sum of atomic charges         :    0.0000000
+
+-------------------------
+GEOMETRY OPTIMIZATION CYCLE
+-------------------------
+                    ***********************HURRAY********************
+                    ***        THE OPTIMIZATION HAS CONVERGED     ***
+                    *************************************************
+
+---------------------------------
+FINAL SINGLE POINT ENERGY   -4038.257956000
+---------------------------------
+
+Fe-O distance (constrained)  ....  1.9500 Angstrom
+
+                             ****ORCA TERMINATED NORMALLY****
+TOTAL RUN TIME: 0 days 2 hours 41 minutes 3 seconds

@@ -357,6 +357,35 @@ break the refusal the user is waiting on), and the refusal text promises only wh
 actually happened. `aspen-users requests` is the same queue on the terminal, and it drops
 asks that reality has already answered.
 
+### 5.2 DEMO mode (`aspen/demo.py`)
+
+``DEMO`` in a DM runs a walkthrough for someone who is not a user: refusal, the
+request card, approval, a workflow, browsing, and a plot — over fabricated data in
+`examples/demo-calculations/` (regenerate with `python examples/build_demo_tree.py`).
+
+It sits **ahead of the allowlist gate**, which is the point: it has to be usable by
+someone who would be refused. That is not a hole in admission, because of three
+properties, each asserted in `tests/test_demo.py` against the real tool surface:
+
+- **Scope isolation.** The demo root is the only thing a session can read. This is the
+  single place in the codebase that restricts reads *by identity* — and it restricts them
+  to strictly less than a registered user sees. A visitor is not a group member, so the
+  flat-read rule of §5.1 does not extend to them. Enforced in `roots.resolve` **and**
+  separately in `tools._distinct_scopes`, because the cross-root sweep reads the roster
+  directly and would otherwise walk around the fence every other read goes through.
+- **Nothing is written.** No registry entry, not even a temporary one: the admission story
+  is "no message can widen the allowlist", and a demo that writes to `users.json` would
+  crack the property everything else rests on. The workflow and notes a visitor saves live
+  in `demo.py`'s memory for the session.
+- **Nobody is paged.** The admin request is rendered into the thread rather than sent — a
+  demo anyone can trigger must not be able to page a human. `ASPEN_DEMO_REAL_ADMIN_DM=true`
+  opts into the real thing.
+
+Model time is the one real cost, so demo turns are rate-limited like any other and capped
+per session, per day across everyone, and by a session TTL. The walkthrough advances
+through `demo.STAGES`, with per-stage guidance injected in place of the usual `<aspen_context>`
+block; the agent does the talking.
+
 ### 5.1 Calculations roots (`aspen/roots.py`)
 
 There is no single calculations directory. Each user may have their own (`calc_root`),

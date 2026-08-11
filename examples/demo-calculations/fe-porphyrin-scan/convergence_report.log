@@ -1,0 +1,8 @@
+# Convergence report — Fe-porphyrin Fe-O scan (synthetic)
+
+d1.80  converged  E = -4038.270977 Eh
+d1.90  converged  E = -4038.283825 Eh
+d1.95  converged  E = -4038.285056 Eh
+d2.00  converged  E = -4038.284079 Eh
+d2.10  converged  E = -4038.278015 Eh
+d2.30  FAILED (SCF not converged)

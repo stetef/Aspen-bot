@@ -1,0 +1,321 @@
+"""
+DEMO mode — let someone see Aspen work before they are anyone.
+
+Type ``DEMO`` in a DM and Aspen walks you through the whole arc it normally
+takes days to see: being turned away, the request that reaches the admin, being
+welcomed, saving a workflow, being pointed at some calculations, and getting a
+plot back. Against fabricated data, without being added as a user, and without
+touching anything real.
+
+Three properties make that safe to offer to anyone in the workspace:
+
+**Scope isolation.** This is the one place the "everyone reads everyone" rule
+(``roots.py``) does *not* apply. A demo visitor is not a group member, so for
+them the only addressable root is the demo tree — real roots are not listed, not
+addressable by name, and do not exist as far as that session is concerned.
+
+**Nothing is written.** No registry entry, not even a temporary one: the whole
+admission story is "no message can widen the allowlist", and a demo that writes
+to ``users.json`` would put a crack in the property everything else rests on. The
+workflow and notes a visitor "saves" live in this module's memory for the length
+of the session and are then gone. The only thing that reaches disk is a figure in
+the sandbox's own scratch area.
+
+**Nobody gets paged.** The admin request is rendered *into the demo thread* —
+the card the admin would have received, so the visitor can see and approve it —
+rather than actually sent. A demo that can DM the admin is a spam vector the
+moment a channel discovers it. ``ASPEN_DEMO_REAL_ADMIN_DM=true`` opts into the
+real thing for rehearsing.
+
+Costs are real even when the data isn't, so demo turns are rate-limited like any
+other, capped per session, and capped per day across everyone.
+"""
+
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import date
+from typing import Optional
+
+from . import config
+
+log = logging.getLogger("aspen")
+
+TRIGGER = "demo"
+SCOPE_NAME = "demo"
+
+# The walkthrough, in order. Each stage tells the agent what this beat is *for*;
+# the agent does the talking. Stages advance on what the visitor and agent
+# actually do, not on a timer, so someone who wanders off-script is followed
+# rather than corrected.
+STAGES = ("welcome", "request", "approved", "workflow", "explore", "analyze", "done")
+
+
+@dataclass
+class DemoSession:
+    """One visitor's walkthrough. Lives in memory and nowhere else."""
+    user_id: str
+    thread: str
+    started: float = field(default_factory=time.monotonic)
+    turns: int = 0
+    stage: str = "welcome"
+    approved: bool = False
+    workflow: str = ""
+    notes: dict = field(default_factory=dict)
+
+    @property
+    def age_seconds(self) -> float:
+        return time.monotonic() - self.started
+
+    def advance(self, stage: str) -> None:
+        if stage in STAGES and STAGES.index(stage) > STAGES.index(self.stage):
+            self.stage = stage
+            log.info("demo: %s reached stage %s", self.user_id, stage)
+
+
+# thread key -> session. Bounded by MAX_SESSIONS; oldest evicted first.
+_SESSIONS: dict = {}
+# Crude daily counter so a curious channel can't run up a bill: {date: count}.
+_STARTS: dict = {}
+
+
+# --------------------------------------------------------------------------- #
+# Lifecycle
+# --------------------------------------------------------------------------- #
+def enabled() -> bool:
+    return bool(config.DEMO_ENABLED and config.DEMO_ROOT.is_dir())
+
+
+def is_trigger(text: str) -> bool:
+    """Does this message ask to start a demo? Deliberately strict — a message
+    that merely mentions the word should not hijack somebody's question."""
+    return (text or "").strip().strip("`*_.!").lower() == TRIGGER
+
+
+def get(thread: str) -> Optional[DemoSession]:
+    session = _SESSIONS.get(thread)
+    if session is None:
+        return None
+    if session.age_seconds > config.DEMO_SESSION_TTL:
+        _SESSIONS.pop(thread, None)
+        return None
+    return session
+
+
+def active_for(user_id: str) -> Optional[DemoSession]:
+    """Any live session belonging to this user — the seam the tools ask about."""
+    for session in list(_SESSIONS.values()):
+        if session.user_id == user_id and session.age_seconds <= config.DEMO_SESSION_TTL:
+            return session
+    return None
+
+
+def start(user_id: str, thread: str) -> tuple[Optional[DemoSession], str]:
+    """(session, refusal). A refusal is a sentence to show the visitor."""
+    if not enabled():
+        return None, ("The demo isn't available on this deployment. "
+                      "Ask an admin about access instead.")
+
+    today = date.today().isoformat()
+    _STARTS.setdefault(today, 0)
+    if _STARTS[today] >= config.DEMO_MAX_STARTS_PER_DAY:
+        return None, ("The demo has been run its limit of times today — it costs "
+                      "real model time even though the data is made up. Try "
+                      "tomorrow, or ask an admin for access.")
+
+    while len(_SESSIONS) >= config.DEMO_MAX_SESSIONS:
+        oldest = min(_SESSIONS, key=lambda key: _SESSIONS[key].started)
+        _SESSIONS.pop(oldest, None)
+
+    session = DemoSession(user_id=user_id, thread=thread)
+    _SESSIONS[thread] = session
+    _STARTS[today] += 1
+    log.info("demo: started for %s (%d today)", user_id, _STARTS[today])
+    return session, ""
+
+
+def end(thread: str) -> None:
+    _SESSIONS.pop(thread, None)
+
+
+def clear() -> None:
+    """Test seam — drop all sessions and counters."""
+    _SESSIONS.clear()
+    _STARTS.clear()
+
+
+def note_turn(session: DemoSession) -> str:
+    """Count a turn; return a refusal if the session has run long enough."""
+    session.turns += 1
+    if session.turns > config.DEMO_MAX_TURNS:
+        end(session.thread)
+        return ("That's the end of the demo — it's capped so it can't run up a "
+                "bill. Type *DEMO* to start again, or ask an admin for real access.")
+    return ""
+
+
+# --------------------------------------------------------------------------- #
+# The fake identity (never persisted)
+# --------------------------------------------------------------------------- #
+def as_user(session: DemoSession) -> dict:
+    """A registry-shaped record for the visitor.
+
+    Shaped like a registry entry so the read path can use it without special
+    cases — but it is never saved, never in ``allowed_ids()``, and therefore
+    never authorizes anything. Admission for this user is still false; the demo
+    is let through by an explicit branch in the Slack front-end, not by
+    pretending they are registered.
+    """
+    return {
+        "slack_user_id": session.user_id,
+        "alias": SCOPE_NAME,
+        "display_name": "Demo visitor",
+        "role": "member",
+        "status": "active",
+        "calc_root": str(config.DEMO_ROOT),
+        "unix_user": "",
+        "declined": {},
+    }
+
+
+def scope(session: DemoSession) -> dict:
+    """The only calculations root a demo session can reach."""
+    return {
+        "name": SCOPE_NAME,
+        "kind": "demo",
+        "path": config.DEMO_ROOT,
+        "owner_id": session.user_id,
+        "label": "the demo calculations",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# In-session storage (memory, not disk)
+# --------------------------------------------------------------------------- #
+def save_workflow(session: DemoSession, content: str) -> str:
+    session.workflow = content
+    session.advance("explore")
+    return ("Saved your workflow — for this demo it lives in memory only, so it "
+            "disappears when we're done. For a real user it would be a file only "
+            "they can write.")
+
+
+def read_workflow(session: DemoSession) -> str:
+    if not session.workflow:
+        return ("You don't have a workflow yet. Tell me how you like to run "
+                "calculations and I'll save one.")
+    return (f'<workflow owner="Demo visitor" alias="{SCOPE_NAME}" trust="your-own">\n'
+            "This is the speaker's own workflow — their standing preferences.\n\n"
+            f"{session.workflow.strip()}\n</workflow>")
+
+
+def save_notes(session: DemoSession, project: str, content: str) -> str:
+    session.notes[project] = content
+    return (f"Recorded notes for @{SCOPE_NAME}/{project} — in memory for the demo, "
+            "and in Aspen's own storage for a real user (never in the calculations "
+            "tree).")
+
+
+def read_notes(session: DemoSession, project: str) -> str:
+    content = session.notes.get(project)
+    if not content:
+        return f"No notes recorded for @{SCOPE_NAME}/{project} yet."
+    return (f'<metadata project="@{SCOPE_NAME}/{project}" written_by="aspen">\n'
+            f"{content.strip()}\n</metadata>")
+
+
+# --------------------------------------------------------------------------- #
+# The admin request, rendered rather than sent
+# --------------------------------------------------------------------------- #
+def request_card(session: DemoSession, what: str = "access", detail: str = "") -> str:
+    """What the admin would have received. Shown to the visitor instead."""
+    if what == "access":
+        command = (f'./aspen-users add {session.user_id} --alias <their-alias> '
+                   f'--name "<their name>"')
+        line = f"Demo visitor <{session.user_id}> wants access"
+    else:
+        command = f"./aspen-users set-root <their-alias> {detail or '<path>'}"
+        line = "Demo visitor wants their own calculations root"
+    return (
+        "Here's the message your admin would get in Slack — this one is *not* "
+        "actually sent, since this is a demo:\n\n"
+        f"> *Aspen request* — {line}\n"
+        f"> ```\n> {command}\n> ```\n"
+        "> _Run it if you agree; ignore it if you don't._\n\n"
+        "Say *approve* and I'll carry on as if they had."
+    )
+
+
+def approve(session: DemoSession) -> str:
+    session.approved = True
+    session.advance("approved")
+    return ("Approved — in the real thing an admin ran that command, and it takes "
+            "effect on your next message. You're now a regular user as far as the "
+            "rest of this demo is concerned.")
+
+
+# --------------------------------------------------------------------------- #
+# Per-turn guidance
+# --------------------------------------------------------------------------- #
+_GUIDANCE = {
+    "welcome": (
+        "This is the FIRST turn of a demo. Introduce yourself in two or three "
+        "sentences: you are Aspen, you help this group explore HPC computational "
+        "chemistry results from Slack, and this walkthrough is fabricated data so "
+        "nobody's real work is on show. Then explain that normally they'd be "
+        "turned away here because they aren't on the allowlist, and show them what "
+        "that looks like by calling demo_request_card."
+    ),
+    "request": (
+        "They have seen the request card. Wait for them to say something like "
+        "'approve' — then call demo_approve. If they ask what happens if the admin "
+        "says no, tell them honestly: nothing, and the request stays in the queue "
+        "for the admin to see with `aspen-users requests`."
+    ),
+    "approved": (
+        "They are 'in'. Next beat: the workflow. Explain what a workflow file is "
+        "(their own notes on how they run and interpret calculations, which you "
+        "read before planning work) and offer to save one. If they don't want to "
+        "write one, offer a short plausible example for a DFT person and save that "
+        "with write_workflow so they can see the round trip."
+    ),
+    "explore": (
+        "Next beat: their calculations. They have a demo root with two projects — "
+        "an Fe-O distance scan (fe-porphyrin-scan) and a spin-state pair "
+        "(spin-states). Browse with list_directory, and point out that in the real "
+        "thing this would be *their* directory and a colleague's would be "
+        "'@alias/...'. A good hook: one run in the scan did not converge — find it "
+        "with search_files and say which one."
+    ),
+    "analyze": (
+        "The payoff: plot something. Use run_python_analysis on fe-porphyrin-scan "
+        "to pull FINAL SINGLE POINT ENERGY out of each */*-orca.log, parse the "
+        "Fe-O distance from the directory name, and plot energy against distance. "
+        "Say where the minimum is. Then offer to record what you found with "
+        "write_metadata, and explain those notes live in Aspen's own storage — you "
+        "never write inside anyone's calculations."
+    ),
+    "done": (
+        "Wrap up when they're ready: what they saw, that everything was fabricated, "
+        "and how to get real access (message Aspen normally and the admin is told, "
+        "with the command to approve it). Keep it to a few lines."
+    ),
+}
+
+
+def guidance_lines(session: DemoSession) -> list[str]:
+    """The per-turn context block for a demo turn."""
+    lines = [
+        "<demo>",
+        "You are running the DEMO walkthrough for someone who is NOT a registered "
+        "user. Everything they can see is fabricated data in a demo calculations "
+        "root; you cannot see or mention any real user's files, and no real user "
+        "or admin is affected by anything in this conversation. Say so plainly if "
+        "they ask.",
+        f"Stage {STAGES.index(session.stage) + 1} of {len(STAGES)} — {session.stage}.",
+        _GUIDANCE.get(session.stage, _GUIDANCE["done"]),
+        "Move at their pace: answer what they actually ask, and only then nudge "
+        "toward the next beat. Keep replies short — this is a tour, not a lecture.",
+        "</demo>",
+    ]
+    return lines

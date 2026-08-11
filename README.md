@@ -59,6 +59,28 @@ it, and in a group-DM thread it began (via a mention) it picks up your plain rep
 so a back-and-forth doesn't need a mention every turn. Other messages in a channel or
 group DM (not in a thread Aspen is already in) still require an `@Aspen`.
 
+## Try it without being a user (`DEMO`)
+
+DM Aspen the single word **DEMO** and it walks you through the whole arc: being
+turned away, the request that reaches the admin, being welcomed, saving a workflow,
+browsing some calculations, and getting a plot back — against fabricated data in
+[`examples/demo-calculations/`](examples/demo-calculations/), without being added
+as a user and without touching anything real.
+
+Three properties make it safe to offer to a whole workspace:
+
+- **Scope isolation.** A demo session can read the demo tree and nothing else. Real
+  roots aren't listed, aren't addressable by name, and can't be reached by traversal
+  or by a cross-root search. This is the one place the "everyone reads everyone" rule
+  does *not* apply — a visitor isn't a group member.
+- **Nothing is written.** No registry entry, not even a temporary one. The workflow
+  and notes you "save" live in memory for the session and are then gone.
+- **Nobody is paged.** The admin request is rendered *into the thread* — the card
+  your admin would have received, so you can see and approve it — rather than sent.
+
+It still costs model time, so it's capped per session, per day across everyone, and
+by the ordinary rate limiter. Switch it off with `ASPEN_DEMO_ENABLED=false`.
+
 ## Requesting access
 
 Aspen only answers allowlisted users. If you're not on the list yet, it will reply

@@ -21,7 +21,7 @@ from typing import Optional
 
 import httpx
 
-from . import config, metadata, roots, setup, workflows
+from . import config, demo, metadata, roots, setup, workflows
 
 log = logging.getLogger("aspen")
 
@@ -144,10 +144,21 @@ def _search_files(query: str, rel: str = ".", regex: bool = False,
     return "\n".join(out)
 
 
-def _distinct_scopes() -> list[dict]:
-    """Every root once. Users without a ``calc_root`` share the default one, so
-    the roster can name the same directory several times — scanning it once per
-    user would multiply the work for no extra coverage."""
+def _distinct_scopes(viewer_uid: str = "") -> list[dict]:
+    """Every root this viewer may sweep, once.
+
+    Users without a ``calc_root`` share the default one, so the roster can name
+    the same directory several times — scanning it once per user would multiply
+    the work for no extra coverage.
+
+    A demo visitor gets the demo root and nothing else. That has to be enforced
+    *here* as well as in ``roots.resolve``: this function reads the roster
+    directly, so without it a cross-root sweep would walk straight around the
+    fence that every other read goes through.
+    """
+    session = demo.active_for(viewer_uid) if viewer_uid else None
+    if session is not None:
+        return [demo.scope(session)]
     seen, out = set(), []
     for scope in roots.scopes():
         key = str(scope["path"])
@@ -162,7 +173,7 @@ def _search_every_root(query: str, pattern, rel: str, viewer_uid: str) -> str:
     """The cross-root sweep, with a shared budget and an honest tail."""
     budget = config.SEARCH_MAX_FILES_ALL
     matches, scanned_total, skipped = [], 0, []
-    for scope in _distinct_scopes():
+    for scope in _distinct_scopes(viewer_uid):
         if budget <= 0:
             skipped.append(f"{roots.PREFIX}{scope['name']}")
             continue
@@ -182,7 +193,7 @@ def _search_every_root(query: str, pattern, rel: str, viewer_uid: str) -> str:
         budget -= scanned
         if hit_match_cap or len(matches) >= config.SEARCH_MAX_MATCHES:
             skipped.extend(
-                f"{roots.PREFIX}{s['name']}" for s in _distinct_scopes()
+                f"{roots.PREFIX}{s['name']}" for s in _distinct_scopes(viewer_uid)
                 if s["name"] != scope["name"] and f"{roots.PREFIX}{s['name']}" not in skipped
             )
             break
@@ -333,6 +344,26 @@ def _request_calc_root(inp: dict, context: dict) -> tuple[str, list[str]]:
         context.get("user_id", ""), inp.get("path", ""),
         client=context.get("slack_client"),
     ), []
+
+
+def _demo_request_card(inp: dict, context: dict) -> tuple[str, list[str]]:
+    """Show the visitor the DM their admin would have received.
+
+    Rendered into the thread rather than sent, because a demo anyone in the
+    workspace can trigger must not be able to page a human. See demo.py.
+    """
+    session = demo.active_for(context.get("user_id", ""))
+    if session is None:
+        return "Error: that's only available inside a demo.", []
+    session.advance("request")
+    return demo.request_card(session, inp.get("what", "access"), inp.get("path", "")), []
+
+
+def _demo_approve(inp: dict, context: dict) -> tuple[str, list[str]]:
+    session = demo.active_for(context.get("user_id", ""))
+    if session is None:
+        return "Error: that's only available inside a demo.", []
+    return demo.approve(session), []
 
 
 def _tool_server_post(path: str, payload: dict, timeout: int) -> httpx.Response:
@@ -738,6 +769,36 @@ TOOL_SPECS = [
             "required": ["item"],
         },
         "impl": _decline_setup,
+    },
+    {
+        "name": "demo_request_card",
+        "description": (
+            "DEMO ONLY. Show the visitor the Slack message their admin would "
+            "receive if they asked for access (what='access') or their own "
+            "calculations directory (what='calc_root'). Nothing is sent to anyone "
+            "— say so. Outside a demo this does nothing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "what": {"type": "string", "enum": ["access", "calc_root"],
+                         "description": "Which request to render. Default 'access'."},
+                "path": {"type": "string",
+                         "description": "For calc_root, the path they named."},
+            },
+            "required": [],
+        },
+        "impl": _demo_request_card,
+    },
+    {
+        "name": "demo_approve",
+        "description": (
+            "DEMO ONLY. The visitor said to approve the request they were just "
+            "shown — carry on as if an admin had run the command. Outside a demo "
+            "this does nothing; it grants no real access to anyone, ever."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "impl": _demo_approve,
     },
     {
         "name": "run_python_analysis",

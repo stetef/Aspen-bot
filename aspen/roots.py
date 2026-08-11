@@ -30,7 +30,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from . import config, registry
+from . import config, demo, registry
 
 log = logging.getLogger("aspen")
 
@@ -163,6 +163,12 @@ def qualify(scope_name: str, rel: str) -> str:
 # --------------------------------------------------------------------------- #
 # Resolution + fencing
 # --------------------------------------------------------------------------- #
+def token_names_something_else(token: str) -> bool:
+    """True if a demo caller named a root other than the demo one."""
+    token = (token or "").strip().lstrip(PREFIX).lower()
+    return bool(token) and token != demo.SCOPE_NAME
+
+
 def resolve(rel: str, owner: str, viewer_uid: str) -> tuple[Optional[Path], dict, str]:
     """Resolve ``rel`` (optionally ``@name/``-prefixed) to an absolute path.
 
@@ -181,6 +187,28 @@ def resolve(rel: str, owner: str, viewer_uid: str) -> tuple[Optional[Path], dict
             f"Error: '{rel}' is under {PREFIX}{prefix_name} but owner='{owner}' was "
             "also given. Pass one or the other, not both."
         )
+
+    # A demo visitor is not a group member, so the flat-read rule does not apply
+    # to them: the demo tree is the only thing that exists for this session. This
+    # is the single place in the codebase that restricts *reads* by identity, and
+    # it restricts them to strictly less than a registered user can see.
+    session = demo.active_for(viewer_uid)
+    if session is not None:
+        scope = demo.scope(session)
+        if token_names_something_else(prefix_name or owner):
+            return None, scope, (
+                f"Error: this is a demo session, so the only calculations "
+                f"available are the demo ones ({PREFIX}{demo.SCOPE_NAME}). Real "
+                "users' files aren't reachable from here."
+            )
+        try:
+            resolved = (scope["path"] / bare).resolve()
+            resolved.relative_to(scope["path"])
+        except (ValueError, OSError):
+            return None, scope, (
+                f"Error: '{qualify(scope['name'], bare)}' is outside the allowed directory."
+            )
+        return resolved, scope, ""
 
     token = prefix_name or owner
     if token:
@@ -311,6 +339,15 @@ def check_all() -> list[str]:
 # Roster for the per-turn context block
 # --------------------------------------------------------------------------- #
 def preamble_lines(viewer_uid: str) -> list[str]:
+    if demo.active_for(viewer_uid) is not None:
+        return [
+            "All calculations in this session are the demo ones "
+            f"({PREFIX}{demo.SCOPE_NAME}); no real user's files are reachable."
+        ]
+    return _preamble_lines(viewer_uid)
+
+
+def _preamble_lines(viewer_uid: str) -> list[str]:
     """How the roots are described to the model each turn.
 
     Cheap by design: a name and a one-line role per root, no directory listing.

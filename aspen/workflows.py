@@ -36,7 +36,7 @@ from typing import Optional
 
 import yaml
 
-from . import config, registry, roots
+from . import config, demo, registry, roots
 
 log = logging.getLogger("aspen")
 
@@ -280,6 +280,12 @@ def read(token: str, viewer_uid: str) -> str:
     """
     token = (token or "").strip()
 
+    # A demo visitor has no file on disk and never will — their workflow lives in
+    # the session and disappears with it.
+    session = demo.active_for(viewer_uid)
+    if session is not None:
+        return demo.read_workflow(session)
+
     if token in ("", "me", "self", "mine"):
         viewer = registry.by_id(viewer_uid)
         target_uid = viewer_uid
@@ -370,6 +376,10 @@ def write(uid: str, content: str, target: str = "", actor: str = "") -> str:
     ``uid``, so this stays a provenance note and never a way to write as someone
     else. The Slack path leaves it empty and keeps the old behavior.
     """
+    session = demo.active_for(uid)
+    if session is not None:
+        return demo.save_workflow(session, content)
+
     user = registry.by_id(uid)
     if user is None:
         return ("Error: you are not in Aspen's user registry, so there's nowhere to "
