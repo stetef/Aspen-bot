@@ -354,3 +354,99 @@ def test_startup_refuses_the_switch_inside_a_sandbox_write_path(sut, monkeypatch
     monkeypatch.setattr(config, "SANDBOX_WRITE_PATHS", [str(sut.TELEMETRY_STATE_FILE.parent)])
     with pytest.raises(SystemExit, match="sandbox-writable"):
         sut._check_state_locations()
+
+
+# --------------------------------------------------------------------------- #
+# Interim updates and the quota meter, end to end
+# --------------------------------------------------------------------------- #
+def test_interim_text_is_posted_and_timed(sut, monkeypatch, say):
+    """The agent's narration reaches the thread as its own message, and the
+    clock on it is first_output_ms — not the answer's latency."""
+    async def _fake_handle(key, user_message, context):
+        context["on_interim"]("Checking the queue…")
+        return "12 running", []
+
+    monkeypatch.setattr(sut.MANAGER, "handle", _fake_handle)
+    sut._handle_event(
+        {"user": "U1", "text": "how many jobs?", "channel": "C", "ts": "1.0",
+         "channel_type": "im"},
+        say, MagicMock(), strip_mention=False,
+    )
+
+    # Two posts in the thread: the aside, then the answer.
+    assert len(say.calls) == 2
+    entry = _entries(sut)[0]
+    assert entry["first_output_ms"] is not None
+    assert entry["first_output_ms"] <= entry["latency_ms"]
+
+
+def test_an_empty_reply_posts_nothing_more(sut, monkeypatch, say):
+    """A turn that said everything while working must not append a blank message."""
+    async def _fake_handle(key, user_message, context):
+        context["on_interim"]("Cancelled job 12345.")
+        return "", []
+
+    monkeypatch.setattr(sut.MANAGER, "handle", _fake_handle)
+    sut._handle_event(
+        {"user": "U1", "text": "cancel it", "channel": "C", "ts": "1.0",
+         "channel_type": "im"},
+        say, MagicMock(), strip_mention=False,
+    )
+
+    assert len(say.calls) == 1                      # the aside only
+    assert _entries(sut)[0]["outcome"] == "ok"      # still a successful turn
+
+
+def test_interim_updates_can_be_switched_off(sut, monkeypatch, say):
+    from aspen import config
+
+    seen = {}
+
+    async def _fake_handle(key, user_message, context):
+        seen["has_sink"] = "on_interim" in context
+        return "answer", []
+
+    monkeypatch.setattr(config, "INTERIM_UPDATES", False)
+    monkeypatch.setattr(sut.MANAGER, "handle", _fake_handle)
+    sut._handle_event(
+        {"user": "U1", "text": "hi", "channel": "C", "ts": "1.0", "channel_type": "im"},
+        say, MagicMock(), strip_mention=False,
+    )
+
+    assert seen["has_sink"] is False
+    assert len(say.calls) == 1
+
+
+def test_turns_without_narration_still_time_their_output(sut, monkeypatch, say):
+    async def _fake_handle(key, user_message, context):
+        return "just the answer", []
+
+    monkeypatch.setattr(sut.MANAGER, "handle", _fake_handle)
+    sut._handle_event(
+        {"user": "U1", "text": "hi", "channel": "C", "ts": "1.0", "channel_type": "im"},
+        say, MagicMock(), strip_mention=False,
+    )
+
+    assert _entries(sut)[0]["first_output_ms"] is not None
+
+
+def test_the_quota_meter_reaches_the_log(sut, monkeypatch, say):
+    """What makes 'who used the credits' answerable: an account-wide meter on
+    the same row as the per-user token spend."""
+    async def _fake_handle(key, user_message, context):
+        context["result_meta"] = {
+            "quota_utilization": 0.91, "quota_status": "allowed_warning",
+            "input_tokens": 12000, "output_tokens": 800, "api_ms": 4000,
+        }
+        return "answer", []
+
+    monkeypatch.setattr(sut.MANAGER, "handle", _fake_handle)
+    sut._handle_event(
+        {"user": "U1", "text": "hi", "channel": "C", "ts": "1.0", "channel_type": "im"},
+        say, MagicMock(), strip_mention=False,
+    )
+
+    entry = _entries(sut)[0]
+    assert entry["quota_utilization"] == 0.91
+    assert entry["quota_status"] == "allowed_warning"
+    assert entry["input_tokens"] == 12000 and entry["api_ms"] == 4000

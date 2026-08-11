@@ -222,27 +222,36 @@ def _short_tools(tools: Optional[list]) -> list[str]:
 
 
 def _flatten_meta(meta: Optional[dict]) -> dict:
-    """The fields worth keeping from the SDK's ResultMessage (see agent.send)."""
+    """The fields worth keeping from the SDK's ResultMessage (see agent.send).
+
+    ``quota_*`` come from the CLI's rate-limit event and are account-wide, not
+    per-user: they appear only on the turns where the meter changed state. Under
+    a subscription seat they matter more than ``cost_usd``, which the CLI reports
+    as 0 or omits entirely when billing runs through the seat rather than a key.
+    """
     meta = meta or {}
     keep = ("result_subtype", "num_turns", "denials", "input_tokens",
-            "output_tokens", "cost_usd", "agent_ms")
+            "output_tokens", "cost_usd", "agent_ms", "api_ms", "model_usage",
+            "quota_status", "quota_utilization", "quota_resets_at", "quota_type",
+            "quota_overage_status")
     return {k: meta[k] for k in keep if meta.get(k) is not None}
 
 
 def record(uid: str, outcome: str, text: str = "", channel: str = "",
            thread: str = "", latency_ms: Optional[int] = None,
+           first_output_ms: Optional[int] = None,
            tools: Optional[list] = None, reply_chars: int = 0,
            attachments: int = 0, meta: Optional[dict] = None) -> None:
     """Append one turn record. Never raises — telemetry must not cost a turn."""
     try:
-        _record(uid, outcome, text, channel, thread, latency_ms, tools,
-                reply_chars, attachments, meta)
+        _record(uid, outcome, text, channel, thread, latency_ms, first_output_ms,
+                tools, reply_chars, attachments, meta)
     except Exception:
         log.debug("telemetry: could not record a turn", exc_info=True)
 
 
-def _record(uid, outcome, text, channel, thread, latency_ms, tools,
-            reply_chars, attachments, meta) -> None:
+def _record(uid, outcome, text, channel, thread, latency_ms, first_output_ms,
+            tools, reply_chars, attachments, meta) -> None:
     settings = effective()
     if not settings["metrics"]:
         return
@@ -261,6 +270,9 @@ def _record(uid, outcome, text, channel, thread, latency_ms, tools,
         "channel": channel,
         "thread": thread,
         "latency_ms": latency_ms,
+        # Time to the agent's *first* words, when it narrates before acting.
+        # Equal to latency_ms on turns that produce only a final answer.
+        "first_output_ms": first_output_ms,
         "tools": _short_tools(tools),
         # Kept even when the text is not: length alone separates a one-line
         # status check from a pasted traceback, and is not sensitive.

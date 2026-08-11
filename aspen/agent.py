@@ -180,17 +180,43 @@ class SdkSession:
             self._client = sdk.ClaudeSDKClient(options=self._build_options(sdk))
             await self._client.connect()           # spawns the CLI subprocess once (warm)
 
-    def _format_result_reply(self, text: str, result_msg) -> str:
+    @staticmethod
+    def _log_quota(info) -> None:
+        """Say plainly in the log when the account's rate limit is running down.
+
+        The operator otherwise learns about it from a user reporting a failed
+        turn; the CLI tells us in advance.
+        """
+        status = getattr(info, "status", None)
+        if status not in ("allowed_warning", "rejected"):
+            return
+        used = getattr(info, "utilization", None)
+        log.warning(
+            "Rate limit %s — %s of the %s window consumed; resets at %s",
+            status,
+            f"{used:.0%}" if isinstance(used, (int, float)) else "an unknown share",
+            getattr(info, "rate_limit_type", None) or "current",
+            getattr(info, "resets_at", None) or "an unreported time",
+        )
+
+    def _format_result_reply(self, text: str, result_msg, sent_interim: bool = False) -> str:
         """Turn the turn's final ``ResultMessage`` into the user-facing reply.
 
         On success, return the agent's text. On a non-success result, surface the
         *specific* reason (and keep any partial text the agent already produced)
         instead of a generic "backend error" — most importantly distinguishing a
         soft ``error_max_turns`` pause (work continues next turn) from a real error.
+
+        ``sent_interim`` says whether commentary already reached the thread. If it
+        did and the agent ends with nothing further to add, the reply is empty
+        rather than "(no text response)" — the turn *did* produce output, and the
+        front-end skips posting an empty message. Errors are still always reported.
         """
         subtype = getattr(result_msg, "subtype", "success") if result_msg is not None else "success"
         if subtype == "success":
-            return text or "(no text response)"
+            if text:
+                return text
+            return "" if sent_interim else "(no text response)"
 
         denials = getattr(result_msg, "permission_denials", None) or []
         api_status = getattr(result_msg, "api_error_status", None)
@@ -254,38 +280,107 @@ class SdkSession:
             "output_tokens": usage.get("output_tokens"),
             "cost_usd": getattr(result_msg, "total_cost_usd", None),
             "agent_ms": getattr(result_msg, "duration_ms", None),
+            # Splitting total from API time separates *our* overhead (session
+            # wait, pre-warm miss, preamble) from model time from tool time —
+            # three different problems with three different fixes.
+            "api_ms": getattr(result_msg, "duration_api_ms", None),
+            "model_usage": getattr(result_msg, "model_usage", None),
         }
 
+    @staticmethod
+    def _quota_meta(info) -> dict:
+        """The account's rate-limit meter, as of this turn.
+
+        Under a subscription seat there is no per-request dollar cost, so this
+        is the closest thing to a spend signal: ``utilization`` is the fraction
+        of the window consumed (0.0-1.0), account-wide. It cannot say *who*
+        consumed it — that join is against per-user tokens in the turn log.
+
+        The CLI emits the event only when the state *transitions*, so most turns
+        carry nothing here and the ones that do mark the step changes.
+        """
+        if info is None:
+            return {}
+        return {k: v for k, v in {
+            "quota_status": getattr(info, "status", None),
+            "quota_utilization": getattr(info, "utilization", None),
+            "quota_resets_at": getattr(info, "resets_at", None),
+            "quota_type": getattr(info, "rate_limit_type", None),
+            "quota_overage_status": getattr(info, "overage_status", None),
+        }.items() if v is not None}
+
     async def send(self, user_message: str, context: dict) -> tuple[str, list[str]]:
-        """Run one turn. ``context["on_progress"]``, if set, is called with each
-        ``(tool_name, tool_input)`` the agent invokes, so the front-end can show
-        what it's working on mid-turn. It runs on the agent loop, so it must not
-        block — the Slack side only stamps an in-memory holder."""
+        """Run one turn.
+
+        Two optional callbacks ride on ``context``, both called from the agent
+        loop, so neither may block:
+
+        * ``on_progress(tool_name, tool_input)`` — every tool the agent invokes,
+          so the front-end can show what it's working on.
+        * ``on_interim(text)`` — text the agent wrote *before* calling a tool.
+          Without this sink the text is held to the end (the old behavior); with
+          it, the agent's running commentary reaches the user while it works.
+        """
         import claude_agent_sdk as sdk
         context.setdefault("attachments", [])
         self._current = context
         on_progress = context.get("on_progress")
+        on_interim = context.get("on_interim")
+        # Older SDKs don't emit rate-limit events; absence just means no meter.
+        rate_limit_event = getattr(sdk, "RateLimitEvent", None)
         try:
             await self._ensure()
             await self._client.query(user_message)
-            parts: list[str] = []
+            parts: list[str] = []       # text written since the last flush
             result_msg = None
+            quota = None
+            sent_interim = False
+
+            def _flush_interim() -> None:
+                """Hand over what the agent has said so far, before it acts.
+
+                Message-level, not token-level: each flush is a complete block of
+                markdown, so it renders correctly and never has to be revised.
+                """
+                nonlocal sent_interim
+                if on_interim is None:
+                    return          # no sink — keep accumulating for one final reply
+                text = "\n".join(p for p in parts if p).strip()
+                parts.clear()
+                if not text:
+                    return
+                try:
+                    on_interim(text)
+                    sent_interim = True
+                except Exception:   # commentary is a bonus; never fail a turn for it
+                    log.debug("on_interim callback failed", exc_info=True)
+
             # Do NOT break out of receive_response early (SDK cleanup caveat).
             async for msg in self._client.receive_response():
                 if isinstance(msg, sdk.AssistantMessage):
                     for b in msg.content:
                         if isinstance(b, sdk.TextBlock):
                             parts.append(b.text)
-                        elif isinstance(b, sdk.ToolUseBlock) and on_progress is not None:
-                            try:
-                                on_progress(b.name, b.input or {})
-                            except Exception:   # progress is cosmetic; never fail a turn
-                                log.debug("on_progress callback failed", exc_info=True)
+                        elif isinstance(b, sdk.ToolUseBlock):
+                            # Anything said before a tool call is narration of the
+                            # step about to happen — it belongs in the thread now,
+                            # not bolted to the top of an answer minutes later.
+                            _flush_interim()
+                            if on_progress is not None:
+                                try:
+                                    on_progress(b.name, b.input or {})
+                                except Exception:   # progress is cosmetic
+                                    log.debug("on_progress callback failed", exc_info=True)
                 elif isinstance(msg, sdk.ResultMessage):
                     result_msg = msg
+                elif rate_limit_event is not None and isinstance(msg, rate_limit_event):
+                    quota = msg.rate_limit_info
+                    self._log_quota(quota)
             text = "\n".join(p for p in parts if p).strip()
-            context["result_meta"] = self._result_meta(result_msg)
-            return self._format_result_reply(text, result_msg), list(context["attachments"])
+            context["result_meta"] = {**self._result_meta(result_msg),
+                                      **self._quota_meta(quota)}
+            return (self._format_result_reply(text, result_msg, sent_interim),
+                    list(context["attachments"]))
         except sdk.ClaudeSDKError as exc:
             name = type(exc).__name__
             context["result_meta"] = {"result_subtype": f"sdk_error:{name}"}

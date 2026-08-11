@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# aspen-dashboard — read-only view of Aspen's turn log.
+#
+#   ./aspen-dashboard              # against the real log
+#   ./aspen-dashboard --demo       # synthetic data, for judging the layout
+#
+# SECURITY: the bind address is pinned to 127.0.0.1 here and is not
+# configurable. Streamlit's own default listens on every interface; on a shared
+# login node that would publish colleagues' questions to every account on the
+# machine — undoing the 0600 mode on the log file itself. Reach it over an SSH
+# tunnel (the command is printed below).
+#
+# The dashboard gets its OWN venv. The bot's venv is what the service account
+# runs in production; a web framework does not belong in a running Slack
+# service's dependency tree.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+PORT="${ASPEN_DASHBOARD_PORT:-8501}"
+VENV="${ASPEN_DASHBOARD_VENV:-$SCRIPT_DIR/dashboard-venv}"
+
+ensure_venv() {
+    if [[ -x "$VENV/bin/streamlit" ]]; then
+        return 0
+    fi
+    echo "Building the dashboard venv at $VENV (first run only) ..."
+    local uv_bin; uv_bin="$(command -v uv || echo "$HOME/.local/bin/uv")"
+    if [[ -x "$uv_bin" ]]; then
+        "$uv_bin" venv --python 3.11 "$VENV" \
+            && "$uv_bin" pip install --python "$VENV/bin/python" -q -r dashboard-requirements.txt
+    else
+        python3 -m venv "$VENV" \
+            && "$VENV/bin/pip" install -q --upgrade pip \
+            && "$VENV/bin/pip" install -q -r dashboard-requirements.txt
+    fi
+}
+
+if ! ensure_venv; then
+    echo "ERROR: could not build the dashboard venv at $VENV." >&2
+    exit 1
+fi
+
+# .env supplies ASPEN_STATE_DIR / ASPEN_TELEMETRY_DIR so the log is found in the
+# same place the bot writes it. Only those two are read; no tokens are needed.
+if [[ -f .env ]]; then
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*(ASPEN_STATE_DIR|ASPEN_TELEMETRY_DIR)= ]] || continue
+        export "${line?}"
+    done < .env
+fi
+
+cat <<EOF
+
+Aspen dashboard starting on 127.0.0.1:$PORT (this machine only).
+
+From your laptop:
+    ssh -N -L $PORT:localhost:$PORT $(whoami)@$(hostname -f 2>/dev/null || hostname)
+then open http://localhost:$PORT
+
+EOF
+
+exec "$VENV/bin/streamlit" run dashboard/app.py \
+    --server.address=127.0.0.1 \
+    --server.port="$PORT" \
+    --server.headless=true \
+    --browser.gatherUsageStats=false \
+    -- "$@"

@@ -216,6 +216,12 @@ SANDBOX_EXCLUDED_COMMANDS = _csv_env(
 # WORKSPACE_ROOT or a sandbox-writable path, generated analysis code could read
 # the log or switch off its own recording (guarded in main._check_state_locations).
 # ---------------------------------------------------------------------------
+# Post the agent's own commentary as it works, instead of holding every word
+# until the answer is ready. A turn is mostly tool time, so without this a user
+# waits in silence behind a "typing…" indicator and then receives the narration
+# retroactively glued to the top of the answer. Set false for a quieter room.
+INTERIM_UPDATES       = _flag("ASPEN_INTERIM_UPDATES", "true")
+
 TELEMETRY_ENABLED     = _flag("ASPEN_TELEMETRY", "true")
 TELEMETRY_DIR         = Path(os.getenv("ASPEN_TELEMETRY_DIR", str(STATE_DIR / "telemetry"))).resolve()
 TELEMETRY_STATE_FILE  = Path(os.getenv("ASPEN_TELEMETRY_STATE_FILE", str(STATE_DIR / "telemetry.json"))).resolve()

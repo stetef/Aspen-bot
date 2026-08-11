@@ -1,0 +1,7 @@
+# Admin dashboard only (./aspen-dashboard). Deliberately NOT in requirements.txt:
+# the bot venv is what the service account runs in production, and a web
+# framework has no business in a running Slack service's dependency tree.
+# Built into its own venv by the launcher.
+streamlit>=1.36
+pandas>=2.0
+altair>=5.0

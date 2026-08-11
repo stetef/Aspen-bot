@@ -203,6 +203,30 @@ The log and its switch sit under `ASPEN_STATE_DIR` for the same reason the regis
 outside the workspace and every sandbox-writable path, so generated analysis code can
 neither read the log nor stop its own recording. Aspen refuses to start if that's violated.
 
+Because Aspen runs on a **subscription seat**, there is no per-turn dollar cost to record.
+The spend signals are tokens per user, plus the CLI's own rate-limit meter — `utilization`
+(the fraction of the window consumed), its status, and when it resets. That meter is
+account-wide, so it says *how much is left*, not *who spent it*; the join is against the
+per-user token columns on the same rows.
+
+## Seeing the usage (`aspen-dashboard`)
+
+```
+./aspen-dashboard             # against the real log
+./aspen-dashboard --demo      # synthetic data, to judge the layout before real traffic
+```
+
+Volume and tokens per person over time, the rate-limit meter, a per-person table, the tool
+histogram and repeated tool sequences, the failure panel (including the commands the
+allowlist refused — a feature backlog), a latency breakdown separating Aspen's own overhead
+from model time from tool time, and a searchable list of the questions themselves.
+
+It is **read-only**, gets **its own venv** (a web framework has no place in the dependency
+tree of the running Slack service), and is **pinned to `127.0.0.1`** — on a shared login
+node Streamlit's default bind would publish colleagues' questions to every account on the
+machine, undoing the `0600` on the log file. Reach it over an SSH tunnel; the launcher
+prints the exact command. First run builds the venv from `dashboard-requirements.txt`.
+
 ## Architecture at a glance
 
 - **`aspen-bot.py` / `aspen/`** — Slack Bolt front-end running the **Claude Agent SDK**

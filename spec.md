@@ -721,8 +721,17 @@ and its own munge credentials, never the requester's:
 - **Scrub the job environment.** `load_dotenv` puts `SLACK_BOT_TOKEN` and
   `AGENT_INTERNAL_SECRET` into the bot's `os.environ`, which a naive `sbatch` inherits into
   the job. `--export=NONE` plus an explicit whitelist.
-- **Tag for attribution** (`--job-name`/`--comment` carrying `aspen:<alias>:<thread>`) so
-  the read-only `squeue`/`sacct` surface can map jobs back to who asked.
+- **Tag for attribution, keyed by Slack ID.** `--job-name aspen-<alias>-<project>` is what
+  the group sees in `squeue`; `--comment aspen/v1/<slack-id>/<thread-ts>` is the durable
+  machine key. The comment carries the **ID, not the alias**: aliases are renameable and
+  lookups everywhere else resolve by `slack_user_id`, so an alias baked into a months-old
+  job record stops resolving the first time someone is renamed. Both strings are composed
+  only from the Slack event's `user_id` and `thread_ts` — never from conversation text —
+  the same rule that keeps `write_workflow` un-forgeable (C9).
+  **Verified on s3df (2026-08):** `scontrol show config` reports
+  `AccountingStoreFlags = job_comment`, so slurmdbd retains the comment and `sacct -o
+  Comment` can recover attribution from Slurm itself, independent of anything Aspen keeps.
+  Re-check that flag before relying on it — without it the comment is silently dropped.
 - **Accounting is an admin question, not a code one.** Jobs charge the bot's Slurm
   association; either everything runs under one account or the bot is added to each user's,
   which is a cluster-side association change.
@@ -733,6 +742,31 @@ and its own munge credentials, never the requester's:
 - **Results stay in the agent's workspace** (world-readable) and are reported/attached from
   there. Writing back into a user's tree is out of scope; if it is ever wanted, the
   mechanism is an opt-in per-user inbox directory whose existence *is* the consent.
+
+**Attribution is two-phase, and the second phase is the one that answers "who used the
+compute".** At submit time you know *who and what*; you do not know what it cost — elapsed
+time, CPU-hours and exit state exist only after the job ends. A design that logs only at
+submission yields job *counts* and nothing about consumption, which is the metric that
+matters when an allocation runs low.
+
+1. **Ledger, written once at submit** (the "fully logged before `sbatch`" requirement
+   above, given a schema): `job_id`, `slack_user_id`, `alias`, `thread_ts`, `project`,
+   staging path, submitted-at, and the requested resources. Rows are immutable.
+2. **Reconciler, run later** — joins the ledger against Slurm's own accounting to fill in
+   what the job actually consumed:
+
+   ```
+   sacct -X -n -P -u aspen-agent -S <since> \
+     -o JobID,JobName,Comment,State,Submit,Start,End,Elapsed,TotalCPU,AllocTRES,ExitCode
+   ```
+
+   `-X` limits to job allocations (no `.batch`/`.extern` step rows, which would double-count),
+   `-P` is parseable output, `-n` drops the header. `TotalCPU`/`AllocTRES` are the
+   consumption figures; `Comment` lets a row be re-attributed even if the ledger is lost.
+
+The two copies fail differently and that is the point: the ledger can be corrupted or
+deleted, and Slurm's copy survives it; slurmdbd purges on a site-set schedule, and the
+ledger survives that. Neither alone is a durable record of who used the allocation.
 
 ### 18.3 Per-user calculations roots
 

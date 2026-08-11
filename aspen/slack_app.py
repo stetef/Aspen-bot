@@ -384,12 +384,34 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
             tools_used.append(tool_name)
             progress.update(tool_name, tool_input)
 
+        # Time to the agent's first words. A long turn is mostly tool work, so
+        # this is the number that moves when the agent starts narrating, while
+        # latency_ms (time to the answer) barely changes.
+        first_output: list[int] = []
+
+        def _stamp_first_output() -> None:
+            if not first_output:
+                first_output.append(int((time.monotonic() - started) * 1000))
+
+        def _on_interim(text: str) -> None:
+            """Post what the agent said before acting, as its own message.
+
+            Called from the agent loop, so it must not block: one Slack post,
+            no waiting. Failures propagate to the SDK side, which logs and
+            carries on — an unsent aside never costs the answer.
+            """
+            _stamp_first_output()
+            say(thread_ts=thread_ts, **render.slack_reply(text))
+
         key     = sessions._thread_key(event)
         # ``on_progress`` lets the agent report each tool call mid-turn, so the
-        # indicator tracks the actual work instead of a static "is typing…".
+        # indicator tracks the actual work instead of a static "is typing…";
+        # ``on_interim`` carries the agent's own words out while it works.
         context = {"user_id": uid, "username": registry.display_name(uid),
                    "thread_ts": thread_ts or "",
                    "attachments": [], "on_progress": _on_progress}
+        if config.INTERIM_UPDATES:
+            context["on_interim"] = _on_interim
 
         # Who is speaking, and what workflows exist, must ride on the *message*:
         # a session is keyed per thread and pre-warmed before the speaker is
@@ -420,16 +442,23 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
         finally:
             progress.stop()
 
+        if reply:
+            _stamp_first_output()
+
         # Recorded before the reply is posted, so the latency measured is the
         # agent's — the number worth optimizing — and a failing say() can't cost
         # us the record of a turn that actually ran.
         _record(outcome, text=user_message, tools=tools_used,
+                first_output_ms=first_output[0] if first_output else None,
                 reply_chars=len(reply or ""), attachments=len(atts),
                 meta=context.get("result_meta"))
 
-        # Slack's text field speaks mrkdwn, not the GFM the agent emits; send the
-        # reply through a markdown block so Slack renders it (render.slack_reply).
-        say(thread_ts=thread_ts, **render.slack_reply(reply))
+        # An empty reply means the agent already said everything as it worked
+        # (see agent._format_result_reply) — posting "" would be a blank message.
+        if reply.strip():
+            # Slack's text field speaks mrkdwn, not the GFM the agent emits; send
+            # the reply through a markdown block so Slack renders it.
+            say(thread_ts=thread_ts, **render.slack_reply(reply))
 
         if atts:
             attachments._upload_attachments(atts, client, channel, thread_ts)

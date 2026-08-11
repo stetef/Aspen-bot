@@ -412,3 +412,158 @@ def test_subscription_auth_blanks_api_key_for_cli(sut, monkeypatch):
     # API-key mode: don't touch the subprocess env (CLI inherits ANTHROPIC_API_KEY).
     monkeypatch.setattr(config, "ASPEN_SDK_USE_SUBSCRIPTION", False)
     assert s._build_options(sdk).env == {}
+
+
+# --------------------------------------------------------------------------- #
+# Interim commentary — the agent's words reach the thread while it works
+# --------------------------------------------------------------------------- #
+def _narrating_messages(prompt):
+    """Says something, calls a tool, then answers — the shape of a real turn."""
+    return [
+        sdk.AssistantMessage(
+            content=[
+                sdk.TextBlock(text="Let me check the queue first."),
+                sdk.ToolUseBlock(id="t1", name="Bash", input={"command": "squeue"}),
+            ],
+            model="m",
+        ),
+        sdk.AssistantMessage(content=[sdk.TextBlock(text="12 jobs running.")], model="m"),
+        _result("success"),
+    ]
+
+
+def _narrate_only_messages(prompt):
+    """Narrates, acts, and ends with nothing further to add."""
+    return [
+        sdk.AssistantMessage(
+            content=[
+                sdk.TextBlock(text="Cancelling the stuck job."),
+                sdk.ToolUseBlock(id="t1", name="Bash", input={"command": "squeue"}),
+            ],
+            model="m",
+        ),
+        _result("success"),
+    ]
+
+
+def test_text_before_a_tool_call_is_handed_over_immediately(sut):
+    """The point of the feature: narration arrives while the work happens, and
+    is not repeated in the answer minutes later."""
+    from aspen.agent import SdkSession
+
+    FakeClient.responder = staticmethod(_narrating_messages)
+    said: list[str] = []
+    reply, _ = asyncio.run(SdkSession("C:1").send(
+        "how many jobs?", {"attachments": [], "on_interim": said.append}))
+
+    assert said == ["Let me check the queue first."]
+    assert reply == "12 jobs running."          # narration not duplicated here
+
+
+def test_without_an_interim_sink_every_word_lands_in_the_reply(sut):
+    """Unconfigured, the turn behaves exactly as it did before — nothing is lost."""
+    from aspen.agent import SdkSession
+
+    FakeClient.responder = staticmethod(_narrating_messages)
+    reply, _ = asyncio.run(SdkSession("C:1").send("how many jobs?", {"attachments": []}))
+
+    assert "Let me check the queue first." in reply
+    assert "12 jobs running." in reply
+
+
+def test_a_turn_that_only_narrates_ends_quietly(sut):
+    """Everything was already said, so the reply is empty rather than the
+    '(no text response)' placeholder — the front-end posts nothing more."""
+    from aspen.agent import SdkSession
+
+    FakeClient.responder = staticmethod(_narrate_only_messages)
+    said: list[str] = []
+    reply, _ = asyncio.run(SdkSession("C:1").send(
+        "cancel it", {"attachments": [], "on_interim": said.append}))
+
+    assert said == ["Cancelling the stuck job."]
+    assert reply == ""
+
+
+def test_a_silent_turn_still_says_something(sut):
+    """With no narration and no answer, the placeholder is still the right reply."""
+    from aspen.agent import SdkSession
+
+    FakeClient.responder = staticmethod(lambda p: [_result("success")])
+    reply, _ = asyncio.run(SdkSession("C:1").send(
+        "hi", {"attachments": [], "on_interim": lambda t: None}))
+
+    assert reply == "(no text response)"
+
+
+def test_a_failing_interim_sink_never_costs_the_turn(sut):
+    from aspen.agent import SdkSession
+
+    def _boom(_text):
+        raise RuntimeError("slack is down")
+
+    FakeClient.responder = staticmethod(_narrating_messages)
+    reply, _ = asyncio.run(SdkSession("C:1").send(
+        "how many jobs?", {"attachments": [], "on_interim": _boom}))
+
+    assert reply == "12 jobs running."          # the answer still lands
+
+
+# --------------------------------------------------------------------------- #
+# Quota meter and the timing split
+# --------------------------------------------------------------------------- #
+def test_rate_limit_event_is_captured_instead_of_discarded(sut):
+    """Under a subscription seat this meter is the closest thing to a spend
+    signal, and it arrives on the same stream as everything else."""
+    from aspen.agent import SdkSession
+
+    def _quota_messages(prompt):
+        return [
+            sdk.RateLimitEvent(
+                rate_limit_info=sdk.RateLimitInfo(
+                    status="allowed_warning", utilization=0.82,
+                    resets_at=1800000000, rate_limit_type="five_hour",
+                ),
+                uuid="u", session_id="s",
+            ),
+            sdk.AssistantMessage(content=[sdk.TextBlock(text="ok")], model="m"),
+            _result("success"),
+        ]
+
+    FakeClient.responder = staticmethod(_quota_messages)
+    context = {"attachments": []}
+    asyncio.run(SdkSession("C:1").send("hi", context))
+
+    meta = context["result_meta"]
+    assert meta["quota_utilization"] == 0.82
+    assert meta["quota_status"] == "allowed_warning"
+    assert meta["quota_resets_at"] == 1800000000
+    assert meta["quota_type"] == "five_hour"
+
+
+def test_a_turn_without_a_quota_event_carries_no_quota_fields(sut):
+    """The CLI emits the meter only on a state change, so most turns have none —
+    absent, not zero, so the dashboard can forward-fill instead of seeing a drop."""
+    from aspen.agent import SdkSession
+
+    context = {"attachments": []}
+    asyncio.run(SdkSession("C:1").send("hi", context))
+
+    assert not any(k.startswith("quota_") for k in context["result_meta"])
+
+
+def test_result_meta_carries_the_timing_split(sut):
+    """total vs API time is what separates our overhead from model time."""
+    from aspen.agent import SdkSession
+
+    FakeClient.responder = staticmethod(
+        lambda p: [sdk.ResultMessage(
+            subtype="success", duration_ms=9000, duration_api_ms=4000,
+            is_error=False, num_turns=3, session_id="s",
+        )]
+    )
+    context = {"attachments": []}
+    asyncio.run(SdkSession("C:1").send("hi", context))
+
+    assert context["result_meta"]["agent_ms"] == 9000
+    assert context["result_meta"]["api_ms"] == 4000
