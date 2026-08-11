@@ -165,6 +165,14 @@ def _normalize(raw: dict) -> dict:
                 "removed": str(entry.get("removed") or ""),
                 "removed_by": str(entry.get("removed_by") or ""),
                 "notes": str(entry.get("notes") or ""),
+                # Where this person's calculations live. Empty = the shared
+                # CALCULATIONS_ROOT default, which is what makes a deployment
+                # that never sets one behave exactly as it did before. Validated
+                # by `aspen-users set-root`; see roots.py.
+                "calc_root": str(entry.get("calc_root") or ""),
+                # Their Unix account on the cluster. A Slack ID does not name
+                # one, and job submission on someone's behalf needs it.
+                "unix_user": str(entry.get("unix_user") or ""),
             }
         )
     return {"version": int(raw.get("version", 1) or 1), "source": "file", "users": users}
@@ -315,7 +323,8 @@ def save(users_list: list[dict]) -> None:
 
 
 def new_user(uid: str, alias: str, display: str, role: str = "member",
-             added_by: str = "", notes: str = "") -> dict:
+             added_by: str = "", notes: str = "", calc_root: str = "",
+             unix_user: str = "") -> dict:
     return {
         "slack_user_id": uid,
         "alias": alias,
@@ -327,4 +336,6 @@ def new_user(uid: str, alias: str, display: str, role: str = "member",
         "removed": "",
         "removed_by": "",
         "notes": notes,
+        "calc_root": calc_root,
+        "unix_user": unix_user,
     }

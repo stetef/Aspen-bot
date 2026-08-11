@@ -28,6 +28,27 @@ SLACK_APP_TOKEN     = os.environ["SLACK_APP_TOKEN"]
 CALCULATIONS_ROOT     = Path(os.environ["CALCULATIONS_ROOT"]).resolve()
 MODEL                 = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
 
+
+def _named_paths(name: str) -> dict:
+    """``"smb=/data/smb,legacy=/data/old"`` -> ``{"smb": "/data/smb", ...}``."""
+    out = {}
+    for item in os.getenv(name, "").split(","):
+        label, sep, path = item.partition("=")
+        label, path = label.strip().lower(), path.strip()
+        if not sep or not label or not path:
+            if item.strip():
+                log.warning("%s: ignoring %r — expected name=/absolute/path", name, item)
+            continue
+        out[label] = path
+    return out
+
+
+# Calculations roots that belong to nobody in particular — group project data.
+# Per-user roots live on the registry record (`calc_root`); CALCULATIONS_ROOT
+# above is the fallback for anyone without one, which is what keeps a
+# single-root deployment behaving exactly as it did. See roots.py.
+SHARED_CALC_ROOTS     = _named_paths("ASPEN_SHARED_CALC_ROOTS")
+
 # ---------------------------------------------------------------------------
 # Users and per-user workflows
 #
@@ -48,6 +69,18 @@ USERS_FILE            = Path(os.getenv("ASPEN_USERS_FILE", str(STATE_DIR / "user
 WORKFLOWS_ROOT        = Path(os.getenv("ASPEN_WORKFLOWS_ROOT", str(STATE_DIR / "workflows"))).resolve()
 # Cap on a single workflow file (they are prose, not data).
 MAX_WORKFLOW_BYTES    = int(os.getenv("ASPEN_MAX_WORKFLOW_BYTES", "60000"))
+# Project metadata, mirroring each root's layout:
+#   <root>/<alias>__<slack-id>/<project>/metadata.md
+# It lives HERE rather than under WORKSPACE_ROOT for the reason the registry
+# does, and one more: metadata is read back into the model's context on later
+# turns, so metadata in a sandbox-writable area is a slow-loop injection path —
+# generated analysis code edits a note that steers a future session. The line to
+# hold is: WORKSPACE_ROOT is what the sandbox produces, STATE_DIR is what steers
+# the agent. See metadata.py.
+METADATA_ROOT         = Path(os.getenv("ASPEN_METADATA_ROOT", str(STATE_DIR / "metadata"))).resolve()
+METADATA_HISTORY_ROOT = Path(
+    os.getenv("ASPEN_METADATA_HISTORY_ROOT", str(STATE_DIR / "metadata_history"))
+).resolve()
 # Bootstrap allowlist, used only until USERS_FILE exists (fresh install) or if it
 # can't be parsed and nothing good was ever cached. The registry is the real
 # source of truth; this is the operator-controlled floor that prevents lockout.
@@ -67,6 +100,11 @@ MAX_ATTACHMENT_BYTES  = int(os.getenv("MAX_ATTACHMENT_BYTES", str(25 * 1024 * 10
 SEARCH_MAX_FILES      = int(os.getenv("ASPEN_SEARCH_MAX_FILES", "3000"))
 SEARCH_MAX_MATCHES    = int(os.getenv("ASPEN_SEARCH_MAX_MATCHES", "200"))
 SEARCH_MAX_FILE_BYTES = int(os.getenv("ASPEN_SEARCH_MAX_FILE_BYTES", str(2 * 1024 * 1024)))
+# A cross-root sweep (search_files everyone=true) needs its own budget: the cap
+# above was sized for one tree, and N roots multiply the work. Shared across
+# roots, so a sweep is bounded however many people are registered — and the tool
+# reports which roots it could not reach rather than reading as complete.
+SEARCH_MAX_FILES_ALL  = int(os.getenv("ASPEN_SEARCH_MAX_FILES_ALL", str(4 * SEARCH_MAX_FILES)))
 
 # Tool server (only needed when run_python_analysis is used)
 AGENT_INTERNAL_SECRET = os.getenv("AGENT_INTERNAL_SECRET", "")

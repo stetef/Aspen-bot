@@ -43,7 +43,7 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
-from . import config, registry, telemetry, workflows
+from . import config, registry, roots, telemetry, workflows
 
 
 def _err(msg: str) -> int:
@@ -148,6 +148,8 @@ def cmd_list(args) -> int:
             flags.append(u["status"])
         if workflows.has_workflow(uid):
             flags.append("workflow")
+        if u.get("calc_root"):
+            flags.append("root")
         rows.append((u["alias"], uid, u["display_name"], ", ".join(flags) or "-"))
 
     widths = [max(len(r[i]) for r in [("ALIAS", "SLACK ID", "NAME", "FLAGS")] + rows)
@@ -429,15 +431,93 @@ def cmd_telemetry_prune(args) -> int:
     return 0
 
 
+def cmd_set_root(args) -> int:
+    """Point a user at their own calculations tree.
+
+    Validation happens *here*, at write time, rather than only at startup: a bad
+    root typed at the keyboard should fail with a message in front of the person
+    who can fix it, not surface later as a confusing tool error in someone's
+    Slack thread. The check runs as the bot's own Unix user, since that is the
+    identity that will do the reading.
+    """
+    _migrate_bootstrap()
+    user = registry.resolve(args.who, include_removed=False)
+    if user is None:
+        return _err(f"no active user matches '{args.who}'")
+    uid = user["slack_user_id"]
+
+    if args.clear:
+        new_root = ""
+    else:
+        if not args.path:
+            return _err("give a path, or pass --clear to fall back to the default")
+        problem = roots.validate(args.path, for_uid=uid)
+        if problem:
+            return _err(problem)
+        new_root = str(Path(args.path).expanduser().resolve())
+
+    users = [dict(u, calc_root=new_root, **({"unix_user": args.unix_user} if args.unix_user else {}))
+             if u["slack_user_id"] == uid else u
+             for u in registry.users(include_removed=True)]
+    registry.save(users)
+
+    if new_root:
+        print(f"{user['display_name']} (@{user['alias']}) now reads from {new_root}")
+    else:
+        print(f"{user['display_name']} (@{user['alias']}) falls back to the shared "
+              f"default: {config.CALCULATIONS_ROOT}")
+    if args.unix_user:
+        print(f"Unix account recorded as {args.unix_user}")
+    print("Takes effect on their next message — no restart needed.")
+    return 0
+
+
+def cmd_roots(args) -> int:
+    """Every root Aspen can read, and whether it is actually readable."""
+    scopes = roots.scopes()
+    rows = []
+    for scope in scopes:
+        path = scope["path"]
+        if not path.is_dir():
+            state = "MISSING"
+        elif not os.access(path, os.R_OK | os.X_OK):
+            state = "UNREADABLE"
+        elif path == config.CALCULATIONS_ROOT and scope["kind"] == "user":
+            state = "default"
+        else:
+            state = "ok"
+        rows.append((f"@{scope['name']}", scope["kind"], state, str(path)))
+
+    header = ("ROOT", "KIND", "STATE", "PATH")
+    widths = [max(len(r[i]) for r in [header] + rows) for i in range(3)]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths) + "  {}"
+    print(fmt.format(*header))
+    for row in rows:
+        print(fmt.format(*row))
+
+    problems = roots.check_all()
+    if problems:
+        print("\nProblems (Aspen will refuse to start):")
+        for p in problems:
+            print(f"  {p}")
+    else:
+        print(f"\n{len(rows)} root(s), all readable by {getpass.getuser()}.")
+    print(f"Default for anyone without their own: {config.CALCULATIONS_ROOT}")
+    return 0
+
+
 def cmd_whois(args) -> int:
     user = registry.resolve(args.who)
     if user is None:
         return _err(f"no user matches '{args.who}'")
     uid = user["slack_user_id"]
     for field in ("slack_user_id", "alias", "display_name", "role", "status",
-                  "added", "added_by", "removed", "removed_by", "notes"):
+                  "added", "added_by", "removed", "removed_by", "notes", "unix_user"):
         if user.get(field):
             print(f"{field:<15} {user[field]}")
+    root = roots.for_user(uid)
+    suffix = "" if user.get("calc_root") else "  (shared default)"
+    print(f"{'calculations':<15} {root}{suffix}")
     directory = workflows.dir_for(uid, include_archived=True)
     print(f"{'workflow':<15} {directory or '(none)'}")
     if uid == config.ADMIN_USER_ID:
@@ -740,6 +820,27 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("whois", help="show one user's registry entry")
     s.add_argument("who", help="alias or Slack ID")
     s.set_defaults(func=cmd_whois)
+
+    # --- calculations roots -------------------------------------------------- #
+    # Who reads from where. Everyone may READ every root — this sets whose files
+    # an unqualified path means, and where their own work lives. See aspen/roots.py.
+    s = sub.add_parser(
+        "set-root",
+        help="point a user at their own calculations directory",
+        description="Set (or clear) where one user's calculations live. Validated "
+                    "here so a bad path fails in front of you rather than in "
+                    "somebody's Slack thread.",
+    )
+    s.add_argument("who", help="alias or Slack ID")
+    s.add_argument("path", nargs="?", default="", help="absolute path to their calculations tree")
+    s.add_argument("--clear", action="store_true",
+                   help="unset it — they fall back to the shared CALCULATIONS_ROOT")
+    s.add_argument("--unix-user", default="",
+                   help="their cluster account (a Slack ID doesn't name one)")
+    s.set_defaults(func=cmd_set_root)
+
+    s = sub.add_parser("roots", help="list every calculations root and its state")
+    s.set_defaults(func=cmd_roots)
 
     # --- workflows ---------------------------------------------------------- #
     # Filing on someone's behalf, for when they hand you a document instead of

@@ -36,7 +36,7 @@ from typing import Optional
 
 import yaml
 
-from . import config, registry
+from . import config, registry, roots
 
 log = logging.getLogger("aspen")
 
@@ -235,6 +235,10 @@ def turn_preamble(uid: str) -> str:
         f"The person speaking to you right now is {user['display_name']} "
         f"(alias `{user['alias']}`, Slack ID {uid})."
     )
+    # Which calculations trees exist. Without this the model cannot discover that
+    # anyone else's files are reachable at all, since every tool takes a name
+    # rather than a path (roots.py).
+    lines.extend(roots.preamble_lines(uid))
     entries = index()
     own = [e for e in entries if e["owner_id"] == uid]
     if own:

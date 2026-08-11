@@ -36,6 +36,10 @@ _MODMAP = {
     "WORKFLOWS_ROOT": "aspen.config",
     "STATE_DIR": "aspen.config",
     "MAX_WORKFLOW_BYTES": "aspen.config",
+    "METADATA_ROOT": "aspen.config",
+    "METADATA_HISTORY_ROOT": "aspen.config",
+    "SHARED_CALC_ROOTS": "aspen.config",
+    "SEARCH_MAX_FILES_ALL": "aspen.config",
     "BOOTSTRAP_USER_IDS": "aspen.config",
     "ADMIN_OVERRIDE": "aspen.config",
     # prompts
@@ -68,6 +72,11 @@ _MODMAP = {
     # user registry
     "registry": "aspen",
     "workflows": "aspen",
+    "roots": "aspen",
+    "metadata": "aspen",
+    "_read_metadata": "aspen.tools",
+    "tools": "aspen",
+    "_scoped": "aspen.tools",
     "_check_state_locations": "aspen.main",
     # turn telemetry
     "telemetry": "aspen",

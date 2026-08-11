@@ -7,7 +7,7 @@ from pathlib import Path
 
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from . import config, registry, sessions, slack_app, telemetry
+from . import config, registry, roots, sessions, slack_app, telemetry
 
 log = logging.getLogger("aspen")
 
@@ -34,6 +34,8 @@ def _check_state_locations() -> None:
     danger = [config.WORKSPACE_ROOT] + [Path(p).expanduser() for p in config.SANDBOX_WRITE_PATHS]
     for label, target in (("registry", config.USERS_FILE),
                           ("workflows root", config.WORKFLOWS_ROOT),
+                          ("metadata root", config.METADATA_ROOT),
+                          ("metadata history", config.METADATA_HISTORY_ROOT),
                           ("telemetry log", config.TELEMETRY_DIR),
                           ("telemetry switch", config.TELEMETRY_STATE_FILE)):
         for area in danger:
@@ -52,6 +54,8 @@ def _check_state_locations() -> None:
     registry.ensure_private_dir(config.WORKFLOWS_ROOT)
     if config.TELEMETRY_ENABLED:
         registry.ensure_private_dir(config.TELEMETRY_DIR)
+
+    _check_calculations_roots()
 
     users = registry.users()
     if not users:
@@ -81,6 +85,43 @@ def _check_state_locations() -> None:
         if tele["excluded_users"]:
             detail += f"; {len(tele['excluded_users'])} user(s) excluded from text"
         log.info("Telemetry: %s -> %s", detail, config.TELEMETRY_DIR)
+
+
+def _check_calculations_roots() -> None:
+    """Report the configured roots, and refuse to start on a broken one.
+
+    Two failures matter enough to be fatal rather than a turn-time surprise:
+
+    * **Nesting.** ``roots.resolve`` fences a path by containment, so a root
+      inside another root does not bound anything — one person's fence would
+      silently enclose someone else's tree.
+    * **Unreadable.** A root the operator can see but the bot's own account
+      cannot is a root that fails on somebody's question instead of at boot.
+      This is the check that will bite at the §18.1 service-account cutover,
+      which is exactly when it should.
+    """
+    problems = roots.check_all()
+    if problems:
+        raise SystemExit(
+            "FATAL: calculations roots are misconfigured:\n  "
+            + "\n  ".join(problems)
+            + "\n\nFix them with `aspen-users set-root <who> <path>` (or "
+              "ASPEN_SHARED_CALC_ROOTS in .env). Roots must exist, be readable by "
+              "the account Aspen runs as, and never contain one another."
+        )
+
+    scopes = roots.scopes()
+    personal = [s for s in scopes if s["kind"] == "user" and s["path"] != config.CALCULATIONS_ROOT]
+    shared = [s for s in scopes if s["kind"] == "shared"]
+    if not personal and not shared:
+        log.info("Calculations: one root for everyone — %s", config.CALCULATIONS_ROOT)
+    else:
+        log.info(
+            "Calculations: %d personal root(s), %d shared, default %s",
+            len(personal), len(shared), config.CALCULATIONS_ROOT,
+        )
+        for scope in personal + shared:
+            log.info("  @%-20s %s", scope["name"], scope["path"])
 
 
 def _warm_sdk_import() -> None:

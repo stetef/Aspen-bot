@@ -103,6 +103,8 @@ adds or removes a user, so no message — however phrased — can widen the allo
 | `sync` | `--apply` | Dry run by default: reports display-name changes and aliases that no longer match. |
 | `whois` | `<alias\|id>` | Registry entry plus the workflow path. |
 | `workflow` | `import`, `describe`, `list`, `show` | File and maintain workflow documents on someone's behalf — see [Per-user workflows](#per-user-workflows). |
+| `set-root` | `<alias\|id>` `<path>` `--clear` `--unix-user` | Point someone at their own calculations tree — see [Whose calculations](#whose-calculations). Validated when you set it. |
+| `roots` | — | Every calculations root and whether it is actually readable. |
 | `telemetry` | `status`, `on`, `off`, `content on\|off`, `exclude`, `include`, `prune` | What Aspen records about how it's used — see [What Aspen records](#what-aspen-records-aspen-users-telemetry). |
 
 Global: `--by <name>` records who made the change in `added_by`/`removed_by` (defaults to
@@ -112,6 +114,37 @@ Until `users.json` exists, the allowlist falls back to `ASPEN_ALLOWED_SLACK_USER
 `.env` — that bootstrap is what keeps a fresh install (or a corrupt registry) from locking
 the admin out. The first write migrates those IDs into the registry (announced, with names
 resolved from Slack) and the registry takes over; nobody loses access in the process.
+
+## Whose calculations
+
+Each person can have their own calculations tree, and there can be any number of **shared**
+trees for group project data. Anyone without their own reads from `CALCULATIONS_ROOT`, so
+until you set a single root, nothing changes.
+
+```bash
+./aspen-users roots                                  # every root, and is it readable?
+./aspen-users set-root arun /sdf/home/a/arun/calcs   # give someone their own
+./aspen-users set-root arun --clear                  # back to the shared default
+./aspen-users whois arun                             # shows which root they read from
+```
+
+Shared trees are named in `.env`: `ASPEN_SHARED_CALC_ROOTS=smb=/data/smb-shared`.
+
+**Everyone may read everyone.** That mirrors the shared filesystem, where the files are
+already world-readable — so asking "how did Arun set up that geometry optimisation?" or
+"who else has run this?" just works. What ownership decides is whose files an unqualified
+path means, and who may write. In Slack, Aspen reads your own tree by default and reaches
+someone else's by name (`@arun/dft/orca.out`), and it says whose files an answer came from.
+
+**Aspen writes nothing into any calculations tree** — not yours, not anyone's. Its one
+write is its own project notes, which live in `$ASPEN_STATE_DIR/metadata/`, mirroring each
+root's layout. Notes on your own and on shared projects are yours to change; a colleague's
+are readable but theirs.
+
+`set-root` validates when you type it: the path must exist, be readable **by the account
+Aspen runs as**, and never contain (or sit inside) another root — containment is how the
+security fence works, so a nested root would silently enclose someone else's files. Aspen
+re-checks at startup and refuses to boot if a root has since gone missing or unreadable.
 
 ## Per-user workflows
 

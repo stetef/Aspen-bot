@@ -48,6 +48,29 @@ CACHE_DIR             = WORKSPACE_ROOT / "cache"
 LOGS_DIR              = WORKSPACE_ROOT / "logs"
 GENERATED_CODE_DIR    = WORKSPACE_ROOT / "generated_code"
 
+# --- Per-user calculations roots -------------------------------------------
+# PROJECTS_ROOT above is the default; each registered user may have their own
+# (`calc_root` in the registry) and there may be shared group roots. The registry
+# is read DIRECTLY here rather than importing the aspen package: this process
+# deliberately has no Slack/model configuration, and it must resolve the root
+# itself so the caller can never pass one over the socket. Only a user_id crosses
+# that boundary; the mapping user -> root is ours.
+_STATE_DIR            = Path(os.getenv("ASPEN_STATE_DIR", str(Path.home() / ".aspen")))
+USERS_FILE            = Path(os.getenv("ASPEN_USERS_FILE", str(_STATE_DIR / "users.json")))
+METADATA_ROOT         = Path(os.getenv("ASPEN_METADATA_ROOT", str(_STATE_DIR / "metadata"))).resolve()
+
+
+def _shared_roots() -> dict:
+    out = {}
+    for item in os.getenv("ASPEN_SHARED_CALC_ROOTS", "").split(","):
+        label, sep, path = item.partition("=")
+        if sep and label.strip() and path.strip():
+            out[label.strip().lower()] = Path(path.strip()).resolve()
+    return out
+
+
+SHARED_CALC_ROOTS     = _shared_roots()
+
 MAX_STDOUT_CHARS      = int(os.getenv("MAX_STDOUT_CHARS", "10000"))
 MAX_STDERR_CHARS      = int(os.getenv("MAX_STDERR_CHARS", "2000"))
 MAX_FIGURE_BYTES      = int(os.getenv("MAX_FIGURE_BYTES", str(5 * 1024 * 1024)))
@@ -211,14 +234,59 @@ def _require_secret(x_agent_secret: str = Header(..., alias="x-agent-secret")) -
 # ---------------------------------------------------------------------------
 # Path validation
 # ---------------------------------------------------------------------------
-def _safe_project_path(project_name: str) -> Path:
-    """
-    Resolve project_name against PROJECTS_ROOT and confirm it doesn't escape
-    via '..' or symlinks. Raises HTTPException(400) if invalid.
-    """
+@functools.lru_cache(maxsize=8)
+def _registry_users(stamp: tuple) -> list:
+    """Parsed registry entries, re-read when the file changes (stamp is the key)."""
     try:
-        resolved = (PROJECTS_ROOT / project_name).resolve()
-        resolved.relative_to(PROJECTS_ROOT)  # raises ValueError if outside
+        raw = json.loads(USERS_FILE.read_text())
+    except (OSError, ValueError):
+        return []
+    return [u for u in (raw.get("users") or []) if isinstance(u, dict)]
+
+
+def _users() -> list:
+    try:
+        st = USERS_FILE.stat()
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return []
+    return _registry_users(stamp)
+
+
+def resolve_scope(user_id: str, owner: str = "") -> tuple[Path, str]:
+    """(root, scope-directory-name) for a request, resolved from the registry.
+
+    ``owner`` is a *name* (alias / Slack ID / shared root), never a path — the
+    agent cannot hand this process a directory to mount. An unknown or empty
+    owner falls back to the caller's own root, and a caller we don't know falls
+    back to PROJECTS_ROOT, which is exactly the single-root behavior.
+    """
+    token = (owner or "").strip().lstrip("@").lower()
+    if token and token in SHARED_CALC_ROOTS:
+        return SHARED_CALC_ROOTS[token], f"_shared__{token}"
+
+    users = _users()
+    wanted = token or (user_id or "").strip()
+    for entry in users:
+        uid = str(entry.get("slack_user_id", ""))
+        alias = str(entry.get("alias", "")).lower()
+        if wanted and wanted not in (uid, uid.lower(), alias):
+            continue
+        declared = str(entry.get("calc_root") or "").strip()
+        root = Path(declared).resolve() if declared else PROJECTS_ROOT
+        return root, f"{alias}__{uid}"
+    return PROJECTS_ROOT, ""
+
+
+def _safe_project_path(project_name: str, root: Optional[Path] = None) -> Path:
+    """
+    Resolve project_name against ``root`` (the caller's calculations root) and
+    confirm it doesn't escape via '..' or symlinks. Raises HTTPException(400).
+    """
+    base = (root or PROJECTS_ROOT).resolve()
+    try:
+        resolved = (base / project_name).resolve()
+        resolved.relative_to(base)  # raises ValueError if outside
     except (ValueError, OSError):
         raise HTTPException(status_code=400, detail=f"Invalid project name: {project_name!r}")
     if not resolved.is_dir():
@@ -291,11 +359,33 @@ def _parse_markdown_metadata(text: str, project_name: str) -> dict:
     return {"name": project_name, "allowed_libraries": libs, "description": text}
 
 
-def load_metadata(project_path: Path) -> dict:
+def _sidecar_metadata(scope_dir: str, project_name: str) -> Optional[Path]:
+    """Aspen's own metadata for a project, kept outside the calculations tree.
+
+    This is where metadata lives now (see aspen/metadata.py); the in-tree files
+    below are the pre-migration fallback, still readable so an existing project
+    keeps working until its notes are moved.
     """
-    Load project metadata. Prefers metadata.md (natural-language markdown); falls
-    back to metadata.toml / metadata.yaml. Raises HTTPException(422) if none found.
+    if not scope_dir:
+        return None
+    try:
+        candidate = (METADATA_ROOT / scope_dir / project_name / "metadata.md").resolve()
+        candidate.relative_to(METADATA_ROOT)
+    except (ValueError, OSError):
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def load_metadata(project_path: Path, scope_dir: str = "") -> dict:
     """
+    Load project metadata. Prefers Aspen's sidecar, then in-tree metadata.md
+    (natural-language markdown), then metadata.toml / metadata.yaml. Raises
+    HTTPException(422) if none found.
+    """
+    sidecar = _sidecar_metadata(scope_dir, project_path.name)
+    if sidecar is not None:
+        return _parse_markdown_metadata(sidecar.read_text(), project_path.name)
+
     md_path = project_path / "metadata.md"
     toml_path = project_path / "metadata.toml"
     yaml_path = project_path / "metadata.yaml"
@@ -698,6 +788,10 @@ class AnalysisRequest(BaseModel):
     user_id: str = ""
     username: str = ""
     thread_ts: str = ""
+    # Whose calculations to read: an alias / Slack ID / shared-root NAME, never a
+    # path. resolve_scope turns it into a directory; an unknown name simply falls
+    # back to the caller's own root.
+    owner: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -719,11 +813,12 @@ def run_python_analysis(
     except Exception:
         log.exception("Figure archive cleanup failed (non-fatal)")
 
-    # Validate project path
-    project_path = _safe_project_path(project_name)
+    # Whose calculations — resolved HERE from the registry, never taken as a path.
+    root, scope_dir = resolve_scope(req.user_id, req.owner)
+    project_path = _safe_project_path(project_name, root)
 
-    # Load and validate metadata
-    metadata = load_metadata(project_path)
+    # Load and validate metadata (Aspen's sidecar first, then in-tree legacy)
+    metadata = load_metadata(project_path, scope_dir)
     allowed_libs = _validate_metadata(metadata)
 
     # Validate inputs

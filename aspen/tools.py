@@ -21,7 +21,7 @@ from typing import Optional
 
 import httpx
 
-from . import config, workflows
+from . import config, metadata, roots, workflows
 
 log = logging.getLogger("aspen")
 
@@ -29,23 +29,27 @@ log = logging.getLogger("aspen")
 # --------------------------------------------------------------------------- #
 # Read-only file tools
 # --------------------------------------------------------------------------- #
-def _safe_path(rel: str) -> Optional[Path]:
+def _scoped(rel: str, owner: str = "", viewer_uid: str = "") -> tuple[Optional[Path], dict, str]:
+    """Resolve a path within the root named by ``owner`` (or the speaker's own).
+
+    All the fencing lives in ``roots.resolve``; this is the seam every file tool
+    goes through. ``owner`` is a *name*, never a path — the registry does
+    name → root on the trusted side, so no wording in a conversation can point a
+    tool at an arbitrary directory.
     """
-    Resolve a relative path against CALCULATIONS_ROOT and confirm it does not
-    escape via symlinks or '..' traversal. Returns None if the path is unsafe.
-    """
-    try:
-        resolved = (config.CALCULATIONS_ROOT / rel).resolve()
-        resolved.relative_to(config.CALCULATIONS_ROOT)  # raises ValueError if outside
-        return resolved
-    except (ValueError, OSError):
-        return None
+    return roots.resolve(rel, owner, viewer_uid)
 
 
-def _list_directory(rel: str) -> str:
-    path = _safe_path(rel)
-    if path is None:
-        return f"Error: '{rel}' is outside the allowed directory."
+def _safe_path(rel: str, owner: str = "", viewer_uid: str = "") -> Optional[Path]:
+    """The resolved absolute path, or None if it is unsafe or unknown."""
+    path, _scope, error = _scoped(rel, owner, viewer_uid)
+    return None if error else path
+
+
+def _list_directory(rel: str, owner: str = "", viewer_uid: str = "") -> str:
+    path, scope, error = _scoped(rel, owner, viewer_uid)
+    if error:
+        return f"Error: '{rel}' is outside the allowed directory." if "outside" in error else error
     if not path.exists():
         return f"Error: '{rel}' does not exist."
     if not path.is_dir():
@@ -54,15 +58,28 @@ def _list_directory(rel: str) -> str:
         entries = sorted(path.iterdir(), key=lambda e: (e.is_file(), e.name))
         lines = [f"{'[dir]' if e.is_dir() else '[file]'} {e.name}" for e in entries]
         header = f"Contents of '{rel}' ({len(entries)} entries):"
-        return header + "\n" + "\n".join(lines) if lines else f"'{rel}' is empty."
+        # Metadata lives outside the tree now, so a listing is the only place a
+        # project's notes can announce themselves.
+        note = metadata.summary_line(_project_of(rel, path, scope), scope)
+        body = header + "\n" + "\n".join(lines) if lines else f"'{rel}' is empty."
+        return f"{body}\n{note}" if note else body
     except PermissionError:
         return f"Error: permission denied for '{rel}'."
 
 
-def _read_file(rel: str) -> str:
-    path = _safe_path(rel)
-    if path is None:
-        return f"Error: '{rel}' is outside the allowed directory."
+def _project_of(rel: str, path: Path, scope: dict) -> str:
+    """The top-level project a listed directory belongs to ('' if it is the root)."""
+    try:
+        parts = path.relative_to(scope["path"]).parts
+    except (ValueError, KeyError):
+        return ""
+    return parts[0] if parts else ""
+
+
+def _read_file(rel: str, owner: str = "", viewer_uid: str = "") -> str:
+    path, _scope, error = _scoped(rel, owner, viewer_uid)
+    if error:
+        return f"Error: '{rel}' is outside the allowed directory." if "outside" in error else error
     if not path.exists():
         return f"Error: '{rel}' does not exist."
     if not path.is_file():
@@ -81,23 +98,23 @@ def _read_file(rel: str) -> str:
 
 
 def _search_files(query: str, rel: str = ".", regex: bool = False,
-                  case_sensitive: bool = False) -> str:
-    """Search file *contents* for ``query`` under the calculations root.
+                  case_sensitive: bool = False, owner: str = "",
+                  viewer_uid: str = "", everyone: bool = False) -> str:
+    """Search file *contents* for ``query`` across one root, or all of them.
 
-    Like grep, but safe by construction: the start path is fenced to
-    CALCULATIONS_ROOT (same ``_safe_path`` check as read_file), the walk does not
-    follow symlinked directories, and every file's real path is re-checked to be
-    inside the root — so it can never read ``~/.ssh``, ``.env``, or anything else
-    outside the tree. Pure in-process; it never shells out. Bounded by the
-    SEARCH_MAX_* caps so a huge tree can't hang or flood the reply.
+    Like grep, but safe by construction: the start path is fenced to the resolved
+    root (same check as read_file), the walk does not follow symlinked
+    directories, and every file's real path is re-checked to be inside that root
+    — so it can never read ``~/.ssh``, ``.env``, or anything else outside the
+    tree. Pure in-process; it never shells out.
+
+    ``everyone`` is the PI's sweep: the same search against every root at once.
+    Scope, not permission — the boundary is flat, so this widens *what is looked
+    at*, never *what may be looked at*. It carries its own budget, since N roots
+    multiply the work the per-call caps were sized for.
     """
     if not query:
         return "Error: search query is empty."
-    base = _safe_path(rel)
-    if base is None:
-        return f"Error: '{rel}' is outside the allowed directory."
-    if not base.exists():
-        return f"Error: '{rel}' does not exist."
 
     flags = 0 if case_sensitive else re.IGNORECASE
     try:
@@ -105,7 +122,84 @@ def _search_files(query: str, rel: str = ".", regex: bool = False,
     except re.error as exc:
         return f"Error: invalid regular expression: {exc}"
 
-    root = config.CALCULATIONS_ROOT
+    if everyone:
+        return _search_every_root(query, pattern, rel, viewer_uid)
+
+    base, scope, error = _scoped(rel, owner, viewer_uid)
+    if error:
+        return f"Error: '{rel}' is outside the allowed directory." if "outside" in error else error
+    if not base.exists():
+        return f"Error: '{rel}' does not exist."
+
+    matches, files_scanned, files_capped, hit_match_cap = _search_one(
+        pattern, base, scope["path"], config.SEARCH_MAX_FILES, qualify_as="",
+    )
+    if not matches:
+        return f"No matches for {query!r} under '{rel}' ({files_scanned} file(s) searched)."
+    out = [f"{len(matches)} match(es) for {query!r} under '{rel}':", *matches]
+    if hit_match_cap:
+        out.append(f"(stopped at the {config.SEARCH_MAX_MATCHES}-match limit — narrow your query)")
+    if files_capped:
+        out.append(f"(stopped after scanning {config.SEARCH_MAX_FILES} files — narrow the path)")
+    return "\n".join(out)
+
+
+def _distinct_scopes() -> list[dict]:
+    """Every root once. Users without a ``calc_root`` share the default one, so
+    the roster can name the same directory several times — scanning it once per
+    user would multiply the work for no extra coverage."""
+    seen, out = set(), []
+    for scope in roots.scopes():
+        key = str(scope["path"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(scope)
+    return out
+
+
+def _search_every_root(query: str, pattern, rel: str, viewer_uid: str) -> str:
+    """The cross-root sweep, with a shared budget and an honest tail."""
+    budget = config.SEARCH_MAX_FILES_ALL
+    matches, scanned_total, skipped = [], 0, []
+    for scope in _distinct_scopes():
+        if budget <= 0:
+            skipped.append(f"{roots.PREFIX}{scope['name']}")
+            continue
+        try:
+            base = (scope["path"] / (rel if rel != "." else "")).resolve()
+            base.relative_to(scope["path"])
+        except (ValueError, OSError):
+            continue
+        if not base.exists():
+            continue                        # a subpath that only some roots have
+        found, scanned, _capped, hit_match_cap = _search_one(
+            pattern, base, scope["path"],
+            min(budget, config.SEARCH_MAX_FILES), qualify_as=scope["name"],
+        )
+        matches.extend(found)
+        scanned_total += scanned
+        budget -= scanned
+        if hit_match_cap or len(matches) >= config.SEARCH_MAX_MATCHES:
+            skipped.extend(
+                f"{roots.PREFIX}{s['name']}" for s in _distinct_scopes()
+                if s["name"] != scope["name"] and f"{roots.PREFIX}{s['name']}" not in skipped
+            )
+            break
+
+    where = "every root" + (f" under '{rel}'" if rel not in (".", "") else "")
+    if not matches:
+        return f"No matches for {query!r} across {where} ({scanned_total} file(s) searched)."
+    out = [f"{len(matches)} match(es) for {query!r} across {where}:", *matches[:config.SEARCH_MAX_MATCHES]]
+    # Never let a truncated sweep read as a complete one.
+    if skipped:
+        out.append(f"(budget spent — these roots were NOT searched: {', '.join(sorted(set(skipped)))})")
+    return "\n".join(out)
+
+
+def _search_one(pattern, base: Path, root: Path, file_budget: int,
+                qualify_as: str = "") -> tuple[list[str], int, bool, bool]:
+    """Walk one root. Returns (matches, files_scanned, files_capped, match_capped)."""
     matches: list[str] = []
     files_scanned = 0
     files_capped = False
@@ -122,7 +216,7 @@ def _search_files(query: str, rel: str = ".", regex: bool = False,
         )
 
     for fpath in candidates:
-        if files_scanned >= config.SEARCH_MAX_FILES:
+        if files_scanned >= file_budget:
             files_capped = True
             break
         try:
@@ -146,37 +240,32 @@ def _search_files(query: str, rel: str = ".", regex: bool = False,
             rel_name = fpath.relative_to(root)
         except ValueError:
             continue
+        shown = roots.qualify(qualify_as, str(rel_name)) if qualify_as else str(rel_name)
         for lineno, line in enumerate(text.splitlines(), 1):
             if pattern.search(line):
                 snippet = line.strip()
                 if len(snippet) > 300:
                     snippet = snippet[:300] + "…"
-                matches.append(f"{rel_name}:{lineno}: {snippet}")
+                matches.append(f"{shown}:{lineno}: {snippet}")
                 if len(matches) >= config.SEARCH_MAX_MATCHES:
                     hit_match_cap = True
                     break
         if hit_match_cap:
             break
 
-    if not matches:
-        return f"No matches for {query!r} under '{rel}' ({files_scanned} file(s) searched)."
-    out = [f"{len(matches)} match(es) for {query!r} under '{rel}':", *matches]
-    if hit_match_cap:
-        out.append(f"(stopped at the {config.SEARCH_MAX_MATCHES}-match limit — narrow your query)")
-    if files_capped:
-        out.append(f"(stopped after scanning {config.SEARCH_MAX_FILES} files — narrow the path)")
-    return "\n".join(out)
+    return matches, files_scanned, files_capped, hit_match_cap
 
 
-def _attach_file(rel: str) -> tuple[str, list[str]]:
-    """Mark a calculations-root file for upload alongside the reply.
+def _attach_file(rel: str, owner: str = "", viewer_uid: str = "") -> tuple[str, list[str]]:
+    """Mark a calculations file for upload alongside the reply.
 
     Returns (confirmation_or_error, [absolute_path]) — the path is drained into
     the per-turn attachment sink by ``dispatch`` and uploaded by the front-end.
     """
-    path = _safe_path(rel)
-    if path is None:
-        return f"Error: '{rel}' is outside the allowed directory.", []
+    path, _scope, error = _scoped(rel, owner, viewer_uid)
+    if error:
+        return (f"Error: '{rel}' is outside the allowed directory."
+                if "outside" in error else error), []
     if not path.exists():
         return f"Error: '{rel}' does not exist.", []
     if not path.is_file():
@@ -192,80 +281,20 @@ def _attach_file(rel: str) -> tuple[str, list[str]]:
     return f"Attached '{rel}' — it will be uploaded with the reply.", [str(path)]
 
 
-def _backup_metadata(target: Path, project: str) -> None:
-    """Snapshot the current metadata.md before it is overwritten, so a careless
-    whole-file replace is recoverable. Best-effort — a backup failure never blocks
-    the write. History lives under the workspace (writable), one timestamped copy
-    per overwrite: ``<workspace>/metadata_history/<project>/<UTC>.md``."""
-    try:
-        hist_dir = config.WORKSPACE_ROOT / "metadata_history" / project
-        hist_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        dest = hist_dir / f"{ts}.md"
-        n = 1
-        while dest.exists():            # multiple overwrites within the same second
-            dest = hist_dir / f"{ts}-{n}.md"
-            n += 1
-        shutil.copy2(target, dest)
-    except Exception:
-        log.exception("metadata backup failed (non-fatal) for project %s", project)
+def _write_metadata(project: str, content: str, owner: str = "",
+                    viewer_uid: str = "") -> str:
+    """Record Aspen's notes about a project — in Aspen's own area, not the tree.
 
-
-def _write_metadata(project: str, content: str) -> str:
-    """Overwrite ``<calculations-root>/<project>/metadata.md`` with ``content``.
-
-    This is the agent's *only* write surface. It is deliberately narrow: the
-    target is always the literal file ``metadata.md`` directly inside an existing
-    top-level project directory under the calculations root — never any other
-    file, never a nested path, never a directory we'd have to create. The project
-    directory must already exist (so the agent can record metadata for any current
-    or future project without this tool ever being able to mint new directories or
-    touch calculation data). Everything else under the calculations root stays
-    read-only.
+    This is still the agent's *only* write surface, and it is narrower than it
+    was: the target is derived entirely from (owner, project) and lands under
+    METADATA_ROOT, so nothing it does can touch a calculations directory at all.
+    See metadata.py for the layout and why it moved.
     """
-    # Reject path tricks early: the project name must be a single component, so a
-    # caller can't smuggle in '..', a nested 'a/b', or an absolute path.
-    if not project or "/" in project or "\\" in project or project in (".", ".."):
-        return f"Error: '{project}' is not a valid project name (use a single project directory name)."
+    return metadata.write(project, owner, content, viewer_uid)
 
-    try:
-        target = (config.CALCULATIONS_ROOT / project / "metadata.md").resolve()
-        target.relative_to(config.CALCULATIONS_ROOT)  # raises if it escapes the root
-    except (ValueError, OSError):
-        return f"Error: '{project}' resolves outside the calculations root."
 
-    # Enforce shape: <root>/<project>/metadata.md and nothing deeper.
-    if target.name != "metadata.md" or target.parent.parent != config.CALCULATIONS_ROOT:
-        return f"Error: refusing to write outside a top-level project's metadata.md (got '{project}')."
-
-    if not target.parent.is_dir():
-        return (
-            f"Error: project '{project}' does not exist under the calculations root. "
-            "metadata.md can only be written inside an existing project directory."
-        )
-
-    data = content.encode("utf-8")
-    if len(data) > config.MAX_FILE_BYTES:
-        return (
-            f"Error: content is {len(data)} bytes, over the "
-            f"{config.MAX_FILE_BYTES}-byte metadata limit. Keep metadata.md concise."
-        )
-
-    existed = target.exists()
-    if existed:
-        _backup_metadata(target, project)   # snapshot the version we're about to clobber
-    try:
-        # Atomic replace so an interrupted write can't leave a half-written file.
-        tmp = target.with_suffix(".md.tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(content)
-        os.replace(tmp, target)
-    except OSError as exc:
-        return f"Error: could not write '{project}/metadata.md': {exc}."
-
-    verb = "Updated" if existed else "Created"
-    rel = target.relative_to(config.CALCULATIONS_ROOT)
-    return f"{verb} {rel} ({len(data)} bytes)."
+def _read_metadata(project: str, owner: str = "", viewer_uid: str = "") -> str:
+    return metadata.read(project, owner, viewer_uid)
 
 
 # --------------------------------------------------------------------------- #
@@ -320,6 +349,9 @@ def _call_tool_server(inp: dict, context: dict) -> tuple[str, list[str]]:
         "user_id":   context.get("user_id", ""),
         "username":  context.get("username", ""),
         "thread_ts": context.get("thread_ts", ""),
+        # A NAME, not a path — the tool server does its own registry lookup, so
+        # nothing here can point the sandbox at an arbitrary directory.
+        "owner":     inp.get("owner", ""),
     }
     timeout = int(os.getenv("EXECUTION_TIMEOUT_SECONDS", "120")) + 10
     try:
@@ -377,48 +409,76 @@ def _call_tool_server(inp: dict, context: dict) -> tuple[str, list[str]]:
 # --------------------------------------------------------------------------- #
 # Tool specs — single source of truth for the agent
 # --------------------------------------------------------------------------- #
+# Reused by every path-taking tool: which root the path is read from.
+_OWNER_PROPERTY = {
+    "type": "string",
+    "description": (
+        "Whose calculations to look in — an alias (e.g. 'arun-asundi'), a Slack "
+        "ID, or the name of a shared root. Empty (the default) means the files "
+        "of the person you are talking to. You may also write the path as "
+        "'@alias/rest/of/path' instead of using this field; do one or the other, "
+        "not both. Everyone may read every root."
+    ),
+}
+
 TOOL_SPECS = [
     {
         "name": "list_directory",
-        "description": "List contents of a directory under the calculations root.",
+        "description": (
+            "List contents of a directory in someone's calculations. Defaults to "
+            "the files of the person you're talking to; pass owner (or an "
+            "'@alias/...' path) to look in someone else's."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
                     "description": (
-                        "Path relative to the calculations root "
+                        "Path relative to that person's calculations root "
                         "(e.g. 'thermolysin/ca-fixed'). Use '.' for the root."
                     ),
-                }
+                },
+                "owner": _OWNER_PROPERTY,
             },
             "required": ["path"],
         },
-        "impl": lambda inp, _ctx: (_list_directory(inp["path"]), []),
+        "impl": lambda inp, ctx: (
+            _list_directory(inp["path"], inp.get("owner", ""), ctx.get("user_id", "")), []
+        ),
     },
     {
         "name": "read_file",
-        "description": "Read the text contents of a file under the calculations root.",
+        "description": (
+            "Read the text contents of a file in someone's calculations. Defaults "
+            "to the speaker's own files; pass owner (or an '@alias/...' path) for "
+            "someone else's."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path relative to the calculations root.",
-                }
+                    "description": "Path relative to that person's calculations root.",
+                },
+                "owner": _OWNER_PROPERTY,
             },
             "required": ["path"],
         },
-        "impl": lambda inp, _ctx: (_read_file(inp["path"]), []),
+        "impl": lambda inp, ctx: (
+            _read_file(inp["path"], inp.get("owner", ""), ctx.get("user_id", "")), []
+        ),
     },
     {
         "name": "search_files",
         "description": (
-            "Search file CONTENTS for a string or regex under the calculations root "
-            "— like grep, but safely confined to the calculations root. Returns "
-            "matching files with line numbers and the matching line. Use it to find "
-            "where a value, keyword, or setting appears across runs and logs. The "
-            "path is relative to the calculations root (default '.' = the whole tree)."
+            "Search file CONTENTS for a string or regex — like grep, but safely "
+            "confined to the calculations roots. Returns matching files with line "
+            "numbers and the matching line. Use it to find where a value, keyword, "
+            "or setting appears across runs and logs. Searches the speaker's own "
+            "files by default; pass owner for one colleague's, or everyone=true to "
+            "sweep every root at once (paths then come back '@alias/...' so you can "
+            "see whose they are)."
         ),
         "input_schema": {
             "type": "object",
@@ -429,7 +489,7 @@ TOOL_SPECS = [
                 },
                 "path": {
                     "type": "string",
-                    "description": "Subdirectory or file under the calculations root to search. Default '.'",
+                    "description": "Subdirectory or file to search within the root. Default '.'",
                 },
                 "regex": {
                     "type": "boolean",
@@ -439,13 +499,24 @@ TOOL_SPECS = [
                     "type": "boolean",
                     "description": "Case-sensitive match. Default false.",
                 },
+                "owner": _OWNER_PROPERTY,
+                "everyone": {
+                    "type": "boolean",
+                    "description": (
+                        "Search every root instead of one. Use for group-wide "
+                        "questions ('who has run X?'). Slower and budget-limited — "
+                        "it says so when it could not cover everything."
+                    ),
+                },
             },
             "required": ["query"],
         },
-        "impl": lambda inp, _ctx: (
+        "impl": lambda inp, ctx: (
             _search_files(
                 inp["query"], inp.get("path", "."),
                 bool(inp.get("regex", False)), bool(inp.get("case_sensitive", False)),
+                inp.get("owner", ""), ctx.get("user_id", ""),
+                bool(inp.get("everyone", False)),
             ),
             [],
         ),
@@ -453,36 +524,65 @@ TOOL_SPECS = [
     {
         "name": "attach_file",
         "description": (
-            "Attach a file from the calculations root to your Slack reply so the "
-            "user receives it as a downloadable file alongside your text. Use this "
-            "when the user asks for a file directly, or when handing over a specific "
-            "output/data/structure file is more useful than pasting its contents. "
-            "Any file type works. The path is relative to the calculations root "
-            "(same as read_file). Call once per file; your text reply is still sent."
+            "Attach a calculations file to your Slack reply so the user receives it "
+            "as a downloadable file alongside your text. Use this when the user asks "
+            "for a file directly, or when handing over a specific output/data/"
+            "structure file is more useful than pasting its contents. Any file type "
+            "works. Path and owner work exactly as in read_file. Call once per file; "
+            "your text reply is still sent."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path of the file to attach, relative to the calculations root.",
-                }
+                    "description": "Path of the file to attach, relative to the owner's calculations root.",
+                },
+                "owner": _OWNER_PROPERTY,
             },
             "required": ["path"],
         },
-        "impl": lambda inp, _ctx: _attach_file(inp["path"]),
+        "impl": lambda inp, ctx: _attach_file(
+            inp["path"], inp.get("owner", ""), ctx.get("user_id", "")
+        ),
+    },
+    {
+        "name": "read_metadata",
+        "description": (
+            "Open Aspen's recorded notes about a project — status, conventions, and "
+            "the list of Python libraries available for analysing it. These are "
+            "Aspen's own notes, stored outside the calculations tree, NOT a file in "
+            "the project: they are a starting point, not evidence, so check them "
+            "against the data before relying on them. Read this before write_metadata "
+            "(which replaces the whole file) and before run_python_analysis."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "Top-level project directory name (e.g. 'thermolysin').",
+                },
+                "owner": _OWNER_PROPERTY,
+            },
+            "required": ["project"],
+        },
+        "impl": lambda inp, ctx: (
+            _read_metadata(inp["project"], inp.get("owner", ""), ctx.get("user_id", "")), []
+        ),
     },
     {
         "name": "write_metadata",
         "description": (
-            "Create or overwrite the metadata.md file in a project's top-level "
-            "directory under the calculations root. This is your ONLY way to write "
-            "files — it can touch nothing but each project's metadata.md, and all "
-            "other calculation data stays read-only. Use it to record or update a "
-            "project's metadata (e.g. notes, status, the list of Python libraries "
-            "available for analysis). The write replaces the whole file, so read the "
-            "current metadata.md first (read_file) and pass the complete new contents. "
-            "The project directory must already exist; this cannot create new projects."
+            "Record or update Aspen's notes about a project (status, conventions, "
+            "the list of Python libraries available for analysis). This is your ONLY "
+            "way to write anything: it writes into Aspen's own storage — never into "
+            "anyone's calculations directory, which is read-only to you in every "
+            "root. You may write notes for your speaker's own projects and for "
+            "shared group projects; someone else's are readable but not yours to "
+            "change. The write replaces the whole file, so call read_metadata first "
+            "and pass the complete new contents. The project directory must already "
+            "exist."
         ),
         "input_schema": {
             "type": "object",
@@ -490,19 +590,22 @@ TOOL_SPECS = [
                 "project": {
                     "type": "string",
                     "description": (
-                        "Name of the top-level project directory under the "
-                        "calculations root (e.g. 'thermolysin'). A single directory "
-                        "name, not a path."
+                        "Name of the top-level project directory (e.g. 'thermolysin'). "
+                        "A single directory name, not a path."
                     ),
                 },
                 "content": {
                     "type": "string",
-                    "description": "Full Markdown contents to write to that project's metadata.md.",
+                    "description": "Full Markdown contents of the notes for that project.",
                 },
+                "owner": _OWNER_PROPERTY,
             },
             "required": ["project", "content"],
         },
-        "impl": lambda inp, _ctx: (_write_metadata(inp["project"], inp["content"]), []),
+        "impl": lambda inp, ctx: (
+            _write_metadata(inp["project"], inp["content"],
+                            inp.get("owner", ""), ctx.get("user_id", "")), []
+        ),
     },
     {
         "name": "read_workflow",
@@ -580,8 +683,12 @@ TOOL_SPECS = [
             "properties": {
                 "project_name": {
                     "type": "string",
-                    "description": "Name of the project directory under PROJECTS_ROOT.",
+                    "description": (
+                        "Name of the project directory in that owner's calculations "
+                        "root (their own by default)."
+                    ),
                 },
+                "owner": _OWNER_PROPERTY,
                 "code": {
                     "type": "string",
                     "description": (

@@ -1,6 +1,7 @@
 """Characterization tests for the read-only file tools and the tool-server bridge."""
 
 import httpx
+import pytest
 
 
 # --------------------------------------------------------------------------- #
@@ -190,92 +191,132 @@ def test_attach_file_drains_into_attachment_sink(sut):
 
 # --------------------------------------------------------------------------- #
 # _write_metadata
+#
+# Metadata is a SIDECAR now (aspen/metadata.py): the agent writes nothing inside
+# any calculations root, so these assert the note landed in Aspen's own area and
+# the project directory was left alone. The old invariants — project must exist,
+# no traversal, size-capped, backed up on overwrite — are unchanged.
 # --------------------------------------------------------------------------- #
-def test_write_metadata_creates_in_existing_project(sut):
+@pytest.fixture
+def meta(sut, tmp_path, monkeypatch):
+    """Per-test metadata sidecar, so history counts don't leak between tests."""
+    monkeypatch.setattr(sut, "METADATA_ROOT", tmp_path / "metadata")
+    monkeypatch.setattr(sut, "METADATA_HISTORY_ROOT", tmp_path / "metadata_history")
+    return tmp_path
+
+
+def _sidecar(sut, project, uid="U1"):
+    alias = sut.registry.by_id(uid)["alias"]
+    return sut.METADATA_ROOT / f"{alias}__{uid}" / project / "metadata.md"
+
+
+def test_write_metadata_creates_the_sidecar(sut, meta):
     (sut.CALCULATIONS_ROOT / "proj_a").mkdir()
-    out = sut._write_metadata("proj_a", "# notes\nhello\n")
-    assert out.startswith("Created proj_a/metadata.md")
-    assert (sut.CALCULATIONS_ROOT / "proj_a" / "metadata.md").read_text() == "# notes\nhello\n"
+    out = sut._write_metadata("proj_a", "# notes\nhello\n", "", "U1")
+    assert out.startswith("Created metadata for")
+    assert _sidecar(sut, "proj_a").read_text() == "# notes\nhello\n"
 
 
-def test_write_metadata_overwrites_existing(sut):
-    proj = sut.CALCULATIONS_ROOT / "proj_b"
+def test_write_metadata_never_touches_the_calculations_tree(sut, meta):
+    """The whole point of the move: no write lands inside anyone's root."""
+    proj = sut.CALCULATIONS_ROOT / "proj_d"
     proj.mkdir()
-    (proj / "metadata.md").write_text("old")
-    out = sut._write_metadata("proj_b", "new contents")
-    assert out.startswith("Updated proj_b/metadata.md")
-    assert (proj / "metadata.md").read_text() == "new contents"
+    (proj / "results.dat").write_text("precious")
+    sut._write_metadata("proj_d", "meta", "", "U1")
+    assert (proj / "results.dat").read_text() == "precious"
+    assert list(proj.iterdir()) == [proj / "results.dat"]   # nothing was added
 
 
-def test_write_metadata_backs_up_clobbered_version(sut):
-    """An overwrite snapshots the PRIOR content to the workspace history dir, so a
-    careless full-file replace is recoverable."""
-    proj = sut.CALCULATIONS_ROOT / "proj_hist"
-    proj.mkdir()
-    (proj / "metadata.md").write_text("important notes")
-    sut._write_metadata("proj_hist", "oops, replaced everything")
+def test_write_metadata_overwrites_existing(sut, meta):
+    (sut.CALCULATIONS_ROOT / "proj_b").mkdir()
+    sut._write_metadata("proj_b", "old", "", "U1")
+    out = sut._write_metadata("proj_b", "new contents", "", "U1")
+    assert out.startswith("Updated metadata for")
+    assert _sidecar(sut, "proj_b").read_text() == "new contents"
 
-    hist_dir = sut.WORKSPACE_ROOT / "metadata_history" / "proj_hist"
+
+def test_write_metadata_backs_up_clobbered_version(sut, meta):
+    """An overwrite snapshots the PRIOR content, so a careless replace is recoverable."""
+    (sut.CALCULATIONS_ROOT / "proj_hist").mkdir()
+    sut._write_metadata("proj_hist", "important notes", "", "U1")
+    sut._write_metadata("proj_hist", "oops, replaced everything", "", "U1")
+
+    alias = sut.registry.by_id("U1")["alias"]
+    hist_dir = sut.METADATA_HISTORY_ROOT / f"{alias}__U1" / "proj_hist"
     backups = list(hist_dir.glob("*.md"))
     assert len(backups) == 1
-    assert backups[0].read_text() == "important notes"   # the clobbered version
+    assert backups[0].read_text() == "important notes"
 
 
-def test_write_metadata_create_does_not_back_up(sut):
-    """Creating a new metadata.md has nothing to clobber, so no backup is made."""
-    proj = sut.CALCULATIONS_ROOT / "proj_new"
-    proj.mkdir()
-    sut._write_metadata("proj_new", "# fresh\n")
-    assert not (sut.WORKSPACE_ROOT / "metadata_history" / "proj_new").exists()
+def test_metadata_history_is_keyed_by_owner_as_well_as_project(sut, meta):
+    """Two people with the same project name must not share a history directory."""
+    (sut.CALCULATIONS_ROOT / "shared_name").mkdir()
+    for uid in ("U1", "U2"):
+        sut._write_metadata("shared_name", f"first from {uid}", "", uid)
+        sut._write_metadata("shared_name", f"second from {uid}", "", uid)
+    for uid in ("U1", "U2"):
+        alias = sut.registry.by_id(uid)["alias"]
+        hist = sut.METADATA_HISTORY_ROOT / f"{alias}__{uid}" / "shared_name"
+        backups = list(hist.glob("*.md"))
+        assert len(backups) == 1
+        assert backups[0].read_text() == f"first from {uid}"
 
 
-def test_write_metadata_rejects_missing_project(sut):
-    out = sut._write_metadata("ghost_proj", "x")
+def test_write_metadata_create_does_not_back_up(sut, meta):
+    (sut.CALCULATIONS_ROOT / "proj_new").mkdir()
+    sut._write_metadata("proj_new", "# fresh\n", "", "U1")
+    assert not sut.METADATA_HISTORY_ROOT.exists()
+
+
+def test_write_metadata_rejects_missing_project(sut, meta):
+    out = sut._write_metadata("ghost_proj", "x", "", "U1")
     assert "does not exist" in out
     assert not (sut.CALCULATIONS_ROOT / "ghost_proj").exists()
 
 
-def test_write_metadata_rejects_nested_project_path(sut):
+def test_write_metadata_rejects_nested_project_path(sut, meta):
     (sut.CALCULATIONS_ROOT / "proj_c").mkdir()
-    out = sut._write_metadata("proj_c/sub", "x")
+    out = sut._write_metadata("proj_c/sub", "x", "", "U1")
     assert "not a valid project name" in out
 
 
-def test_write_metadata_rejects_parent_traversal(sut):
-    out = sut._write_metadata("..", "x")
+def test_write_metadata_rejects_parent_traversal(sut, meta):
+    out = sut._write_metadata("..", "x", "", "U1")
     assert "not a valid project name" in out
 
 
-def test_write_metadata_rejects_absolute_project(sut):
-    out = sut._write_metadata("/etc", "x")
+def test_write_metadata_rejects_absolute_project(sut, meta):
+    out = sut._write_metadata("/etc", "x", "", "U1")
     assert "not a valid project name" in out
 
 
-def test_write_metadata_does_not_write_other_files(sut):
-    """A project dir becomes writable for metadata.md only — not its data files."""
-    proj = sut.CALCULATIONS_ROOT / "proj_d"
-    proj.mkdir()
-    (proj / "results.dat").write_text("precious")
-    sut._write_metadata("proj_d", "meta")
-    # the only file the tool created is metadata.md; results.dat is untouched
-    assert (proj / "results.dat").read_text() == "precious"
-    assert (proj / "metadata.md").exists()
-
-
-def test_write_metadata_rejects_oversized_content(sut, monkeypatch):
+def test_write_metadata_rejects_oversized_content(sut, meta, monkeypatch):
     monkeypatch.setattr(sut, "MAX_FILE_BYTES", 5)
     (sut.CALCULATIONS_ROOT / "proj_e").mkdir()
-    out = sut._write_metadata("proj_e", "way too long")
+    out = sut._write_metadata("proj_e", "way too long", "", "U1")
     assert "over the" in out and "metadata limit" in out
-    assert not (sut.CALCULATIONS_ROOT / "proj_e" / "metadata.md").exists()
+    assert not _sidecar(sut, "proj_e").exists()
 
 
-def test_write_metadata_dispatch_returns_text_no_attachments(sut):
+def test_write_metadata_dispatch_returns_text_no_attachments(sut, meta):
     (sut.CALCULATIONS_ROOT / "proj_f").mkdir()
-    ctx = {"attachments": []}
+    ctx = {"attachments": [], "user_id": "U1"}
     text = sut.dispatch("write_metadata", {"project": "proj_f", "content": "hi"}, ctx)
-    assert text.startswith("Created proj_f/metadata.md")
+    assert text.startswith("Created metadata for")
     assert ctx["attachments"] == []
+
+
+def test_read_metadata_round_trips_and_says_who_wrote_it(sut, meta):
+    (sut.CALCULATIONS_ROOT / "proj_r").mkdir()
+    sut._write_metadata("proj_r", "libraries: numpy", "", "U1")
+    out = sut._read_metadata("proj_r", "", "U1")
+    assert "libraries: numpy" in out
+    assert 'written_by="aspen"' in out          # never mistakable for project data
+
+
+def test_read_metadata_when_there_is_none(sut, meta):
+    (sut.CALCULATIONS_ROOT / "proj_none").mkdir()
+    assert "No metadata recorded" in sut._read_metadata("proj_none", "", "U1")
 
 
 # --------------------------------------------------------------------------- #
