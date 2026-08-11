@@ -13,19 +13,12 @@ import pytest
 
 
 @pytest.fixture
-def rq(sut, tmp_path, monkeypatch):
-    monkeypatch.setattr(sut, "USERS_FILE", tmp_path / "users.json")
-    monkeypatch.setattr(sut, "REQUESTS_FILE", tmp_path / "requests.json")
-    monkeypatch.setattr(sut, "STATE_DIR", tmp_path)
-    sut.registry.invalidate()
-    sut.registry.save([
-        {"slack_user_id": "U0SAM", "alias": "sam", "display_name": "Sam",
-         "role": "admin", "status": "active"},
-        {"slack_user_id": "U01ARUN", "alias": "arun", "display_name": "Arun N.",
-         "role": "member", "status": "active"},
-    ])
-    yield sut.pending
-    sut.registry.invalidate()
+def rq(sut, env):
+    env.register(
+        {"slack_user_id": "U0SAM", "alias": "sam", "display_name": "Sam", "role": "admin"},
+        {"slack_user_id": "U01ARUN", "alias": "arun", "display_name": "Arun N."},
+    )
+    return sut.pending
 
 
 def _client():

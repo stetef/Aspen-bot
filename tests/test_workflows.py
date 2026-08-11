@@ -16,26 +16,10 @@ import pytest
 
 
 @pytest.fixture
-def wf(sut, tmp_path, monkeypatch):
+def wf(sut, env):
     """Scratch registry + workflows tree with sam (admin), arun, and priya."""
-    monkeypatch.setattr(sut, "USERS_FILE", tmp_path / "users.json")
-    root = tmp_path / "workflows"
-    root.mkdir()
-    monkeypatch.setattr(sut, "WORKFLOWS_ROOT", root)
-    # Per-test workspace too — the session-scoped one would accumulate backup
-    # history across tests and make the "how many backups" assertions lie.
-    monkeypatch.setattr(sut, "WORKSPACE_ROOT", tmp_path / "workspace")
-    sut.registry.invalidate()
-    sut.registry.save([
-        {"slack_user_id": "U0SAM", "alias": "sam", "display_name": "Sam",
-         "role": "admin", "status": "active"},
-        {"slack_user_id": "U01ARUN", "alias": "arun", "display_name": "Arun N.",
-         "role": "member", "status": "active"},
-        {"slack_user_id": "U0PRIYA", "alias": "priya", "display_name": "Priya P.",
-         "role": "member", "status": "active"},
-    ])
-    yield sut.workflows
-    sut.registry.invalidate()
+    env.default_group()
+    return sut.workflows
 
 
 def _ctx(uid):

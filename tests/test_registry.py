@@ -14,15 +14,9 @@ import pytest
 
 
 @pytest.fixture
-def reg(sut, tmp_path, monkeypatch):
+def reg(sut, env):
     """Point config at a scratch registry + workflows tree, and yield helpers."""
-    monkeypatch.setattr(sut, "USERS_FILE", tmp_path / "users.json")
-    wf_root = tmp_path / "workflows"
-    wf_root.mkdir()
-    monkeypatch.setattr(sut, "WORKFLOWS_ROOT", wf_root)
-    sut.registry.invalidate()
-    yield sut.registry
-    sut.registry.invalidate()
+    return sut.registry
 
 
 def _u(uid, alias, name=None, role="member", status="active"):

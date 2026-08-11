@@ -1,3 +1,4 @@
 # Development / test dependencies (not needed at runtime).
 # Install with:  venv/bin/pip install -r requirements-dev.txt
 pytest>=7
+pytest-cov>=5.0

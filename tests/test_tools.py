@@ -198,11 +198,9 @@ def test_attach_file_drains_into_attachment_sink(sut):
 # no traversal, size-capped, backed up on overwrite — are unchanged.
 # --------------------------------------------------------------------------- #
 @pytest.fixture
-def meta(sut, tmp_path, monkeypatch):
+def meta(sut, env):
     """Per-test metadata sidecar, so history counts don't leak between tests."""
-    monkeypatch.setattr(sut, "METADATA_ROOT", tmp_path / "metadata")
-    monkeypatch.setattr(sut, "METADATA_HISTORY_ROOT", tmp_path / "metadata_history")
-    return tmp_path
+    return env
 
 
 def _sidecar(sut, project, uid="U1"):

@@ -17,31 +17,21 @@ import pytest
 
 
 @pytest.fixture
-def multi(sut, tmp_path, monkeypatch):
+def multi(sut, env):
     """Three users with three separate roots, plus a shared one."""
-    monkeypatch.setattr(sut, "USERS_FILE", tmp_path / "users.json")
-    sam_root = tmp_path / "sam-calcs"
-    arun_root = tmp_path / "arun-calcs"
-    shared_root = tmp_path / "group-calcs"
-    for root in (sam_root, arun_root, shared_root):
-        root.mkdir()
-    monkeypatch.setattr(sut, "SHARED_CALC_ROOTS", {"smb": str(shared_root)})
-    monkeypatch.setattr(sut, "METADATA_ROOT", tmp_path / "metadata")
-    monkeypatch.setattr(sut, "METADATA_HISTORY_ROOT", tmp_path / "metadata_history")
-
-    sut.registry.invalidate()
-    sut.registry.save([
+    sam_root = env.root("sam-calcs")
+    arun_root = env.root("arun-calcs")
+    shared_root = env.shared("smb")
+    env.register(
         {"slack_user_id": "U0SAM", "alias": "sam", "display_name": "Sam",
-         "role": "admin", "status": "active", "calc_root": str(sam_root)},
+         "role": "admin", "calc_root": str(sam_root)},
         {"slack_user_id": "U01ARUN", "alias": "arun", "display_name": "Arun N.",
-         "role": "member", "status": "active", "calc_root": str(arun_root)},
+         "calc_root": str(arun_root)},
         # No calc_root: falls back to the shared default, which is the migration
         # story — nothing changes for anyone until a root is set.
-        {"slack_user_id": "U0PRIYA", "alias": "priya", "display_name": "Priya P.",
-         "role": "member", "status": "active"},
-    ])
-    yield {"sam": sam_root, "arun": arun_root, "shared": shared_root, "tmp": tmp_path}
-    sut.registry.invalidate()
+        {"slack_user_id": "U0PRIYA", "alias": "priya", "display_name": "Priya P."},
+    )
+    return {"sam": sam_root, "arun": arun_root, "shared": shared_root, "tmp": env.calcs}
 
 
 # --------------------------------------------------------------------------- #

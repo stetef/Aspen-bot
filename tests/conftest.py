@@ -69,19 +69,25 @@ _MODMAP = {
     # attachments
     "_upload_attachments": "aspen.attachments",
     "_under": "aspen.attachments",
-    # user registry
+    # calculations roots, metadata sidecar, setup + request queue
+    "REQUESTS_FILE": "aspen.config",
+    "REQUEST_NOTIFY_COOLDOWN_HOURS": "aspen.config",
+    "_read_metadata": "aspen.tools",
+    "_scoped": "aspen.tools",
+    # whole modules, reached as sut.<name> so tests can call them directly
     "registry": "aspen",
     "workflows": "aspen",
     "roots": "aspen",
     "metadata": "aspen",
     "pending": "aspen",
     "setup": "aspen",
-    "REQUESTS_FILE": "aspen.config",
-    "REQUEST_NOTIFY_COOLDOWN_HOURS": "aspen.config",
-    "_read_metadata": "aspen.tools",
     "tools": "aspen",
-    "_scoped": "aspen.tools",
+    # startup guards
     "_check_state_locations": "aspen.main",
+    "_check_calculations_roots": "aspen.main",
+    "SANDBOX_WRITE_PATHS": "aspen.config",
+    "SEARCH_MAX_MATCHES": "aspen.config",
+    "SEARCH_MAX_FILES": "aspen.config",
     # turn telemetry
     "telemetry": "aspen",
     "TELEMETRY_ENABLED": "aspen.config",
@@ -227,6 +233,93 @@ def _isolate_telemetry(sut, tmp_path, monkeypatch):
     sut.telemetry.invalidate()
     yield
     sut.telemetry.invalidate()
+
+
+class AspenEnv:
+    """An isolated Aspen: its own state dir, workspace, and calculations trees.
+
+    Six test modules had grown their own near-identical version of this, each
+    patching a slightly different subset of the config paths and laying the
+    directories out slightly differently. That inconsistency was not free: one of
+    them put ``STATE_DIR`` *at* ``tmp_path``, so every calculations root created
+    under it was (correctly) refused as overlapping the state directory — a real
+    check firing on a fixture artefact rather than on the behavior under test.
+
+    The layout here is the one that matches production, and the reason it matters
+    is the same reason ``roots.validate`` enforces it::
+
+        <tmp>/state/       registry, workflows, metadata, requests   (STATE_DIR)
+        <tmp>/workspace/   figures, cache, generated code           (WORKSPACE_ROOT)
+        <tmp>/calcs/       one subdirectory per user's root
+    """
+
+    def __init__(self, sut, tmp_path, monkeypatch):
+        self._sut = sut
+        self._monkeypatch = monkeypatch
+        self.tmp = tmp_path
+        self.state = tmp_path / "state"
+        self.workspace = tmp_path / "workspace"
+        self.calcs = tmp_path / "calcs"
+        for path in (self.state, self.workspace, self.calcs):
+            path.mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(sut, "STATE_DIR", self.state)
+        monkeypatch.setattr(sut, "USERS_FILE", self.state / "users.json")
+        monkeypatch.setattr(sut, "WORKFLOWS_ROOT", self.state / "workflows")
+        monkeypatch.setattr(sut, "METADATA_ROOT", self.state / "metadata")
+        monkeypatch.setattr(sut, "METADATA_HISTORY_ROOT", self.state / "metadata_history")
+        monkeypatch.setattr(sut, "REQUESTS_FILE", self.state / "requests.json")
+        monkeypatch.setattr(sut, "WORKSPACE_ROOT", self.workspace)
+        monkeypatch.setattr(sut, "SHARED_CALC_ROOTS", {})
+        (self.state / "workflows").mkdir(exist_ok=True)
+        sut.registry.invalidate()
+
+    # -- calculations -------------------------------------------------------- #
+    def root(self, name: str, projects=()):
+        """Create a calculations tree, optionally with empty project dirs."""
+        path = self.calcs / name
+        path.mkdir(parents=True, exist_ok=True)
+        for project in projects:
+            (path / project).mkdir(parents=True, exist_ok=True)
+        return path
+
+    def shared(self, name: str, projects=()):
+        """Create a shared (owned-by-nobody) root and register it under ``name``."""
+        path = self.root(f"shared-{name}", projects)
+        current = dict(self._sut.SHARED_CALC_ROOTS)
+        current[name] = str(path)
+        self._monkeypatch.setattr(self._sut, "SHARED_CALC_ROOTS", current)
+        return path
+
+    # -- people -------------------------------------------------------------- #
+    def register(self, *users):
+        """Save a registry. Each entry may be a dict or ``(alias, uid, **kw)``."""
+        entries = []
+        for user in users:
+            entry = dict(user)
+            entry.setdefault("display_name", entry["alias"].title())
+            entry.setdefault("role", "member")
+            entry.setdefault("status", "active")
+            entries.append(entry)
+        self._sut.registry.invalidate()
+        self._sut.registry.save(entries)
+        return entries
+
+    def default_group(self):
+        """sam (admin), arun, priya — the cast most of the suite already uses."""
+        return self.register(
+            {"slack_user_id": "U0SAM", "alias": "sam", "display_name": "Sam", "role": "admin"},
+            {"slack_user_id": "U01ARUN", "alias": "arun", "display_name": "Arun N."},
+            {"slack_user_id": "U0PRIYA", "alias": "priya", "display_name": "Priya P."},
+        )
+
+
+@pytest.fixture
+def env(sut, tmp_path, monkeypatch):
+    """An isolated Aspen (see :class:`AspenEnv`). Register users yourself."""
+    environment = AspenEnv(sut, tmp_path, monkeypatch)
+    yield environment
+    sut.registry.invalidate()
 
 
 class SayRecorder:

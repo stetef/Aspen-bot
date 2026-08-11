@@ -10,33 +10,21 @@ import pytest
 
 
 @pytest.fixture
-def multi(sut, tmp_path, monkeypatch):
+def multi(sut, env):
     """Sam and Arun with separate roots, a shared root, and some content."""
-    monkeypatch.setattr(sut, "USERS_FILE", tmp_path / "users.json")
-    sam_root, arun_root, shared_root = (tmp_path / n for n in
-                                        ("sam-calcs", "arun-calcs", "group-calcs"))
-    for root in (sam_root, arun_root, shared_root):
-        root.mkdir()
-    (sam_root / "thermolysin").mkdir()
+    sam_root = env.root("sam-calcs", ["thermolysin"])
+    arun_root = env.root("arun-calcs", ["dft"])
+    shared_root = env.shared("smb", ["csd"])
     (sam_root / "thermolysin" / "notes.txt").write_text("sam: zinc site converged\n")
-    (arun_root / "dft").mkdir()
     (arun_root / "dft" / "orca.out").write_text("arun: BP86/def2-TZVP converged\n")
-    (shared_root / "csd").mkdir()
     (shared_root / "csd" / "index.txt").write_text("shared: CSD entries\n")
-
-    monkeypatch.setattr(sut, "SHARED_CALC_ROOTS", {"smb": str(shared_root)})
-    monkeypatch.setattr(sut, "METADATA_ROOT", tmp_path / "metadata")
-    monkeypatch.setattr(sut, "METADATA_HISTORY_ROOT", tmp_path / "metadata_history")
-
-    sut.registry.invalidate()
-    sut.registry.save([
+    env.register(
         {"slack_user_id": "U0SAM", "alias": "sam", "display_name": "Sam",
-         "role": "admin", "status": "active", "calc_root": str(sam_root)},
+         "role": "admin", "calc_root": str(sam_root)},
         {"slack_user_id": "U01ARUN", "alias": "arun", "display_name": "Arun N.",
-         "role": "member", "status": "active", "calc_root": str(arun_root)},
-    ])
-    yield {"sam": sam_root, "arun": arun_root, "shared": shared_root}
-    sut.registry.invalidate()
+         "calc_root": str(arun_root)},
+    )
+    return {"sam": sam_root, "arun": arun_root, "shared": shared_root}
 
 
 def _ctx(uid):
