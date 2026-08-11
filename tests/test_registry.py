@@ -369,3 +369,52 @@ def test_cli_list_hides_removed_users_unless_asked(cli, reg, capsys):
     assert "arun" not in capsys.readouterr().out
     cli.main(["list", "--all"])
     assert "arun" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# The hot-reload hook, and the way tests can break it
+# --------------------------------------------------------------------------- #
+def test_the_allowlist_is_served_by_the_hook_not_a_stored_attribute(sut):
+    """Hot reload only works while the name is ABSENT from config.__dict__."""
+    import importlib
+    config = importlib.import_module("aspen.config")
+    assert "ALLOWED_USER_IDS" not in config.__dict__
+    assert "ADMIN_USER_ID" not in config.__dict__
+
+
+def test_monkeypatching_the_allowlist_would_freeze_it_without_the_cleanup(sut):
+    """Pins the hazard the conftest cleanup exists for.
+
+    ``monkeypatch.undo()`` restores by ``setattr``, which turns a hook-backed name
+    into a real attribute frozen at the value it had when the patch was applied —
+    so the allowlist stops tracking the registry for every later test. This walks
+    that sequence by hand and shows the cleanup is what repairs it.
+    """
+    import importlib
+    from tests.conftest import _unshadow_hook_backed
+
+    config = importlib.import_module("aspen.config")
+    live = set(config.ALLOWED_USER_IDS)
+
+    original = getattr(config, "ALLOWED_USER_IDS")        # what monkeypatch captures
+    setattr(config, "ALLOWED_USER_IDS", {"UTEST"})        # ... setattr
+    setattr(config, "ALLOWED_USER_IDS", original)         # ... and undo()
+
+    assert "ALLOWED_USER_IDS" in config.__dict__          # the hook is now shadowed
+    _unshadow_hook_backed()
+    assert "ALLOWED_USER_IDS" not in config.__dict__
+    assert set(config.ALLOWED_USER_IDS) == live           # tracking the registry again
+
+
+def test_the_cleanup_runs_between_tests(sut, monkeypatch):
+    """The real path: monkeypatch it here, and the autouse fixture repairs it."""
+    monkeypatch.setattr(sut, "ALLOWED_USER_IDS", {"UONLY"})
+    assert sut.ALLOWED_USER_IDS == {"UONLY"}
+    # The assertion for the next test is in test_the_allowlist_survives_a_patch below.
+
+
+def test_the_allowlist_survives_a_patch_in_a_previous_test(sut):
+    import importlib
+    config = importlib.import_module("aspen.config")
+    assert "ALLOWED_USER_IDS" not in config.__dict__
+    assert "UONLY" not in config.ALLOWED_USER_IDS

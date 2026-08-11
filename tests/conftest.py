@@ -121,6 +121,36 @@ class _Facade:
         setattr(importlib.import_module(modname), name, value)
 
 
+# Names that ``aspen.config`` serves through its PEP 562 module ``__getattr__``
+# rather than holding in its ``__dict__`` (they resolve through the registry on
+# every read, which is what makes ``aspen-users remove`` take effect on the next
+# message). See ``config._REGISTRY_BACKED``.
+_HOOK_BACKED = ("ALLOWED_USER_IDS", "ADMIN_USER_ID")
+
+
+def _unshadow_hook_backed() -> None:
+    """Undo the damage ``monkeypatch`` does to a ``__getattr__``-backed name.
+
+    ``monkeypatch.setattr`` reads the current value so it can restore it later —
+    but a module ``__getattr__`` only fires for names *absent* from ``__dict__``,
+    so the restoring ``setattr`` in ``undo()`` writes a **real attribute** and the
+    hook is shadowed from then on. The allowlist is then silently frozen at
+    whatever it happened to be when that test ran, for every test that follows.
+
+    This stayed invisible for a long time because every early use snapshotted the
+    same bootstrap value. It surfaced the moment a test patched the allowlist
+    while its own registry fixture was installed: ten unrelated tests began seeing
+    that fixture's two-user allowlist and failing as "not authorized".
+
+    Deleting the key restores the hook. Called autouse, before and after each
+    test — the "after" runs once ``monkeypatch`` has done its own teardown, since
+    autouse fixtures are set up first and therefore finalize last.
+    """
+    config = importlib.import_module("aspen.config")
+    for name in _HOOK_BACKED:
+        config.__dict__.pop(name, None)
+
+
 def _neutralize_import_side_effects():
     """Stop import-time work from reading real config or hitting the network."""
     import dotenv
@@ -178,7 +208,11 @@ def _reset_state(sut):
     sut._bot_uid_cache = None  # re-resolve the bot's own ID per test client
     sut.MANAGER.clear()
     sut.registry.invalidate()  # the registry is mtime-cached; don't leak across tests
+    _unshadow_hook_backed()
     yield
+    # After monkeypatch.undo(), which is what leaves the shadow behind.
+    _unshadow_hook_backed()
+    sut.registry.invalidate()
 
 
 @pytest.fixture(autouse=True)
