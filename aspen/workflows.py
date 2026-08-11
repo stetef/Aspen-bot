@@ -354,12 +354,18 @@ def _backup(target: Path, uid: str) -> None:
         log.exception("workflow backup failed (non-fatal) for %s", uid)
 
 
-def write(uid: str, content: str, target: str = "") -> str:
+def write(uid: str, content: str, target: str = "", actor: str = "") -> str:
     """Write ``uid``'s own workflow (or ``_group`` if they're the admin).
 
     ``uid`` comes from the Slack event, never from a tool argument — that is the
     property that makes ownership unspoofable. A model can be talked into passing
     any owner it is told to; it cannot pass a value it never receives.
+
+    ``actor`` records *who performed* the write when that isn't the owner — the
+    ``aspen-users workflow import`` path, where an admin files someone else's
+    notes for them. It lands in ``updated_by`` only; ownership still comes from
+    ``uid``, so this stays a provenance note and never a way to write as someone
+    else. The Slack path leaves it empty and keeps the old behavior.
     """
     user = registry.by_id(uid)
     if user is None:
@@ -410,7 +416,7 @@ def write(uid: str, content: str, target: str = "") -> str:
         "description": description,
         "derived_from": derived,
         "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
-        "updated_by": uid,
+        "updated_by": actor or uid,
     }
 
     existed = path.is_file()

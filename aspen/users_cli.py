@@ -14,6 +14,16 @@ with no restart.
     python -m aspen.users_cli sync --apply
     python -m aspen.users_cli whois arun
 
+It also files workflows on people's behalf, for the common case where someone
+hands you a document instead of typing it to Aspen themselves. The body goes in
+verbatim — these are meant to be the user's own words — so the only authored part
+is the one-line ``description``, which is what tells Aspen when to open the file
+at all:
+
+    python -m aspen.users_cli workflow import arun ArunDFTWorkflow.md
+    python -m aspen.users_cli workflow describe arun "ORCA DFT for 3d metals…"
+    python -m aspen.users_cli workflow list
+
 It also owns the turn-log switch (``aspen/telemetry.py``), which is admin-only for
 the same reason admission is — the agent must not be able to stop the record of
 what it did:
@@ -27,8 +37,11 @@ what it did:
 
 import argparse
 import getpass
+import os
+import subprocess
 import sys
 from datetime import date, timedelta
+from pathlib import Path
 
 from . import config, registry, telemetry, workflows
 
@@ -433,6 +446,255 @@ def cmd_whois(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Workflow filing
+#
+# Ingestion is deliberately dumb about the *body*: it goes in exactly as written.
+# A workflow is fed to its owner's sessions as their standing preferences, so
+# reformatting someone's prose would mean rewriting instructions that still carry
+# their name. The one authored field is ``description`` — the only routing signal
+# in workflows.turn_preamble, and therefore the whole difference between a file
+# Aspen opens and a file it never thinks to look at.
+# --------------------------------------------------------------------------- #
+_DRAFT_TIMEOUT = 90
+_DRAFT_PROMPT = (
+    "Below is one scientist's personal computational-chemistry workflow, filed so "
+    "an assistant can decide when to consult it. Reply with ONE line of at most "
+    "200 characters saying what it covers — the methods, software, and kind of "
+    "problem — specific enough to tell it apart from a colleague's workflow on a "
+    "neighboring topic. Output only that line: no preamble, no quotes, no bullets."
+)
+
+
+def _resolve_workflow_target(who: str) -> tuple[str, str, str, int]:
+    """(uid, target, label, exit_code) for a workflow subcommand's ``who``.
+
+    ``_group`` resolves to the admin's own ID because ``workflows.write`` gates
+    the shared file on ``uid == ADMIN_USER_ID`` — the CLI is admin-only anyway,
+    but going through the same check keeps one rule instead of two.
+    """
+    if who.strip().lstrip("_").lower() == "group":
+        admin = config.ADMIN_USER_ID
+        if not admin:
+            return "", "", "", _err("no admin in the registry — cannot write the _group workflow")
+        return admin, "_group", "the shared _group workflow", 0
+    user = registry.resolve(who)
+    if user is None:
+        known = ", ".join(u["alias"] for u in registry.users()) or "(none)"
+        return "", "", "", _err(f"no user matches '{who}'. Known aliases: {known}")
+    return user["slack_user_id"], "", f"{user['display_name']}'s workflow", 0
+
+
+def _workflow_path(uid: str, target: str):
+    if target == "_group":
+        return config.WORKFLOWS_ROOT / workflows.GROUP_DIR / workflows.WORKFLOW_FILENAME
+    directory = workflows.dir_for(uid)
+    return (directory / workflows.WORKFLOW_FILENAME) if directory else None
+
+
+def _draft_description(body: str) -> tuple[str, str]:
+    """(description, error) — one line drafted by the Claude Code CLI.
+
+    Shelling out to the CLI rather than importing an SDK keeps this dependency-free:
+    the binary is already required to run the bot at all (config.CLAUDE_CLI_PATH),
+    and it carries its own auth, so the import path needs no key of its own.
+    """
+    cli = config.CLAUDE_CLI_PATH or "claude"
+    env = dict(os.environ)
+    if config.ASPEN_SDK_USE_SUBSCRIPTION:
+        env["ANTHROPIC_API_KEY"] = ""       # prefer the Code login, as agent.py does
+    try:
+        proc = subprocess.run(
+            [cli, "-p", _DRAFT_PROMPT], input=body, text=True,
+            capture_output=True, timeout=_DRAFT_TIMEOUT, env=env,
+        )
+    except FileNotFoundError:
+        return "", f"the Claude CLI ({cli}) wasn't found — set CLAUDE_CLI_PATH, or pass --description"
+    except subprocess.TimeoutExpired:
+        return "", f"the Claude CLI didn't answer within {_DRAFT_TIMEOUT}s"
+    except OSError as exc:
+        return "", str(exc)
+    if proc.returncode != 0:
+        return "", (proc.stderr.strip().splitlines() or [f"claude exited {proc.returncode}"])[0]
+    return workflows._one_line(proc.stdout.strip().strip('"').strip("'")), ""
+
+
+def _settle_description(args, supplied: dict, body: str) -> str:
+    """The description to file: explicit flag, then the file's own, then a draft."""
+    if args.description.strip():
+        return args.description.strip()
+
+    existing = workflows._one_line(supplied.get("description"))
+    if existing:
+        print(f"Using the description already in the file: {existing}")
+        return existing
+
+    if args.no_draft:
+        return ""
+
+    draft, failure = _draft_description(body)
+    if failure:
+        print(f"warning: could not draft a description ({failure})")
+        return ""
+    print(f"\nDrafted description:\n  {draft}\n")
+    if _confirm("File it with this description?", args.yes):
+        return draft
+    try:
+        return input("Description (blank to file without one): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+
+
+def cmd_workflow_import(args) -> int:
+    """File a document someone handed you as their workflow."""
+    src = Path(args.file).expanduser()
+    if not src.is_file():
+        return _err(f"{src} is not a file")
+    try:
+        raw = src.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return _err(f"could not read {src} ({exc}) — this takes text/markdown, "
+                    "so convert anything else first")
+
+    uid, target, label, code = _resolve_workflow_target(args.who)
+    if code:
+        return code
+
+    supplied, body = workflows.parse(raw)
+    if not body.strip():
+        return _err(f"{src} has no content below its frontmatter")
+
+    path = _workflow_path(uid, target)
+    if path is not None and path.is_file():
+        print(f"{label} already exists at {path} — importing REPLACES its body.")
+        print(f"(the current version is backed up to "
+              f"{config.WORKSPACE_ROOT / 'workflow_history' / (target or uid)} either way)")
+        if not _confirm("Proceed?", args.yes):
+            print("Aborted.")
+            return 1
+
+    description = _settle_description(args, supplied, body)
+    content = workflows.render(
+        {"description": description, "derived_from": supplied.get("derived_from")}, body
+    )
+    result = workflows.write(uid, content, target=target, actor=_actor(args))
+    if result.startswith("Error"):
+        return _err(result[len("Error: "):] if result.startswith("Error: ") else result)
+    print(result)
+
+    written = _workflow_path(uid, target)
+    if written:
+        print(f"Filed at {written}")
+    if args.archive_source:
+        moved = _archive_source(src)
+        print(f"Source moved to {moved}" if moved else f"warning: could not move {src}")
+    else:
+        print(f"The source file is untouched at {src} — delete it, or it will "
+              "drift away from what Aspen serves.")
+    print("Live on their next message — no restart needed.")
+    return 0
+
+
+def _archive_source(src: Path):
+    """Move an imported source aside so it can't drift from the filed copy."""
+    dest = src.with_name(f"{src.name}.imported-{date.today().isoformat()}")
+    n = 1
+    while dest.exists():
+        dest = src.with_name(f"{src.name}.imported-{date.today().isoformat()}-{n}")
+        n += 1
+    try:
+        src.rename(dest)
+        return dest
+    except OSError:
+        return None
+
+
+def cmd_workflow_describe(args) -> int:
+    """Rewrite the one line that decides whether Aspen opens a workflow."""
+    uid, target, label, code = _resolve_workflow_target(args.who)
+    if code:
+        return code
+
+    path = _workflow_path(uid, target)
+    if path is None or not path.is_file():
+        return _err(f"no workflow on file for '{args.who}' — import one first with "
+                    "`aspen-users workflow import`")
+    try:
+        _, body = workflows.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except OSError as exc:
+        return _err(f"could not read {path} ({exc})")
+
+    description = args.description.strip()
+    if not description:
+        return _err("refusing to blank the description — it is the only thing that "
+                    "tells Aspen when to open this file")
+
+    content = workflows.render({"description": description}, body)
+    result = workflows.write(uid, content, target=target, actor=_actor(args))
+    if result.startswith("Error"):
+        return _err(result[len("Error: "):] if result.startswith("Error: ") else result)
+    print(f"{label}: description updated (the body is unchanged).")
+    print(f"  {description}")
+    return 0
+
+
+def cmd_workflow_list(args) -> int:
+    """Every description on file, side by side — how you tune them."""
+    entries = workflows.index(include_archived=args.all)
+    if not entries:
+        print(f"No workflows on file. Root: {config.WORKFLOWS_ROOT}")
+        print("File one with:  aspen-users workflow import <alias> <file.md>")
+        return 0
+
+    rows = [
+        (e["alias"] + (" [archived]" if e["archived"] else ""),
+         e["updated"] or "-", e["description"])
+        for e in entries
+    ]
+    header = ("WHO", "UPDATED", "DESCRIPTION")
+    widths = [max(len(r[i]) for r in [header] + rows) for i in range(2)]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths) + "  {}"
+    print(fmt.format(*header))
+    for row in rows:
+        print(fmt.format(*row))
+
+    missing = [u["alias"] for u in registry.users()
+               if not workflows.has_workflow(u["slack_user_id"])]
+    print(f"\n{len(rows)} workflow(s). Root: {config.WORKFLOWS_ROOT}")
+    if missing:
+        print(f"No workflow yet: {', '.join(missing)}")
+    return 0
+
+
+def cmd_workflow_show(args) -> int:
+    uid, target, label, code = _resolve_workflow_target(args.who)
+    if code:
+        return code
+    path = _workflow_path(uid, target)
+    if path is None or not path.is_file():
+        archived = workflows.dir_for(uid, include_archived=True) if not target else None
+        if archived and workflows.ARCHIVE_DIR in archived.parts:
+            print(f"Archived: {archived / workflows.WORKFLOW_FILENAME}")
+            path = archived / workflows.WORKFLOW_FILENAME
+        else:
+            return _err(f"no workflow on file for '{args.who}'")
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return _err(f"could not read {path} ({exc})")
+
+    meta, body = workflows.parse(raw)
+    print(f"# {label}")
+    print(f"{'path':<13} {path}")
+    for field in ("description", "updated", "updated_by", "derived_from", "archived"):
+        if meta.get(field):
+            print(f"{field:<13} {meta[field]}")
+    print(f"{'bytes':<13} {len(raw.encode('utf-8'))}\n")
+    print(body.strip())
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="aspen-users",
@@ -478,6 +740,45 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("whois", help="show one user's registry entry")
     s.add_argument("who", help="alias or Slack ID")
     s.set_defaults(func=cmd_whois)
+
+    # --- workflows ---------------------------------------------------------- #
+    # Filing on someone's behalf, for when they hand you a document instead of
+    # typing it to Aspen. Everyone can still write their own from Slack; this is
+    # the admin path, and it is the only one that can write another user's file.
+    s = sub.add_parser(
+        "workflow",
+        help="file and maintain per-user workflow documents",
+        description="Import documents as workflows and keep their descriptions "
+                    "sharp. Bodies are stored verbatim — only the description is "
+                    "authored here, and it is what routes Aspen to the file.",
+    )
+    wsub = s.add_subparsers(dest="workflow_command", required=True)
+
+    w = wsub.add_parser("import", help="file a markdown/text document as someone's workflow")
+    w.add_argument("who", help="alias, Slack ID, or '_group' for the shared file")
+    w.add_argument("file", help="path to the document (text or markdown)")
+    w.add_argument("--description", default="",
+                   help="the one-line routing summary (default: the file's own, else drafted)")
+    w.add_argument("--no-draft", action="store_true",
+                   help="never call the Claude CLI to draft a description")
+    w.add_argument("--archive-source", action="store_true",
+                   help="rename the source file aside once it is filed")
+    w.add_argument("-y", "--yes", action="store_true",
+                   help="accept a drafted description and any overwrite without asking")
+    w.set_defaults(func=cmd_workflow_import)
+
+    w = wsub.add_parser("describe", help="rewrite a workflow's one-line description")
+    w.add_argument("who", help="alias, Slack ID, or '_group'")
+    w.add_argument("description", help="the new one-line summary")
+    w.set_defaults(func=cmd_workflow_describe)
+
+    w = wsub.add_parser("list", help="every workflow on file, with its description")
+    w.add_argument("--all", action="store_true", help="include archived workflows")
+    w.set_defaults(func=cmd_workflow_list)
+
+    w = wsub.add_parser("show", help="print one workflow in full")
+    w.add_argument("who", help="alias, Slack ID, or '_group'")
+    w.set_defaults(func=cmd_workflow_show)
 
     # --- telemetry ---------------------------------------------------------- #
     # Metrics and question text are switched separately on purpose: metrics stay

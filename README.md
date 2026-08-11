@@ -89,6 +89,8 @@ adds or removes a user, so no message — however phrased — can widen the allo
 ./aspen-users remove arun --purge                    # revoke + delete their workflow
 ./aspen-users sync --apply                           # refresh display names from Slack
 ./aspen-users whois arun                             # one user's full entry
+./aspen-users workflow import arun notes.md          # file a document as their workflow
+./aspen-users workflow list                          # every workflow's description
 ```
 
 | Command | Arguments | Notes |
@@ -100,6 +102,7 @@ adds or removes a user, so no message — however phrased — can widen the allo
 | `remove` | `<alias\|id>` `--purge` `--purge-history` `--force` `-y/--yes` | Archives the workflow by default. `--force` is required to remove the admin. |
 | `sync` | `--apply` | Dry run by default: reports display-name changes and aliases that no longer match. |
 | `whois` | `<alias\|id>` | Registry entry plus the workflow path. |
+| `workflow` | `import`, `describe`, `list`, `show` | File and maintain workflow documents on someone's behalf — see [Per-user workflows](#per-user-workflows). |
 | `telemetry` | `status`, `on`, `off`, `content on\|off`, `exclude`, `include`, `prune` | What Aspen records about how it's used — see [What Aspen records](#what-aspen-records-aspen-users-telemetry). |
 
 Global: `--by <name>` records who made the change in `added_by`/`removed_by` (defaults to
@@ -139,6 +142,31 @@ user-authored text and is treated as untrusted, exactly like project data.
 
 Every overwrite snapshots the previous version to
 `$WORKSPACE_ROOT/workflow_history/<slack-id>/`.
+
+### Filing one for someone (`aspen-users workflow`)
+
+When someone hands you a document instead of typing it to Aspen, file it for them:
+
+```bash
+./aspen-users --by you workflow import arun ArunDFTWorkflow.md   # <alias|id|_group> <file>
+./aspen-users workflow import arun notes.md --description "…"    # skip the drafting step
+./aspen-users workflow describe arun "…"                         # rewrite just that line
+./aspen-users workflow list                                      # every description, plus who has none
+./aspen-users workflow show arun                                 # one file in full
+```
+
+The **body is filed verbatim** — it becomes that person's standing guidance under their
+name, so it is stored, never reformatted. The only authored field is the one-line
+`description`, and `import` settles it in that order: `--description` if given, else one
+already in the file, else a draft from the Claude CLI that it shows you and files only on
+an explicit yes (`--no-draft` skips the call; an unreachable CLI is a warning, not a
+failure). Because the description is the whole routing signal, `describe` exists to sharpen
+it later without re-importing.
+
+Filing for someone is not writing as them: `owner_id` stays the user, while `--by` lands in
+`updated_by`. Overwrites confirm first and snapshot as usual, `--archive-source` renames the
+original aside so it can't drift from the filed copy, and the user must already be
+registered — there's nowhere to file it otherwise.
 
 ## What Aspen records (`aspen-users telemetry`)
 
