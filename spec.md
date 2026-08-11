@@ -8,7 +8,8 @@ and summarizing data in a sandbox, and recording per-project notes.
 
 This document describes the system **as built**. Work that is designed but not yet
 implemented (production service account / systemd, the agent submitting its own Slurm
-jobs) is collected in [§18 Roadmap](#18-roadmap--not-yet-implemented). Magic numbers in
+jobs, per-user calculations roots, metadata moving to a sidecar) is collected in
+[§18 Roadmap](#18-roadmap--not-yet-implemented). Magic numbers in
 this doc are defaults; the authority is `.env` (see [§15](#15-environment-variables-env)).
 
 ---
@@ -389,6 +390,10 @@ For backward compatibility `metadata.toml` / `metadata.yaml` are still accepted 
 fallback. If no metadata file exists, the tool server returns a 422 with a `metadata.md`
 template.
 
+Metadata is planned to move **out of the project directory** into a mirrored sidecar under
+`ASPEN_STATE_DIR`, since the agent must not write into user-owned trees — see
+[§18.4](#184-project-metadata-as-a-sidecar).
+
 **Project text is untrusted input.** Metadata, README/blurb text, file names, and file
 contents all flow into the model's context and could attempt prompt injection
 ("ignore previous instructions…"). The security boundary is therefore the **bwrap jail
@@ -698,7 +703,142 @@ would let it submit and cancel its own jobs via the `orca-pipeline` `submit-batc
   without refactoring, the tool server stays structured so new routes/tools drop in
   without modifying existing ones.
 
-### 18.3 Other deferred items
+Once calculations are per-user ([§18.3](#183-per-user-calculations-roots)), submission is
+always **on someone's behalf but under the agent's own identity** — the agent's Unix user
+and its own munge credentials, never the requester's:
+
+- **Copy, then edit, then submit.** Nothing in a user's root is modified. Files are staged
+  into `$WORKSPACE_ROOT/jobs/<alias>__<uid>/<thread>/` — copied, never symlinked (a symlink
+  lets the sandboxed editor write back through it) — with a provenance record of source
+  paths, checksums, and the requesting Slack user. The staging tree is the agent's writable
+  surface; roots stay outside every sandbox write path.
+- **`sbatch` is a structured tool, never a Bash allowlist entry.** A `Bash(sbatch:*)` prefix
+  rule would hand the model `--wrap`, i.e. arbitrary code execution as the bot user on a
+  compute node, outside the jail. The tool builds the argv itself: script path must resolve
+  inside a staging directory, resources come from validated fields, partition/account from
+  an allowlist. It runs outside the jail for the same reason the Slurm read clients do
+  (munge socket + cluster network).
+- **Scrub the job environment.** `load_dotenv` puts `SLACK_BOT_TOKEN` and
+  `AGENT_INTERNAL_SECRET` into the bot's `os.environ`, which a naive `sbatch` inherits into
+  the job. `--export=NONE` plus an explicit whitelist.
+- **Tag for attribution** (`--job-name`/`--comment` carrying `aspen:<alias>:<thread>`) so
+  the read-only `squeue`/`sacct` surface can map jobs back to who asked.
+- **Accounting is an admin question, not a code one.** Jobs charge the bot's Slurm
+  association; either everything runs under one account or the bot is added to each user's,
+  which is a cluster-side association change.
+- **Gate this on §18.1.** A submitted job runs another user's script, possibly edited by the
+  model, as the bot's Unix user with no sandbox on the compute node — so it can read
+  `$ASPEN_STATE_DIR` and the repo `.env`. With a single account there is no fix; the
+  service-account split is what makes this safe to build.
+- **Results stay in the agent's workspace** (world-readable) and are reported/attached from
+  there. Writing back into a user's tree is out of scope; if it is ever wanted, the
+  mechanism is an opt-in per-user inbox directory whose existence *is* the consent.
+
+### 18.3 Per-user calculations roots
+
+Today there is one `CALCULATIONS_ROOT` and it is one person's tree; every user's questions
+resolve into it. The target model is **N named roots**, so each user's own work lives where
+they keep it and colleagues' work is reachable by name.
+
+**The read boundary stays flat, and stays POSIX's job.** Everyone may read everyone,
+exactly as on the shared filesystem — so Aspen models *naming and ownership*, never
+permission. A group/ACL layer inside Aspen would be a copy of the real boundary, and a copy
+can only ever be wrong in the direction of showing something it shouldn't. If the boundary
+ever stops being flat (an embargo, a collaborator's data under someone else's agreement),
+the enforcement is Unix groups on the bot's own account and the read simply fails — nothing
+to model here. Note the corollary at the §18.1 cutover: the bot currently runs as the
+developer and therefore sees everything the developer sees; under `aspen-agent` its group
+memberships *become* the effective boundary, so every root needs re-checking then.
+
+- **Where the value lives:** a `calc_root` field on the registry record (§5), beside
+  `alias`/`role`, plus `unix_user` (a Slack ID does not name a SLAC account). The registry
+  hot-reloads and sits outside `WORKSPACE_ROOT`, so sandboxed code cannot edit where the
+  agent is allowed to look — the same requirement that put `USERS_FILE` there.
+- **Shared roots** are named entries owned by nobody, for group project data. Needed
+  because the existing tree is a mix of personal and shared work: without this tier,
+  setting the first personal root permanently relabels group projects as one person's.
+- **Migration is a no-op.** `CALCULATIONS_ROOT` remains the fallback for any user with no
+  `calc_root`. Day one nobody has one and behavior is identical; roots are then set one
+  user at a time, each taking effect on that user's next message.
+- **One resolution seam.** `_safe_path(rel)` becomes `_safe_path(rel, owner, context)`:
+  empty owner = the caller's own root, an alias = that person's. Every file tool already
+  routes through it. **The model passes an alias, never a path** — the registry does
+  alias → root on the trusted side, the same property that makes `write_workflow`
+  unspoofable. Paths echoed back are qualified (`@arun-asundi/thermolysin/...`), which is
+  also the attribution a PI asking across the group actually wants.
+- **Scope, not permission, on search.** `search_files` gains own (default) / one alias /
+  everyone. The caps in §15 bound a single call; N roots multiply the work, so a
+  cross-root sweep needs its own budget.
+- **Validation twice.** An `aspen-users set-root` command validates at write time (exists,
+  is a directory, readable *as the bot's Unix user*, not inside `STATE_DIR`/`WORKSPACE_ROOT`
+  /the repo) and `main._check_state_locations` re-checks at startup, because roots rot.
+  **No root may be nested inside another**: `_safe_path` fences by `relative_to`, so a root
+  containing another silently encloses it and the boundary is not there.
+- **Writes never cross into a root.** `write_metadata` is the only write into the tree
+  today and it moves out entirely (§18.4). Anything the agent must modify — a script it is
+  preparing to run — is *copied* into its own workspace first; see §18.2.
+- **The tool server needs the same treatment.** `PROJECTS_ROOT` is a second copy of the
+  fence and feeds the bwrap binds. It already receives `user_id` per call, so it resolves
+  the root from the registry server-side and binds *that* read-only — it never accepts a
+  root path over the socket.
+
+### 18.4 Project metadata as a sidecar
+
+`write_metadata` (§7) writes `metadata.md` into the project directory. That works only
+because the tree belongs to the account the bot runs as. Under per-user roots it is a write
+into someone else's directory, and under the §18.1 service account it stops working at all,
+including for the developer's own root. Metadata therefore moves **out of the calculations
+tree**, into a sidecar that mirrors it:
+
+```
+$ASPEN_STATE_DIR/
+  users.json
+  workflows/<alias>__<uid>/WORKFLOW.md
+  metadata/<alias>__<uid>/<project>/metadata.md        ← mirrors <their-root>/<project>/
+  metadata_history/<alias>__<uid>/<project>/<ts>.md
+```
+
+**The path is the key.** Mirroring derives the location by arithmetic, so there is no
+mapping to keep in sync — the same trick as `workflows.dir_for`, and the reason to prefer
+it over an index file (a second source of truth that can desync, needs locking, and stores
+what was derivable), flat encoded filenames (slug collisions: `a/b` and `a-b`), or
+frontmatter declaring its own target (requires a full scan to answer one lookup, and makes
+the *model's* declared target authoritative).
+
+**It belongs in `STATE_DIR`, not `WORKSPACE_ROOT`.** The workspace is sandbox-writable, and
+metadata is read back into the model's context on later turns — so metadata stored there is
+a slow-loop injection path: generated analysis code edits a note that steers a future
+session. The line to hold is **`WORKSPACE_ROOT` = what the sandbox produces; `STATE_DIR` =
+what steers the agent.** Placing it beside `workflows/` also inherits the existing
+`_check_state_locations` guard for free. `metadata_history` moves for the same reason.
+
+Consequences to handle in the same pass:
+
+- **`metadata_history` must be keyed by owner.** It is keyed by project alone today, so the
+  moment there are multiple roots, two users with a `thermolysin` project silently share a
+  history directory. Latent collision, exposed rather than created by this change.
+- **Ownership is the *data's* owner, not the writer.** One canonical metadata file per
+  project, written only by the person whose project it is. Per-viewer annotations (a PI
+  commenting on someone's work) are a different feature; folding them in here would fork
+  metadata into per-reader copies.
+- **Fence the join.** The relative path comes from a tool argument and is now joined into a
+  *writable* location, so it needs the resolve-and-`relative_to` check `workflows._fenced`
+  does. Keep the existing requirement that the source project directory exists — it doubles
+  as validation, so metadata cannot exist for a project that does not.
+- **Read it through its own tool, not a transparent `read_file` redirect.** Metadata is
+  Aspen-authored; project files are the user's. Serving both through one path means the
+  agent cannot distinguish its own past notes from ground truth — the same reason
+  `read_workflow` is separate and trust-tagged (§6). `list_directory` notes that metadata
+  exists; `read_metadata(project, owner)` returns it with authorship and date.
+- **The tool server reads it too.** `load_metadata` parses the advisory Python-library list
+  out of the project directory (§7) and 422s with a template when absent; it must read the
+  sidecar instead, resolved server-side from `user_id`.
+- **Migration.** Existing in-tree `metadata.md` files are copied into the sidecar keyed to
+  their owner. The originals cannot be removed (read-only tree, and impossible once the bot
+  is a separate account), so they linger as ordinary files that `read_file` still returns —
+  `read_metadata` prefers the sidecar, and users delete the stale in-tree copy themselves.
+
+### 18.5 Other deferred items
 
 - LLM-assisted metadata/indexing suggestions.
 - Persistent conversation history across restarts.
