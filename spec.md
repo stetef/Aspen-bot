@@ -7,9 +7,10 @@ HPC computational-chemistry results from Slack: browsing a calculations tree, pl
 and summarizing data in a sandbox, and recording per-project notes.
 
 This document describes the system **as built**. Work that is designed but not yet
-implemented (production service account / systemd, the agent submitting its own Slurm
-jobs) is collected in
-[§18 Roadmap](#18-roadmap--not-yet-implemented). Magic numbers in
+implemented (chiefly the production service account / systemd) is collected in
+[§18 Roadmap](#18-roadmap--not-yet-implemented). Slurm job submission is built but runs
+**under the developer's own account for a beta group**, which changes what several of its
+controls are load-bearing *for* — [§19](#19-slurm-job-submission-beta). Magic numbers in
 this doc are defaults; the authority is `.env` (see [§15](#15-environment-variables-env)).
 
 ---
@@ -26,7 +27,11 @@ aspen-bot.py / aspen.* package   (Slack Bolt app)
   │   └── tool calls served in-process as MCP tools:
   │         list_directory · read_file · search_files · attach_file
   │         read_metadata · write_metadata · read_workflow · write_workflow
-  │         (every path-taking tool takes an `owner` — whose root to read)
+  │         submit_orca_batch · cancel_orca_batch · list_my_jobs
+  │         (every path-taking tool takes an `owner` — whose root to read;
+  │          the job tools deliberately do not — they act on the speaker)
+  │   └── Slurm: read-only via Bash (squeue/sacct/…); submit + cancel via the
+  │         structured tools above, gated on Aspen's own job ledger (§19)
   │
   ▼  run_python_analysis → HTTP POST over a Unix-domain socket + shared-secret header
 FastAPI tool server  (tool_server.py, binds a Unix socket in a 0700 dir)
@@ -174,7 +179,7 @@ was mentioned in (or DMed in). Adding/removing scopes requires reinstalling the 
 ### User allowlist
 
 Aspen acts only on Slack user IDs marked `status: active` in the **user registry**
-([§5](#5-user-registry)). Anyone else gets at most one "not authorized" reply that names
+([§5](#5-user-registry--calculations-roots)). Anyone else gets at most one "not authorized" reply that names
 the admin to contact. This check is the **first authorization gate**, before rate limiting
 and before any tool runs. Until the registry file exists, the allowlist falls back to the
 `ASPEN_ALLOWED_SLACK_USER_IDS` bootstrap.
@@ -235,12 +240,23 @@ auto-approves exactly the MCP tools below plus a read-only Bash allowlist, and a
 | `demo_request_card` | demo-only | Render the admin request into the thread (never sends) — [§5.2](#52-demo-mode-aspendemopy) |
 | `demo_approve` | demo-only | Advance the demo walkthrough; grants nothing to anyone |
 | `run_python_analysis` | sandboxed | Execute analysis code in the bwrap jail (via the tool server) |
+| `submit_orca_batch` | **submit** | Stage structures and run the ORCA → CORVUS pipeline for the speaker — [§19](#19-slurm-job-submission-beta) |
+| `cancel_orca_batch` | **cancel** | Cancel the speaker's *own* Aspen-submitted jobs, after per-ID verification — [§19.5](#195-verify-before-cancel) |
+| `list_my_jobs` | read-only | The speaker's ledger rows, with live Slurm state |
 
 Every path-taking tool takes an **`owner`** — a *name* (alias, Slack ID, or shared-root
 name), never a path. Reading is flat: any root may be read by anyone ([§5.1](#51-calculations-roots-aspenrootspy)).
 
 **No tool writes inside any calculations root.** That is now absolute, not a narrow
-exception: the two write surfaces both land in Aspen's own storage.
+exception: every write surface lands in Aspen's own storage — including job staging, which
+*copies* structures out of a root and never writes back into one
+([§19.3](#193-staging-the-model-never-authors-a-job)).
+
+`submit_orca_batch` / `cancel_orca_batch` are the one pair that spends a shared resource
+rather than producing text, and they follow the same discipline as `write_workflow`: neither
+takes an `owner`, both act on `context["user_id"]` alone, and cancellation is enumerated
+from Aspen's own ledger rather than from the scheduler. Their full argument is
+[§19](#19-slurm-job-submission-beta).
 
 `write_metadata`: the target is derived entirely from (owner, project) and lands under
 `METADATA_ROOT` ([§7](#7-project-metadata)). The project directory must exist, the project
@@ -281,7 +297,12 @@ off (the default) the Bash tool runs as the bot's Unix user with no path restric
 those would let an allowlisted user read any file that user can (SSH keys, `.env`,
 `~/.claude`). Content search is provided instead by the path-fenced `search_files` tool.
 The `can_use_tool` backstop denies anything off the allowlist; job-control (`scancel`,
-`scontrol update`) is never permitted.
+`sbatch`, `scontrol update`) is **never** permitted through Bash — not even now that Aspen
+can submit and cancel jobs. That capability is a pair of structured tools
+([§19.2](#192-the-two-tools)) precisely so the argv stays in Python: `Bash(sbatch:*)` would
+hand the model `--wrap` (arbitrary code execution as the bot's Unix user on a compute node,
+outside every jail) and `Bash(scancel:*)` would hand it `-u` (the entire queue, in one
+word). A prefix rule cannot express "only this user's own jobs"; a Python function can.
 
 If/when the agent is given a Bash **write/exec** surface, the Claude Code OS sandbox
 ("Sandbox B") should be enabled **fail-closed** to confine it — see
@@ -813,6 +834,28 @@ ASPEN_MAX_WORKFLOW_BYTES=60000
 # Bash allowlist (default: Slurm read-only only — no general file readers; see §4)
 # ASPEN_BASH_ALLOWLIST=
 
+# Slurm job submission (§19). OFF by default — a deployment that hasn't thought
+# about compute budgets shouldn't gain job submission just by upgrading.
+ASPEN_JOBS_SUBMIT_ENABLED=false
+ASPEN_JOBS_LEDGER=                        # default $ASPEN_STATE_DIR/jobs.sqlite
+ASPEN_JOBS_STAGING_ROOT=                  # default $ASPEN_STATE_DIR/jobs-staging
+                                          # MUST be outside WORKSPACE_ROOT + sandbox
+                                          # write paths — startup refuses otherwise
+ASPEN_JOBS_PIPELINE_BIN=xas-run-batch     # the pipeline entry point (on PATH)
+ASPEN_JOBS_SCHEDULER=slurm
+ASPEN_JOBS_MAX_STRUCTURES=24              # per submission
+ASPEN_JOBS_MAX_ACTIVE_PER_USER=48         # concurrent non-terminal jobs
+ASPEN_JOBS_MAX_ACTIVE_TOTAL=200
+ASPEN_JOBS_MAX_SUBMITS_PER_DAY=10         # per user
+ASPEN_JOBS_CONFIRM_TTL_SECONDS=900        # dry-run → confirm token lifetime
+ASPEN_JOBS_SUBMIT_TIMEOUT_SECONDS=600     # cap on the orchestrator subprocess
+# Extra env names to pass through to the orchestrator subprocess (and thus to
+# jobs). The base allowlist is PATH/HOME/USER/LANG/TERM/TMPDIR + PIPELINE_*/XAS_*;
+# secrets are never included, whatever is listed here (§19.6).
+# ASPEN_JOBS_ENV_PASSTHROUGH=
+# ASPEN_JOBS_SBATCH_EXPORT=               # default: the same allowlist; 'NONE' to
+                                          # tighten (disables pipeline auto-rerun)
+
 # Analysis sandbox (bwrap)
 ANALYSIS_PYTHON=                          # default $WORKSPACE_ROOT/analysis-venv/bin/python
 # ANALYSIS_VENV, BWRAP_BIN, ANALYSIS_RO_PATHS — optional, sane defaults
@@ -842,7 +885,9 @@ Paths and identity-specific values are driven entirely from `.env` (no hardcoded
 |---|---|
 | Authorization | Slack user-ID allowlist — first gate, before rate limiting. In group DMs, a **participant gate** additionally requires *every* human member to be allowlisted (fail-closed) |
 | Slack connection | Socket Mode — outbound WebSocket only, no open ports |
-| Tool surface | Locked-down allowlist + `can_use_tool` deny; host settings ignored; Bash = Slurm read-only |
+| Tool surface | Locked-down allowlist + `can_use_tool` deny; host settings ignored; Bash = Slurm read-only (`sbatch`/`scancel` are structured tools, never Bash rules) |
+| Slurm submission | Off by default. Model supplies a `template_mode` from a fixed enum, never a script; inputs copied into a staging tree outside every writable area; orchestrator env scrubbed to an allowlist so no token reaches a compute node; per-user and global job caps; dry run + single-use confirmation token ([§19](#19-slurm-job-submission-beta)) |
+| Slurm cancellation | Enumerated **only** from Aspen's own ledger, filtered to the Slack event's `user_id`, then each ID verified against live Slurm (`WorkDir` inside *that* requester's staging dir) before an explicit-ID `scancel`. No filter flags, ever ([§19.5](#195-verify-before-cancel)) |
 | Read/search tools | Path-fenced in Python to the *resolved* root; can't read `~/.ssh`, `.env`, or hop between roots |
 | Calculations roots | One per user + shared; reads are flat by design, and the tool surface takes a **name**, never a path. Roots may not nest (startup refuses) |
 | Write surface | **Nothing inside any calculations root.** Metadata and workflows land in `$ASPEN_STATE_DIR`; the jail gets `figures/`,`cache/`. Prior versions snapshotted |
@@ -862,9 +907,11 @@ service-account cutover checklist) is in [`THREAT_MODEL.md`](THREAT_MODEL.md).
 **Hard constraints — Aspen can never:** act for a non-allowlisted user; engage in a group
 DM that contains any non-allowlisted human (participant gate, fail-closed); write *any*
 file inside *any* calculations root; grant itself or anyone else access or a calculations
-root; write another user's workflow or metadata; submit/cancel Slurm jobs (read-only
-investigation only); reach files outside the configured roots / workspace / state dir;
-make network calls from inside the analysis jail.
+root; write another user's workflow or metadata; **cancel a Slurm job it did not submit, or
+one submitted for a different Slack user** ([§19.5](#195-verify-before-cancel));
+**author the body of a job it submits** ([§19.3](#193-staging-the-model-never-authors-a-job));
+run `sbatch`/`scancel` through Bash; reach files outside the configured roots / workspace /
+state dir / staging tree; make network calls from inside the analysis jail.
 
 ---
 
@@ -901,6 +948,19 @@ A hermetic pytest suite runs without a live Slack connection, Claude CLI, or net
   `test_render.py`, `test_attachments.py`** — session lifecycle, rate limits, the Slack
   admission/typing-status path, Slack-markdown rendering, and the attachment sink.
 
+- **`tests/test_jobs.py`, `test_jobs_cancel.py`, `test_staging.py`** — the Slurm surface
+  ([§19](#19-slurm-job-submission-beta)), which is where the contract tests are densest
+  because it is the one capability that spends a shared resource. The properties asserted
+  against the real tool surface: a cancel tool that grows an `owner` parameter fails the
+  suite; one user cannot cancel another's job by ID, by batch, by project name, or by any
+  wording; a job whose `WorkDir` lies outside the requester's staging tree is refused even
+  when its ledger row says otherwise (the recycled-ID case); `scancel` argv never contains
+  a filter flag (`-u`/`-n`/`-A`/`-p`/`-q`/`-t`/`--me`); an unparseable or erroring
+  `scontrol` fails closed; the orchestrator env contains no secret; `template_mode` off the
+  enum is refused; no tool accepts a script path or script body; the ledger write precedes
+  submission and a failed write aborts it; caps and the confirmation token are enforced in
+  Python rather than by prompt.
+
 `tests/conftest.py` provides a facade mapping the legacy flat names onto the `aspen.*`
 package and neutralizes import-time side effects.
 
@@ -928,97 +988,86 @@ by **systemd**, required before opening Aspen to users beyond the developer. Out
   the model endpoint, the analysis venv building, and the SQLite placement/journal choice
   validated on the actual filesystem.
 
-### 18.2 Agent-submitted Slurm/PBS jobs (ORCA → CORVUS pipeline)
+### 18.2 Agent-submitted Slurm jobs — built in beta form
 
-Today Aspen's scheduler access is **read-only investigation** only. A future capability
-would let it submit and cancel its own jobs via the `orca-pipeline` `submit-batch.py`
-(ORCA → CORVUS → postprocess chains, one per `.xyz`). Non-negotiable design principles:
+Submission and cancellation are **implemented** and running under the developer's own
+account for a small beta group. The as-built design, and the ways it differs from the
+sketch that used to live here, are in [§19](#19-slurm-job-submission-beta).
 
-- **No agent-written code touches the pipeline** — it may only invoke `submit-batch.py`
-  with a validated, fixed `template_mode` allowlist and path-validated structure/output
-  dirs (within the projects root); it never composes shell commands.
-- **Every submission is fully logged before `qsub`/`sbatch`** (command, args, user, job
-  IDs, timestamp); if logging fails, submission aborts.
+What remains roadmap is the part this section always said it depended on: the
+**service-account split** ([§18.1](#181-production-deployment-service-account--systemd)).
+Until it lands, a submitted job runs as the developer's Unix user with no sandbox on the
+compute node, so it can read `$ASPEN_STATE_DIR` and the repo `.env`. That risk is now
+*accepted and recorded* ([THREAT_MODEL](THREAT_MODEL.md) §8) rather than blocking, on the
+grounds that the beta registry is a handful of trusted colleagues and the model never
+authors the job body ([§19.3](#193-staging-the-model-never-authors-a-job)). The
+consequences for the *cancel* boundary are the subject of
+[§19.1](#191-why-the-ledger-and-the-workdir-tag-are-load-bearing) — they are the reason
+this feature could be built early at all.
+
+The design principles below were written before the build and are **unchanged and still
+binding**. Where the implementation had to depart from the mechanism this section
+originally proposed, the reason is recorded in §19 and cross-referenced here.
+
+- **No agent-written code touches the pipeline** — it may only invoke the pipeline's own
+  entry point with a validated, fixed `template_mode` allowlist and path-validated
+  structure/output dirs; it never composes shell commands.
+  ([§19.3](#193-staging-the-model-never-authors-a-job); the entry point is
+  `xas-run-batch`, not the `submit-batch.py` this section used to name — the pipeline was
+  reorganised into the installable `xas_pipeline` package.)
+- **Every submission is fully logged before `sbatch`** (command, args, user, job IDs,
+  timestamp); if logging fails, submission aborts.
+  ([§19.4](#194-the-ledger))
 - **`--no-submit` dry run first** to validate inputs before any real submission.
-- **Scheduler-agnostic in the pipeline, not Aspen.** Cancellation is scoped strictly to
-  job IDs in the agent's own SQLite `jobs`/`job_runs` tables (reserved names) — the agent
+  ([§19.7](#197-caps-dry-runs-and-the-kill-switch))
+- **Cancellation is scoped strictly to job IDs in the agent's own ledger** — the agent
   never lists scheduler jobs and cancels from that. Cancelling the CORVUS job kills the
   dependent postprocess job via the dependency chain.
-- Two endpoints: `submit_orca_batch` and `cancel_orca_batch`. To keep this addable
-  without refactoring, the tool server stays structured so new routes/tools drop in
-  without modifying existing ones.
-
-Once calculations are per-user ([§18.3](#183-per-user-calculations-roots)), submission is
-always **on someone's behalf but under the agent's own identity** — the agent's Unix user
-and its own munge credentials, never the requester's:
-
-- **Copy, then edit, then submit.** Nothing in a user's root is modified. Files are staged
-  into `$WORKSPACE_ROOT/jobs/<alias>__<uid>/<thread>/` — copied, never symlinked (a symlink
-  lets the sandboxed editor write back through it) — with a provenance record of source
-  paths, checksums, and the requesting Slack user. The staging tree is the agent's writable
-  surface; roots stay outside every sandbox write path.
-- **`sbatch` is a structured tool, never a Bash allowlist entry.** A `Bash(sbatch:*)` prefix
-  rule would hand the model `--wrap`, i.e. arbitrary code execution as the bot user on a
-  compute node, outside the jail. The tool builds the argv itself: script path must resolve
-  inside a staging directory, resources come from validated fields, partition/account from
-  an allowlist. It runs outside the jail for the same reason the Slurm read clients do
-  (munge socket + cluster network).
+  ([§19.5](#195-verify-before-cancel))
+- **Copy, then edit, then submit.** Nothing in a user's calculations root is modified;
+  inputs are copied (never symlinked — a symlink lets a writer reach back through it) into
+  a staging tree, with provenance. ([§19.3](#193-staging-the-model-never-authors-a-job))
+- **`sbatch` is never a Bash allowlist entry.** A `Bash(sbatch:*)` prefix rule would hand
+  the model `--wrap`, i.e. arbitrary code execution as the bot user on a compute node,
+  outside every jail. ([§19.2](#192-the-two-tools))
 - **Scrub the job environment.** `load_dotenv` puts `SLACK_BOT_TOKEN` and
   `AGENT_INTERNAL_SECRET` into the bot's `os.environ`, which a naive `sbatch` inherits into
-  the job. `--export=NONE` plus an explicit whitelist.
-- **Tag for attribution, keyed by Slack ID.** `--job-name aspen-<alias>-<project>` is what
-  the group sees in `squeue`; `--comment aspen/v1/<slack-id>/<thread-ts>` is the durable
-  machine key. The comment carries the **ID, not the alias**: aliases are renameable and
-  lookups everywhere else resolve by `slack_user_id`, so an alias baked into a months-old
-  job record stops resolving the first time someone is renamed. Both strings are composed
-  only from the Slack event's `user_id` and `thread_ts` — never from conversation text —
-  the same rule that keeps `write_workflow` un-forgeable (C9).
-  **Verified on s3df (2026-08):** `scontrol show config` reports
-  `AccountingStoreFlags = job_comment`, so slurmdbd retains the comment and `sacct -o
-  Comment` can recover attribution from Slurm itself, independent of anything Aspen keeps.
-  Re-check that flag before relying on it — without it the comment is silently dropped.
-- **Accounting is an admin question, not a code one.** Jobs charge the bot's Slurm
-  association; either everything runs under one account or the bot is added to each user's,
-  which is a cluster-side association change.
-- **Gate this on §18.1.** A submitted job runs another user's script, possibly edited by the
-  model, as the bot's Unix user with no sandbox on the compute node — so it can read
-  `$ASPEN_STATE_DIR` and the repo `.env`. With a single account there is no fix; the
-  service-account split is what makes this safe to build.
-- **Results stay in the agent's workspace** (world-readable) and are reported/attached from
-  there. Writing back into a user's tree is out of scope; if it is ever wanted, the
-  mechanism is an opt-in per-user inbox directory whose existence *is* the consent.
+  the job. ([§19.6](#196-environment-scrubbing) — implemented by scrubbing the
+  *orchestrator subprocess*, not by `--export=NONE`, for a reason worth reading)
+- **Accounting is an admin question, not a code one.** Jobs charge the submitting account's
+  Slurm association. During the beta that is the developer's, via the pipeline templates'
+  `--account=ssrl:SMBXAS`.
+- **Results stay in the agent's workspace** and are reported/attached from there. Writing
+  back into a user's tree is out of scope; if it is ever wanted, the mechanism is an opt-in
+  per-user inbox directory whose existence *is* the consent.
 
-**Attribution is two-phase, and the second phase is the one that answers "who used the
-compute".** At submit time you know *who and what*; you do not know what it cost — elapsed
-time, CPU-hours and exit state exist only after the job ends. A design that logs only at
-submission yields job *counts* and nothing about consumption, which is the metric that
-matters when an allocation runs low.
+Two mechanisms this section proposed did **not** survive contact with the cluster, and the
+replacements are load-bearing rather than cosmetic:
 
-1. **Ledger, written once at submit** (the "fully logged before `sbatch`" requirement
-   above, given a schema): `job_id`, `slack_user_id`, `alias`, `thread_ts`, `project`,
-   staging path, submitted-at, and the requested resources. Rows are immutable.
-2. **Reconciler, run later** — joins the ledger against Slurm's own accounting to fill in
-   what the job actually consumed:
-
-   ```
-   sacct -X -n -P -u aspen-agent -S <since> \
-     -o JobID,JobName,Comment,State,Submit,Start,End,Elapsed,TotalCPU,AllocTRES,ExitCode
-   ```
-
-   `-X` limits to job allocations (no `.batch`/`.extern` step rows, which would double-count),
-   `-P` is parseable output, `-n` drops the header. `TotalCPU`/`AllocTRES` are the
-   consumption figures; `Comment` lets a row be re-attributed even if the ledger is lost.
-
-The two copies fail differently and that is the point: the ledger can be corrupted or
-deleted, and Slurm's copy survives it; slurmdbd purges on a site-set schedule, and the
-ledger survives that. Neither alone is a durable record of who used the allocation.
+- **`--comment aspen/v1/<slack-id>/<thread-ts>` cannot be set by Aspen.** The pipeline runs
+  `sbatch` itself, and **there is no `SBATCH_COMMENT` environment variable** (verified
+  against the s3df `sbatch` man page, 2026-08) — `--comment` is settable only on the
+  command line or in a script's `#SBATCH` header, neither of which Aspen owns.
+  `--wckey` is not an alternative either: s3df reports `TrackWCKey = no`, so it is
+  dropped. The tag Aspen uses instead is **`WorkDir`**, which Slurm records itself —
+  see [§19.1](#191-why-the-ledger-and-the-workdir-tag-are-load-bearing). The
+  `AccountingStoreFlags = job_comment` finding still holds and still matters: it is what
+  makes the comment worth plumbing through the pipeline as a *second* check later
+  ([§19.9](#199-what-the-beta-does-not-fix)).
+- **Two endpoints on the tool server** is not where this went. `tool_server.py` is
+  deliberately standalone — it never imports the `aspen` package and keeps its own
+  registry reader. Putting the cancel-ownership check there would mean a **second
+  implementation** of it, which is the precise shape of both scope escapes recorded in
+  [THREAT_MODEL](THREAT_MODEL.md) §3. The Slurm surface therefore lives in the bot
+  process (`aspen/jobs.py`), which is also where the Slurm read clients already run.
 
 ### 18.3 Shipped since this list was written
 
 Per-user calculations roots and the metadata sidecar are **built** — see
-[§5.1](#51-calculations-roots-aspenrootspy) and [§7](#7-project-metadata). What is still
-outstanding from that design is the part that depends on §18.1: staged job submission on a
-user's behalf, covered above.
+[§5.1](#51-calculations-roots-aspenrootspy) and [§7](#7-project-metadata). Staged job
+submission on a user's behalf is **built in beta form** —
+see [§19](#19-slurm-job-submission-beta). What is still outstanding is
+[§18.1](#181-production-deployment-service-account--systemd) itself.
 
 
 ### 18.4 Other deferred items
@@ -1031,3 +1080,261 @@ user's behalf, covered above.
 - Async/background figure-archive trimming (synchronous per-request is sufficient now).
 - Automated shared-secret rotation (manual today).
 - Multi-process scaling (would require moving rate-limit/concurrency state out of process).
+
+---
+
+## 19. Slurm Job Submission (beta)
+
+Aspen can submit and cancel ORCA → CORVUS pipeline batches on a user's behalf
+(`aspen/jobs.py`, `aspen/staging.py`). This is the one capability that **spends a shared
+resource** and the one whose mistakes are visible to the whole group, so it is built with
+more enforcement per line than anything else in the system.
+
+It runs during the beta under the **developer's own Unix account**, ahead of the
+service-account split ([§18.1](#181-production-deployment-service-account--systemd)). That
+ordering was chosen deliberately — the alternative was shipping it for the first time
+directly into a systemd service with no room to iterate — and it changes the *role* of
+several controls rather than merely weakening them. §19.1 is that argument; it is the
+section to read before changing anything here.
+
+### 19.1 Why the ledger and the `WorkDir` tag are load-bearing
+
+Under a dedicated `aspen-agent` account, Unix and Slurm ownership are a **free outer
+layer**: the service account simply cannot `scancel` a job belonging to anyone else, and
+every Aspen-side check is defense in depth on top of that.
+
+Running as the developer removes that layer **and inverts it**. Every job the developer has
+ever submitted by hand — months of real research jobs — is inside `scancel` range of the
+bot's own credentials. So the Aspen-side checks stop being redundancy and become the only
+thing standing between a confused or injected model and someone's queue.
+
+The substitute for Unix ownership is a **tag Slurm maintains itself**, checked immediately
+before every cancel:
+
+| Layer | What it stops | Status during beta |
+|---|---|---|
+| Slurm/POSIX ownership | Cancelling another *person's* hand-submitted jobs | **Absent** — the bot is the developer |
+| Ledger membership: the job ID must be a row in Aspen's own `jobs` table | Cancelling anything Aspen did not submit — including a hallucinated ID, or one a user typed in chat | Enforced ([§19.4](#194-the-ledger)) |
+| Ledger *ownership*: the row's `slack_user_id` must equal the Slack event's `user_id` | **Cancelling another Slack user's Aspen job.** Slurm cannot distinguish these — they are all one Unix user | Enforced ([§19.5](#195-verify-before-cancel)) |
+| `WorkDir` verification against live Slurm state | A stale ledger row pointing at a **recycled** job ID | Enforced ([§19.5](#195-verify-before-cancel)) |
+
+**Why `WorkDir` and not `--comment`.** The original design ([§18.2](#182-agent-submitted-slurm-jobs--built-in-beta-form))
+keyed this on `--comment aspen/v1/<slack-id>/<thread-ts>`. Aspen cannot set it: the
+pipeline invokes `sbatch` itself, and Slurm offers no `SBATCH_COMMENT` environment variable
+to inject one through (`--wckey` is dropped too — `TrackWCKey = no`). What Slurm *does*
+record without being asked is the submission directory, and the pipeline's job scripts run
+with `--chdir=.` from their staging run directory. So `WorkDir` is:
+
+- **Set by Slurm, not by Aspen** — it cannot be forged by conversation text, which is the
+  same property the `--comment` design was reaching for (C9).
+- **Per-user by construction** — staging is
+  `$ASPEN_JOBS_STAGING_ROOT/<alias>__<slack-id>/<thread-ts>/…`, so "is this job's `WorkDir`
+  inside *this requester's* staging directory" reuses the path fence Aspen already
+  enforces everywhere else, rather than introducing a second notion of ownership.
+- **Structurally absent from hand-submitted jobs** — a job the developer launched from
+  their own tree has a `WorkDir` outside the staging root, so it is not merely *disallowed*
+  from being cancelled, it fails the check by construction. This is what restores the
+  protection that Unix ownership would otherwise provide.
+
+Job **IDs are reused** — s3df reports `MaxJobId = 67043328`, and the counter also resets on
+a controller rebuild — which is why this check is against live Slurm state at cancel time
+rather than trusting the ledger alone.
+
+### 19.2 The two tools
+
+| Tool | Access | What it does |
+|---|---|---|
+| `submit_orca_batch` | **submit** | Stage a structure set and run the ORCA → CORVUS pipeline for the speaker |
+| `cancel_orca_batch` | **cancel** | Cancel the speaker's own Aspen-submitted jobs, after verification |
+| `list_my_jobs` | read-only | The speaker's ledger rows, with live Slurm state |
+
+Neither write tool takes an **`owner`** parameter, and that omission is the control, not an
+oversight. The requester is `context["user_id"]` — the ID Slack itself attached to the
+event — exactly as with `write_workflow` (C9). A model can be argued into passing any
+argument it is handed; it cannot pass a value it never receives. There is deliberately no
+way to submit or cancel *on behalf of* someone else, not even for the admin through the
+agent: the admin's escape hatch is the CLI ([§19.8](#198-the-cli-escape-hatch)), outside
+the model's reach, like every other granting action in the system.
+
+`sbatch` and `scancel` are **never** added to the Bash allowlist ([§4](#4-tool-surface)),
+which stays read-only. `Bash(sbatch:*)` would hand the model `--wrap` — arbitrary code
+execution as the bot's Unix user on a compute node, outside every jail — and
+`Bash(scancel:*)` would hand it `-u`, which is the whole queue in one word.
+
+### 19.3 Staging: the model never authors a job
+
+`submit_orca_batch` takes a `template_mode` from a **fixed enum** (`ca-fixed`, `h-only`,
+`single-point`, `free`, `backbone`, `xtb-free`, `xtb-constrained`, `quick`,
+`quick-ca-fixed` — mirroring the pipeline's mutually-exclusive mode flags), a structure
+path resolved through `roots.resolve` like every other path-taking tool, and nothing else
+that reaches a command line.
+
+It takes **no script path and no script content.** This is the load-bearing difference from
+the §18.2 sketch, which said only that a script path must resolve inside a staging
+directory — necessary but not sufficient, because a tool that accepts a path the model
+chose is one writable staging directory away from "the model wrote the job body". Instead
+the pipeline renders its own job scripts from its own packaged templates, and Aspen's
+contribution is a validated mode name. What lands on a compute node is therefore *pipeline
+code plus the user's `.xyz` data* — never model output.
+
+Inputs are **copied** into `$ASPEN_JOBS_STAGING_ROOT/<alias>__<slack-id>/<thread-ts>/`,
+never symlinked, alongside a `provenance.json` recording source paths, SHA-256 of each
+copied structure, the requesting Slack ID, and the resolved mode. Nothing in any
+calculations root is written — the invariant from [§7](#7-project-metadata) is unchanged by
+this feature.
+
+The staging root must sit **outside** `WORKSPACE_ROOT` and outside every
+`ASPEN_SANDBOX_WRITE_PATHS` entry, enforced at startup by the same guard that protects the
+registry ([§6 placement guard](#6-per-user-workflows)). If staging were writable by
+sandboxed analysis code, generated Python could plant a script and Aspen would submit it —
+the cross-tool path that makes an otherwise-fenced feature exploitable.
+
+### 19.4 The ledger
+
+One SQLite file, `$ASPEN_STATE_DIR/jobs.sqlite`, written only by the bot:
+
+- **`batches`** — one row per `submit_orca_batch`: `batch_id`, `slack_user_id`, `alias`,
+  `thread_ts`, `project`, `template_mode`, staging path, `submitted_at`, and the argv
+  actually run.
+- **`jobs`** — one row per scheduler job: `job_id`, `batch_id`, `kind` (`orca` / `corvus` /
+  `postprocess`), `job_name`, `work_dir`, `submitted_at`, plus the reconciler's columns
+  (`state`, `elapsed`, `total_cpu`, `alloc_tres`, `exit_code`, `reconciled_at`).
+
+Submit rows are **immutable**; only the reconciler's columns are ever updated
+([§19.9](#199-what-the-beta-does-not-fix)). The write happens **before** the pipeline is
+invoked and a failure to write **aborts the submission** — the §18.2 requirement, kept
+literally, because a job running with no ledger row is a job nobody can cancel through
+Aspen and nobody can attribute.
+
+**Why `STATE_DIR` and not `<workspace>/db/`.** The per-project SQLite databases of
+[§12](#12-per-project-database--sqlite) live under `WORKSPACE_ROOT`, and putting this one
+beside them would be the obvious move. It would also be wrong: this ledger is an
+**authorization input** — it decides who may cancel what — and the rule from
+[§7](#7-project-metadata) applies unchanged, *`WORKSPACE_ROOT` is what the sandbox
+produces; `STATE_DIR` is what steers the agent*. A ledger the sandbox could write is a
+ledger the agent can forge a row into, and a forged row is a cancel it should not have.
+
+### 19.5 Verify before cancel
+
+`cancel_orca_batch` resolves what it may touch through **one** function,
+`jobs.resolve_cancellable(event_user_id, selector)` — the single chokepoint, deliberately
+not duplicated into the tool server ([§18.2](#182-agent-submitted-slurm-jobs--built-in-beta-form)):
+
+1. **Enumerate from the ledger**, never from the scheduler: rows whose `slack_user_id`
+   equals the Slack event's `user_id` and whose state is not terminal. A `selector` may
+   narrow this (a batch, a project, a job ID) but can never widen it — an ID that is not
+   already in the requester's own rows resolves to nothing, whatever the conversation says.
+2. **Verify each ID against live Slurm** — `scontrol show job <id> -o`, requiring
+   `UserId` to be the account Aspen runs as, `WorkDir` to resolve inside *that requester's*
+   staging directory, and (when present) `Comment` to match. Fail **closed**: a
+   `scontrol` error, a missing field, or a `WorkDir` outside the fence drops that ID and
+   says so. It never falls through to cancelling.
+3. **Cancel explicit IDs only** — `scancel <id> <id> …`, argv built in Python.
+
+`scancel` **filter flags are never used.** `-u`, `-n/--name`, `-A`, `-p`, `-q`, `-t`,
+`--me` all delegate enumeration to Slurm, which contradicts step 1 and makes step 2
+impossible — you cannot verify the `WorkDir` of a job you never enumerated. A contract test
+fails if any of them ever appears in a built argv. "Cancel all of my jobs" needs none of
+them: `scancel` accepts many IDs at once, so the ledger supplies the set and each one is
+still verified individually.
+
+**Job names are for humans, not for authorization.** Jobs carry the pipeline's own
+`--job-name` (`orca-<basename>`, `corvus-<id>-xas`, …) so the group can read `squeue`; a
+future pipeline change can prefix them with `aspen-<alias>`. Names are never an
+authorization key: aliases are renameable, names are not unique, and a name is something a
+human can type by hand.
+
+### 19.6 Environment scrubbing
+
+`config.py` calls `load_dotenv()` at import, so `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` and
+`AGENT_INTERNAL_SECRET` are in the bot process's `os.environ`. `sbatch` defaults to
+`--export=ALL`, which snapshots the submitting environment into the job — so without care
+every compute node would receive Aspen's Slack tokens.
+
+The control is to **scrub the environment of the orchestrator subprocess**, so
+`--export=ALL` has nothing secret to copy. `jobs.submit_env()` builds an explicit
+allowlist (`PATH`, `HOME`, `USER`, `LANG`, `TERM`, `TMPDIR`, plus `PIPELINE_*` / `XAS_*`
+site variables) rather than a denylist, for the reason the seccomp filter goes the other
+way: a denylist of secret names silently fails to cover the next secret added to `.env`. A
+contract test asserts no allowlisted name matches the secret patterns.
+
+**`--export=NONE` is deliberately *not* used**, and this is a real trade rather than
+laziness. The pipeline's ORCA job script triages its own failures by calling
+`xas-rerun-orca`, which it finds on `PATH` "inherited via SLURM `--export=ALL` from the
+submitting venv" — and the call is guarded by `command -v`, so under `--export=NONE` the
+auto-rerun feature becomes a **silent no-op**: no error, no log line, just runs that quietly
+stop retrying. Scrubbing the parent environment achieves the security goal without breaking
+a feature whose failure mode is invisible. `SBATCH_EXPORT` is set to the same explicit
+allowlist as a second layer, and `ASPEN_JOBS_SBATCH_EXPORT` can tighten it to `NONE` for a
+deployment that does not want auto-rerun.
+
+### 19.7 Caps, dry runs, and the kill switch
+
+Compute is the asset that rises sharply with this feature
+([THREAT_MODEL](THREAT_MODEL.md) §2), and the primary threat actor is the careless
+allowlisted member, so the caps are Python-enforced rather than advisory:
+
+| Limit | Default | Env |
+|---|---|---|
+| Structures per submission | 24 | `ASPEN_JOBS_MAX_STRUCTURES` |
+| Concurrent Aspen jobs, per user | 48 | `ASPEN_JOBS_MAX_ACTIVE_PER_USER` |
+| Concurrent Aspen jobs, global | 200 | `ASPEN_JOBS_MAX_ACTIVE_TOTAL` |
+| Submissions / user / day | 10 | `ASPEN_JOBS_MAX_SUBMITS_PER_DAY` |
+| Feature enabled at all | **off** | `ASPEN_JOBS_SUBMIT_ENABLED` |
+
+The feature is **off by default**: a deployment that has not thought about compute
+budgets does not get job submission because it upgraded.
+
+**Dry run by default.** `submit_orca_batch` runs the pipeline with `--no-submit` first and
+reports what *would* be submitted; committing requires a second call carrying a
+confirmation token. The token is held in-process, keyed by `(thread_ts, user_id)` with a
+short TTL, and is single-use.
+
+**The confirmation is a Python control, not a prompt instruction.** Cancels work the same
+way: a preview call returns the job list and a token, and only a redeeming call cancels.
+Asking the model in the system prompt to "confirm first" would be advice — the pattern
+here is the same one `pending.py` uses, and it survives a model that has been talked into
+skipping the question.
+
+### 19.8 The CLI escape hatch
+
+`aspen-users jobs` — `list`, `show`, `cancel`, `reconcile`, and `panic` (cancel every
+non-terminal ledger job) — is the operator's path in, outside the agent and outside Slack.
+It exists because the beta's failure mode is a runaway batch at 2 a.m., and debugging that
+through a Slack thread is the wrong tool. Like every other granting/administrative action
+([§5.1](#51-calculations-roots-aspenrootspy)), it is CLI-only and has no agent-facing
+equivalent.
+
+### 19.9 What the beta does not fix
+
+Recorded here rather than left implicit, because the point of the beta is to iterate with
+the risks visible:
+
+- **A submitted job runs unjailed as the developer** and can read `$ASPEN_STATE_DIR`, the
+  repo `.env`, and `~/.ssh`. There is no fix under a single account; what bounds it is that
+  the job body is pipeline code ([§19.3](#193-staging-the-model-never-authors-a-job)) and
+  that the beta registry is a handful of trusted colleagues. Resolved by
+  [§18.1](#181-production-deployment-service-account--systemd).
+- **Jobs charge the developer's Slurm association** (`ssrl:SMBXAS` via the pipeline
+  templates), so per-user compute accounting is a ledger fact, not a cluster fact.
+- **`--comment` is not yet plumbed through the pipeline.** Adding `--comment` (and a
+  `--job-name-prefix`) to `xas-run-batch` would give a second independent tag beside
+  `WorkDir`, recoverable from `sacct -o Comment` even if the ledger is lost — worth doing,
+  since `AccountingStoreFlags = job_comment` is confirmed on s3df. Deliberately **not** a
+  generic `--sbatch-extra-args` pass-through, which would be `--wrap` by another name.
+- **The reconciler is manual** (`aspen-users jobs reconcile`), not a cron job.
+  Attribution is two-phase and the second phase is the one that answers "who used the
+  compute": at submit time you know *who and what*, but elapsed time, CPU-hours and exit
+  state exist only after a job ends, so a design that logged only at submission would yield
+  job counts and nothing about consumption. The join is:
+
+  ```
+  sacct -X -n -P -u <bot-user> -S <since> \
+    -o JobID,JobName,Comment,State,Submit,Start,End,Elapsed,TotalCPU,AllocTRES,ExitCode
+  ```
+
+  `-X` limits to job allocations (no `.batch`/`.extern` step rows, which would
+  double-count), `-P` is parseable, `-n` drops the header. The two copies fail differently
+  and that is the point: the ledger can be corrupted or deleted and Slurm's copy survives
+  it; slurmdbd purges on a site-set schedule and the ledger survives that. Neither alone is
+  a durable record of who used the allocation.
