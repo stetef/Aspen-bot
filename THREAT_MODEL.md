@@ -56,14 +56,22 @@ tell a deliberate decision from an accident.
   the Python-enforced tool limits, **never** the prompt.
 - **Non-user → the agent (DEMO)** — the one path that deliberately runs *before*
   the allowlist gate, so the boundary cannot be identity; it is **scope**. A demo
-  session resolves to the demo root and nothing else, in `roots.resolve` and
-  again in `tools._distinct_scopes` (the cross-root sweep reads the roster
-  directly and escaped the first fence during development — caught by the
-  isolation tests, which is the argument for having written them first). It
-  writes nothing, not even a temporary registry entry, so admission stays "no
+  session resolves to the demo root and nothing else, enforced in **three**
+  places: `roots.resolve`, `tools._distinct_scopes` (the cross-root sweep reads
+  the roster directly and escaped the first fence during development), and
+  `tool_server.resolve_scope` (a separate process with no view of demo sessions,
+  which resolved a visitor to the real `PROJECTS_ROOT` — on the one path that
+  *executes* code — until the bot began marking the request `demo: true` from
+  its own session state).
+  **Both escapes were the same shape:** a code path that reads the roster or the
+  registry directly instead of going through the fence. Worth checking for
+  explicitly when adding the next one — scope isolation is not a single
+  chokepoint, and nothing tells you when one was missed.
+  It writes nothing, not even a temporary registry entry, so admission stays "no
   message can widen the allowlist". Reviewing that boundary means reviewing
-  `tests/test_demo.py`: every negative case is asserted against the real tool
-  surface rather than against `demo.py` alone.
+  `tests/test_demo.py` and the DEMO section of `tests/test_tool_server_roots.py`:
+  every negative case is asserted against the real tool surface rather than
+  against `demo.py` alone.
 - **One user's authored text → another user's session** — per-user workflow files
   are user-written text *intended to be followed*, and are readable across users
   for knowledge transfer. Someone else's file is delivered `trust="reference-only"`
