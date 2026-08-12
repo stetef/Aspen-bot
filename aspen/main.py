@@ -30,6 +30,14 @@ def _check_state_locations() -> None:
     edit the allowlist or another user's workflow directly. The telemetry log and
     its switch are held to the same rule: a record of what the agent did is worth
     little if the agent can rewrite it, or quietly stop it being written.
+
+    The job ledger and the staging tree (spec §19) are held to it for two reasons
+    of their own. The ledger decides *who may cancel which job*, so a ledger the
+    sandbox can write is a row the agent can forge and a cancel it should never
+    have had. The staging tree holds the files a submitted job actually runs from,
+    so if sandboxed analysis code could write there, generated Python could plant
+    a script and Aspen would dutifully submit it — two separately fenced tools
+    composing into one hole.
     """
     danger = [config.WORKSPACE_ROOT] + [Path(p).expanduser() for p in config.SANDBOX_WRITE_PATHS]
     for label, target in (("registry", config.USERS_FILE),
@@ -38,14 +46,17 @@ def _check_state_locations() -> None:
                           ("metadata history", config.METADATA_HISTORY_ROOT),
                           ("request queue", config.REQUESTS_FILE),
                           ("telemetry log", config.TELEMETRY_DIR),
-                          ("telemetry switch", config.TELEMETRY_STATE_FILE)):
+                          ("telemetry switch", config.TELEMETRY_STATE_FILE),
+                          ("job ledger", config.JOBS_LEDGER),
+                          ("job staging root", config.JOBS_STAGING_ROOT)):
         for area in danger:
             if _under(target, area):
                 raise SystemExit(
                     f"FATAL: the {label} ({target}) is inside a sandbox-writable area "
                     f"({area}). Sandboxed code could then edit it directly, bypassing the "
                     "ownership and admission checks. Move it — set ASPEN_STATE_DIR (or "
-                    "ASPEN_USERS_FILE / ASPEN_WORKFLOWS_ROOT / ASPEN_TELEMETRY_DIR) to a "
+                    "ASPEN_USERS_FILE / ASPEN_WORKFLOWS_ROOT / ASPEN_TELEMETRY_DIR / "
+                    "ASPEN_JOBS_LEDGER / ASPEN_JOBS_STAGING_ROOT) to a "
                     "path outside WORKSPACE_ROOT and ASPEN_SANDBOX_WRITE_PATHS."
                 )
 
@@ -55,8 +66,11 @@ def _check_state_locations() -> None:
     registry.ensure_private_dir(config.WORKFLOWS_ROOT)
     if config.TELEMETRY_ENABLED:
         registry.ensure_private_dir(config.TELEMETRY_DIR)
+    if config.JOBS_SUBMIT_ENABLED:
+        registry.ensure_private_dir(config.JOBS_STAGING_ROOT)
 
     _check_calculations_roots()
+    _check_jobs_staging()
 
     users = registry.users()
     if not users:
@@ -72,6 +86,20 @@ def _check_state_locations() -> None:
     else:
         log.info("User registry: %d active user(s) from %s", len(users), config.USERS_FILE)
 
+    # Say plainly at every boot whether Aspen can spend compute, and under whose
+    # identity. This is the one capability whose blast radius is shared with the
+    # group, so "is it on" should never require reading .env to answer.
+    if config.JOBS_SUBMIT_ENABLED:
+        log.warning(
+            "Slurm submission: ON as Unix user %s — caps %d structures/submit, "
+            "%d active/user, %d active total, %d submits/user/day; ledger %s",
+            roots._whoami(), config.JOBS_MAX_STRUCTURES,
+            config.JOBS_MAX_ACTIVE_PER_USER, config.JOBS_MAX_ACTIVE_TOTAL,
+            config.JOBS_MAX_SUBMITS_PER_DAY, config.JOBS_LEDGER,
+        )
+    else:
+        log.info("Slurm submission: off (read-only investigation only)")
+
     # Say plainly at every boot what is being recorded — a collection window that
     # nobody can see is one nobody remembers to close.
     tele = telemetry.effective()
@@ -86,6 +114,48 @@ def _check_state_locations() -> None:
         if tele["excluded_users"]:
             detail += f"; {len(tele['excluded_users'])} user(s) excluded from text"
         log.info("Telemetry: %s -> %s", detail, config.TELEMETRY_DIR)
+
+
+def _check_jobs_staging() -> None:
+    """Refuse to start if job staging overlaps a calculations root.
+
+    Staging is the one place Aspen *writes* files that a compute node will later
+    execute, and the invariant it must not break is the absolute one from spec §7:
+    **nothing Aspen does writes inside any calculations root**. Containment is what
+    fences both, so an overlap in either direction breaks something:
+
+    * staging inside a root — every staged copy is a write into someone's tree, and
+      under the service account it would simply start failing instead;
+    * a root inside staging — the copy step could then read its own output, and
+      ``roots.resolve``'s fence would enclose a directory the agent can write.
+
+    Checked at boot rather than per-submission because it is a static property of
+    the configuration, and a misconfiguration should be loud at start rather than
+    surfacing as a confusing tool error on somebody's first submission.
+    """
+    if not config.JOBS_SUBMIT_ENABLED:
+        return
+    staging = config.JOBS_STAGING_ROOT
+    problems = []
+    for scope in roots.scopes():
+        root = Path(scope["path"])
+        if _under(staging, root):
+            problems.append(
+                f"job staging ({staging}) is inside the calculations root "
+                f"@{scope['name']} ({root}) — staging there would write into it"
+            )
+        elif _under(root, staging):
+            problems.append(
+                f"the calculations root @{scope['name']} ({root}) is inside job "
+                f"staging ({staging}) — staging would enclose a read-only tree"
+            )
+    if problems:
+        raise SystemExit(
+            "FATAL: job staging overlaps a calculations root:\n  "
+            + "\n  ".join(problems)
+            + "\n\nSet ASPEN_JOBS_STAGING_ROOT to a path outside every calculations "
+              "root (the default, $ASPEN_STATE_DIR/jobs-staging, satisfies this)."
+        )
 
 
 def _check_calculations_roots() -> None:

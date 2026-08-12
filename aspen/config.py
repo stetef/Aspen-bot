@@ -277,6 +277,85 @@ SANDBOX_EXCLUDED_COMMANDS = _csv_env(
 
 
 # ---------------------------------------------------------------------------
+# Slurm job submission (spec §19)
+#
+# The one capability that spends a *shared* resource, so it is off unless a
+# deployment says otherwise: nobody should gain job submission by upgrading.
+#
+# Two placement rules, both enforced at startup by main._check_state_locations:
+#
+#   * LEDGER is an AUTHORIZATION INPUT — it decides who may cancel what — so it
+#     belongs beside the registry in STATE_DIR, not with the per-project
+#     databases under WORKSPACE_ROOT. Same rule as metadata: WORKSPACE_ROOT is
+#     what the sandbox produces, STATE_DIR is what steers the agent. A ledger
+#     the sandbox can write is a row the agent can forge, and a forged row is a
+#     cancel it should not have had.
+#   * STAGING_ROOT holds the files a job actually runs from. If sandboxed
+#     analysis code could write there, generated Python could plant a script and
+#     Aspen would submit it — the cross-tool path that turns two separately
+#     fenced tools into one hole.
+# ---------------------------------------------------------------------------
+JOBS_SUBMIT_ENABLED   = _flag_early("ASPEN_JOBS_SUBMIT_ENABLED", "false")
+JOBS_LEDGER           = Path(
+    os.getenv("ASPEN_JOBS_LEDGER", str(STATE_DIR / "jobs.sqlite"))
+).resolve()
+JOBS_STAGING_ROOT     = Path(
+    os.getenv("ASPEN_JOBS_STAGING_ROOT", str(STATE_DIR / "jobs-staging"))
+).resolve()
+# The pipeline entry point. A NAME resolved on PATH (or an absolute path), never
+# a shell string — the argv is built as a list, so there is no shell to inject
+# into. See jobs.build_submit_argv.
+JOBS_PIPELINE_BIN     = os.getenv("ASPEN_JOBS_PIPELINE_BIN", "xas-run-batch")
+JOBS_SCHEDULER        = os.getenv("ASPEN_JOBS_SCHEDULER", "slurm")
+# Caps. The primary threat actor here is the careless allowlisted member and the
+# asset is shared compute, so these are Python-enforced, not prompt advice.
+JOBS_MAX_STRUCTURES   = int(os.getenv("ASPEN_JOBS_MAX_STRUCTURES", "24"))
+JOBS_MAX_ACTIVE_PER_USER = int(os.getenv("ASPEN_JOBS_MAX_ACTIVE_PER_USER", "48"))
+JOBS_MAX_ACTIVE_TOTAL = int(os.getenv("ASPEN_JOBS_MAX_ACTIVE_TOTAL", "200"))
+JOBS_MAX_SUBMITS_PER_DAY = int(os.getenv("ASPEN_JOBS_MAX_SUBMITS_PER_DAY", "10"))
+# Lifetime of a dry-run → confirm token. Single-use, keyed by (thread, user).
+JOBS_CONFIRM_TTL      = int(os.getenv("ASPEN_JOBS_CONFIRM_TTL_SECONDS", "900"))
+# Wall-clock cap on the orchestrator subprocess itself (it only *submits*; it
+# does not wait for jobs to run, so this is generous).
+JOBS_SUBMIT_TIMEOUT   = int(os.getenv("ASPEN_JOBS_SUBMIT_TIMEOUT_SECONDS", "600"))
+# Timeout for a single read-only Slurm client call (scontrol/sacct/squeue).
+JOBS_SLURM_TIMEOUT    = int(os.getenv("ASPEN_JOBS_SLURM_TIMEOUT_SECONDS", "30"))
+
+# Environment handed to the orchestrator subprocess — and therefore, since
+# `sbatch` defaults to --export=ALL, to every compute node.
+#
+# An ALLOWLIST, not a denylist of secret names: a denylist silently fails to
+# cover the next secret someone adds to .env, and the cost of that failure is
+# Slack tokens sitting in a job environment on a shared cluster.
+#
+# NOT --export=NONE, which would be the obvious tightening: the pipeline's ORCA
+# job script triages its own failures by calling `xas-rerun-orca`, which it finds
+# on an inherited PATH behind a `command -v` guard. Under --export=NONE that guard
+# fails and auto-rerun becomes a SILENT no-op — no error, no log line, just runs
+# that quietly stop retrying. Scrubbing the parent environment gets the security
+# result without paying that. Set ASPEN_JOBS_SBATCH_EXPORT=NONE to override.
+JOBS_ENV_BASE         = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG",
+                         "LC_ALL", "TERM", "TMPDIR", "TZ")
+# Prefixes of site/pipeline variables that must survive scrubbing for the
+# pipeline to find ORCA, OpenMPI, its own entry points and its .env.
+JOBS_ENV_PREFIXES     = ("PIPELINE_", "XAS_", "SLURM_CONF", "MODULE", "LMOD_")
+# Extra names an operator wants passed through (comma-separated). Secrets are
+# filtered out regardless of what is listed here — see jobs.submit_env.
+JOBS_ENV_PASSTHROUGH  = [
+    v.strip() for v in os.getenv("ASPEN_JOBS_ENV_PASSTHROUGH", "").split(",") if v.strip()
+]
+# Value for SBATCH_EXPORT (defense in depth beside the scrub). Empty = derive it
+# from the scrubbed environment's own names.
+JOBS_SBATCH_EXPORT    = os.getenv("ASPEN_JOBS_SBATCH_EXPORT", "").strip()
+
+# Names that must NEVER reach a compute node, whatever the allowlist says. Used
+# as a belt-and-braces filter in jobs.submit_env and asserted by a contract test.
+JOBS_ENV_FORBIDDEN    = ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "ANTHROPIC_API_KEY",
+                         "AGENT_INTERNAL_SECRET", "ASPEN_ADMIN_SLACK_USER_ID",
+                         "ASPEN_ALLOWED_SLACK_USER_IDS")
+
+
+# ---------------------------------------------------------------------------
 # Turn telemetry — one JSON line per turn, so the tool surface and prompt can be
 # tuned for the tasks people actually bring. See telemetry.py.
 #
