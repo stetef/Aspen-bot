@@ -45,8 +45,12 @@ thread.
   calculations directory? Aspen files the request and DMs the admin the exact command.
 - **Show itself off** — anyone can DM `DEMO` for a guided walkthrough over fabricated
   data, without being added as a user ([below](#try-it-without-being-a-user-demo)).
-- **Investigate jobs** — read-only Slurm queries (`squeue`/`sacct`/…). It does **not**
-  submit or cancel jobs.
+- **Investigate jobs** — read-only Slurm queries (`squeue`/`sacct`/…) across the whole
+  queue, whoever it belongs to.
+- **Run calculations** *(beta, off by default)* — submit an ORCA → CORVUS batch and cancel
+  it again. Always a dry run first, then an explicit confirmation. It can only cancel jobs
+  **it submitted for you** — never your own hand-submitted jobs, never a colleague's
+  ([below](#running-calculations-beta)).
 
 It responds to `@Aspen` mentions from allowlisted users, keeps per-thread context, and
 shows a live status naming what it's doing right now ("Aspen is reading orca.out…",
@@ -268,6 +272,58 @@ Filing for someone is not writing as them: `owner_id` stays the user, while `--b
 original aside so it can't drift from the filed copy, and the user must already be
 registered — there's nowhere to file it otherwise.
 
+## Running calculations (beta)
+
+Off by default. Turn it on with `ASPEN_JOBS_SUBMIT_ENABLED=true` once you have read
+[spec §19](spec.md#19-slurm-job-submission-beta) — in particular §19.9, on what the beta
+account model does *not* fix.
+
+In Slack it is deliberately two steps:
+
+```
+you    @Aspen run the CA-fixed pipeline on thermolysin/structures
+Aspen  DRY RUN — 6 structures (a.xyz, b.xyz, …), ca-fixed template. Nothing submitted yet.
+       Want me to go ahead?
+you    yes
+Aspen  Submitted batch 9f2c… — 18 scheduler jobs queued.
+```
+
+Cancelling works the same way, with a preview first. The confirmation is enforced in
+Python, not requested in the prompt: the first call mints a single-use token bound to that
+user and thread, and only a call carrying it acts. A model can be talked out of asking a
+question; it cannot mint a token it was never given.
+
+**What it can cancel.** Exactly the jobs Aspen submitted *for the person asking*. Not your
+own hand-submitted jobs, not a colleague's, not anything else in the queue. Every job ID is
+checked against live Slurm before anything is cancelled, and a job whose working directory
+is not inside that user's staging area is refused. That check is why your own research jobs
+are safe even though Aspen currently runs under the same Unix account you do — they
+structurally cannot pass it. Reading stays flat: Aspen can *see* the whole queue.
+
+**What the model never does.** It doesn't write the job script. It picks a `template_mode`
+from a fixed list (`ca-fixed`, `h-only`, `single-point`, `free`, `backbone`, `xtb-free`,
+`xtb-constrained`, `quick`, `quick-ca-fixed`) and the pipeline generates everything from its
+own templates. Structures are *copied* into a staging tree — nothing is written inside
+anyone's calculations directory, as everywhere else in Aspen.
+
+### Operator commands
+
+```bash
+./aspen-users jobs list              # active Aspen jobs, all users
+./aspen-users jobs list arun         # just one person's
+./aspen-users jobs show <batch-id>   # one batch: inputs, argv, its jobs
+./aspen-users jobs cancel arun       # cancel someone's, same verification as the agent
+./aspen-users jobs panic             # cancel every active Aspen job (still per-ID)
+./aspen-users jobs reconcile         # fill in what jobs actually consumed, from sacct
+```
+
+`panic` is the 2 a.m. button. It stays per-job-ID rather than using `scancel -u`, so it
+cannot take out your own research jobs alongside Aspen's.
+
+`reconcile` is worth running periodically: the ledger knows *who submitted what*, but
+elapsed time, CPU-hours and exit state only exist once a job has finished, so
+"who used the compute" is unanswerable until you join against `sacct`.
+
 ## What Aspen records (`aspen-users telemetry`)
 
 Aspen keeps a **turn log** — one JSON line per message — so its tools, prompt and
@@ -401,10 +457,12 @@ A hermetic suite — no live Slack, Claude CLI, or network needed.
 
 ## Status
 
-Aspen is implemented and running in **developer mode** (under a personal account). Two
-things remain on the [roadmap](spec.md#18-roadmap--not-yet-implemented): a production
-service account + systemd deployment, and letting the agent submit/manage its own
-Slurm/PBS jobs (the ORCA → CORVUS pipeline). Today its scheduler access is read-only.
+Aspen is implemented and running in **developer mode** (under a personal account). Job
+submission is **built and in beta** ([above](#running-calculations-beta)); what remains on
+the [roadmap](spec.md#18-roadmap--not-yet-implemented) is the production **service account
++ systemd** deployment. That last item is what makes submission safe to open up beyond a
+small trusted group: until it lands, a submitted job runs unjailed as the account Aspen
+runs under. Keep the registry small.
 
 ---
 
