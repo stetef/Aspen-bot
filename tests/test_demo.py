@@ -42,10 +42,18 @@ def _event(uid, text, ts="1700000000.000100"):
             "channel_type": "im"}
 
 
-def _ctx(session):
+def _slack(display_name="Ada Lovelace"):
+    """A Slack client that knows who the visitor is, as the real one does."""
+    client = MagicMock()
+    client.users_info.return_value = {
+        "user": {"profile": {"display_name": display_name}, "name": "ada"}}
+    return client
+
+
+def _ctx(session, client=None):
     return {"user_id": session.user_id, "username": "", "thread_ts": session.thread,
-            "attachments": [], "slack_client": MagicMock(), "first_turn": False,
-            "demo": True}
+            "attachments": [], "slack_client": client or _slack(),
+            "first_turn": False, "demo": True}
 
 
 @pytest.fixture
@@ -257,6 +265,49 @@ def test_the_card_is_never_sent_to_anyone(sut, session):
     sut.dispatch("demo_request_card", {"what": "access"}, ctx)
     ctx["slack_client"].chat_postMessage.assert_not_called()
     ctx["slack_client"].conversations_open.assert_not_called()
+
+
+def test_the_card_names_the_visitor_and_the_alias_they_would_get(sut, session):
+    """The real card names the person (pending.command_for slugifies their
+    profile name); the demo card should look like the real one, not like a
+    template full of angle brackets."""
+    posted = []
+    sut.dispatch("demo_request_card", {"what": "access"},
+                 dict(_ctx(session), on_interim=posted.append))
+    assert "Ada Lovelace" in posted[0]
+    assert "--alias ada-lovelace" in posted[0]
+    assert '--name "Ada Lovelace"' in posted[0]
+    assert "<their-alias>" not in posted[0]
+
+
+def test_the_name_is_looked_up_once_per_session(sut, session):
+    client = _slack()
+    for _ in range(3):
+        sut.dispatch("demo_request_card", {"what": "access"},
+                     dict(_ctx(session, client), on_interim=lambda _t: None))
+    assert client.users_info.call_count == 1
+
+
+def test_an_unreachable_slack_degrades_to_placeholders(sut, session):
+    """Never invent a name — fall back to the template rather than guess."""
+    client = _slack()
+    client.users_info.side_effect = Exception("slack is down")
+    posted = []
+    sut.dispatch("demo_request_card", {"what": "access"},
+                 dict(_ctx(session, client), on_interim=posted.append))
+    assert "<their-alias>" in posted[0] and "<their name>" in posted[0]
+    assert "Demo visitor" in posted[0]
+
+
+def test_a_junk_profile_does_not_break_the_card(sut, session):
+    """Profile fields come from an external API; a non-string reaching slugify
+    used to raise inside the card."""
+    client = MagicMock()
+    client.users_info.return_value = {"user": {"profile": {"display_name": 12345}}}
+    posted = []
+    sut.dispatch("demo_request_card", {"what": "access"},
+                 dict(_ctx(session, client), on_interim=posted.append))
+    assert "<their-alias>" in posted[0]
 
 
 def test_the_root_request_card_shows_the_set_root_command(sut, session):

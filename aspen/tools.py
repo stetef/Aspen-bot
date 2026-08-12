@@ -361,6 +361,7 @@ def _demo_request_card(inp: dict, context: dict) -> tuple[str, list[str]]:
     if session is None:
         return "Error: that's only available inside a demo.", []
     session.advance("request")
+    demo.identify(session, context.get("slack_client"))
     card = demo.request_card(session, inp.get("what", "access"), inp.get("path", ""))
 
     post = context.get("on_interim")

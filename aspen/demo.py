@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Optional
 
-from . import config
+from . import config, registry
 
 log = logging.getLogger("aspen")
 
@@ -60,6 +60,10 @@ class DemoSession:
     turns: int = 0
     stage: str = "welcome"
     approved: bool = False
+    # Their Slack display name, resolved once (see ``identify``). Empty until
+    # then, and empty for good if Slack can't be reached — the card degrades to
+    # placeholders rather than inventing a name.
+    display_name: str = ""
     workflow: str = ""
     notes: dict = field(default_factory=dict)
 
@@ -157,6 +161,31 @@ def note_turn(session: DemoSession) -> str:
 # --------------------------------------------------------------------------- #
 # The fake identity (never persisted)
 # --------------------------------------------------------------------------- #
+def identify(session: DemoSession, client) -> str:
+    """Resolve the visitor's Slack display name, once. Never raises.
+
+    The real request card names the person, because ``pending`` captures their
+    profile when they are turned away. The demo card should look like the real
+    one, so it does the same lookup — this is the visitor's own name, shown back
+    to them in their own DM, so there is nothing to leak.
+    """
+    if session.display_name or client is None:
+        return session.display_name
+    try:
+        info = client.users_info(user=session.user_id)["user"]
+        profile = info.get("profile", {}) or {}
+        for value in (profile.get("display_name"), profile.get("real_name"),
+                      info.get("real_name"), info.get("name")):
+            # Coerce rather than trust: these come from an external API, and a
+            # non-string reaching registry.slugify raises inside the card.
+            if isinstance(value, str) and value.strip():
+                session.display_name = value.strip()
+                break
+    except Exception:
+        log.debug("demo: could not resolve a name for %s", session.user_id, exc_info=True)
+    return session.display_name
+
+
 def as_user(session: DemoSession) -> dict:
     """A registry-shaped record for the visitor.
 
@@ -169,7 +198,7 @@ def as_user(session: DemoSession) -> dict:
     return {
         "slack_user_id": session.user_id,
         "alias": SCOPE_NAME,
-        "display_name": "Demo visitor",
+        "display_name": session.display_name or "Demo visitor",
         "role": "member",
         "status": "active",
         "calc_root": str(config.DEMO_ROOT),
@@ -229,13 +258,21 @@ def read_notes(session: DemoSession, project: str) -> str:
 # --------------------------------------------------------------------------- #
 def request_card(session: DemoSession, what: str = "access", detail: str = "") -> str:
     """What the admin would have received. Shown to the visitor instead."""
+    # Use their real name and the alias it would actually produce, exactly as
+    # pending.command_for does for a real request. Placeholders only if the
+    # lookup failed — a demo of the real thing should show the real thing.
+    name = session.display_name
+    alias = registry.slugify(name) if name else ""
+    who = name or "Demo visitor"
+
     if what == "access":
-        command = (f'./aspen-users add {session.user_id} --alias <their-alias> '
-                   f'--name "<their name>"')
-        line = f"Demo visitor <{session.user_id}> wants access"
+        command = (f'./aspen-users add {session.user_id} '
+                   f'--alias {alias or "<their-alias>"} '
+                   f'--name "{name or "<their name>"}"')
+        line = f"{who} <{session.user_id}> wants access"
     else:
-        command = f"./aspen-users set-root <their-alias> {detail or '<path>'}"
-        line = "Demo visitor wants their own calculations root"
+        command = f"./aspen-users set-root {alias or '<their-alias>'} {detail or '<path>'}"
+        line = f"{who} wants their own calculations root"
     # Ends at the card. It used to close with "Say *approve*…", which the agent
     # then asked again in its own words — clunky, and wrong twice over: an
     # admin's DM does not address the visitor, so that line broke the very
