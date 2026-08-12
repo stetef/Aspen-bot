@@ -47,6 +47,10 @@ def test_a_sane_layout_starts(sut, boot):
 @pytest.mark.parametrize("name", [
     "USERS_FILE", "WORKFLOWS_ROOT", "METADATA_ROOT", "METADATA_HISTORY_ROOT",
     "REQUESTS_FILE", "TELEMETRY_DIR", "TELEMETRY_STATE_FILE",
+    # The job ledger decides who may cancel what, and the staging tree holds the
+    # files a job actually executes. Sandbox-writable, they are a forgeable cancel
+    # and a plantable job body respectively.
+    "JOBS_LEDGER", "JOBS_STAGING_ROOT",
 ])
 def test_state_inside_the_workspace_is_fatal(sut, boot, monkeypatch, name):
     """Every one of these is writable by generated analysis code if misplaced."""
@@ -140,3 +144,54 @@ def test_the_guard_runs_as_part_of_the_startup_check(sut, boot):
     ])
     with pytest.raises(SystemExit):
         sut._check_state_locations()
+
+
+# --------------------------------------------------------------------------- #
+# Job staging vs the calculations roots
+#
+# Containment is the fence on both sides, so an overlap in either direction
+# breaks something: staging inside a root makes every staged copy a write into
+# someone's tree (the invariant Aspen holds absolutely), and a root inside
+# staging puts a directory the agent can write behind roots.resolve's fence.
+# --------------------------------------------------------------------------- #
+def test_sane_staging_starts(sut, boot, monkeypatch):
+    monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", True)
+    sut.main._check_jobs_staging()        # must not raise
+
+
+def test_staging_inside_a_calculations_root_is_fatal(sut, boot, monkeypatch):
+    monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", True)
+    monkeypatch.setattr(sut, "JOBS_STAGING_ROOT", boot.calcs / "sam-calcs" / "aspen-jobs")
+    with pytest.raises(SystemExit) as exit_info:
+        sut.main._check_jobs_staging()
+    assert "inside the calculations root" in str(exit_info.value)
+
+
+def test_a_calculations_root_inside_staging_is_fatal(sut, boot, monkeypatch):
+    monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", True)
+    monkeypatch.setattr(sut, "JOBS_STAGING_ROOT", boot.calcs)
+    with pytest.raises(SystemExit) as exit_info:
+        sut.main._check_jobs_staging()
+    assert "inside job staging" in str(exit_info.value)
+
+
+def test_staging_is_not_checked_when_submission_is_off(sut, boot, monkeypatch):
+    """A deployment without submission should not be blocked by its staging config."""
+    monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", False)
+    monkeypatch.setattr(sut, "JOBS_STAGING_ROOT", boot.calcs / "sam-calcs" / "nested")
+    sut.main._check_jobs_staging()        # must not raise
+
+
+def test_the_staging_guard_runs_as_part_of_the_startup_check(sut, boot, monkeypatch):
+    """A guard nothing calls is a guard that does not exist."""
+    monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", True)
+    monkeypatch.setattr(sut, "JOBS_STAGING_ROOT", boot.calcs / "sam-calcs" / "aspen-jobs")
+    with pytest.raises(SystemExit):
+        sut._check_state_locations()
+
+
+def test_the_staging_directory_is_made_private(sut, boot, monkeypatch):
+    """0700: staged inputs and generated job scripts are not other accounts' business."""
+    monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", True)
+    sut._check_state_locations()
+    assert (sut.JOBS_STAGING_ROOT.stat().st_mode & 0o777) == 0o700

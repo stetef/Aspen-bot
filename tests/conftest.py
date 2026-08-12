@@ -99,6 +99,7 @@ _MODMAP = {
     "demo": "aspen",
     "jobs": "aspen",
     "staging": "aspen",
+    "main": "aspen",
     "DEMO_ENABLED": "aspen.config",
     "DEMO_ROOT": "aspen.config",
     "DEMO_MAX_TURNS": "aspen.config",
