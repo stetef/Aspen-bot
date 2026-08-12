@@ -236,13 +236,17 @@ def request_card(session: DemoSession, what: str = "access", detail: str = "") -
     else:
         command = f"./aspen-users set-root <their-alias> {detail or '<path>'}"
         line = "Demo visitor wants their own calculations root"
+    # Ends at the card. It used to close with "Say *approve*…", which the agent
+    # then asked again in its own words — clunky, and wrong twice over: an
+    # admin's DM does not address the visitor, so that line broke the very
+    # illusion the card exists to create. Asking is the agent's job (see the
+    # `request` stage guidance).
     return (
         "Here's the message your admin would get in Slack — this one is *not* "
         "actually sent, since this is a demo:\n\n"
         f"> *Aspen request* — {line}\n"
         f"> ```\n> {command}\n> ```\n"
-        "> _Run it if you agree; ignore it if you don't._\n\n"
-        "Say *approve* and I'll carry on as if they had."
+        "> _Run it if you agree; ignore it if you don't._"
     )
 
 
@@ -259,20 +263,30 @@ def approve(session: DemoSession) -> str:
 # --------------------------------------------------------------------------- #
 _GUIDANCE = {
     "welcome": (
-        "This is the FIRST turn of a demo. Introduce yourself in two or three "
-        "sentences: you are Aspen, you help this group explore HPC computational "
-        "chemistry results from Slack, and this walkthrough is fabricated data so "
-        "nobody's real work is on show. Then explain that normally they'd be "
-        "turned away here because they aren't on the allowlist, and show them what "
-        "that looks like by calling demo_request_card. Never claim to have shown "
-        "them something you did not: the card only exists once that tool has run, "
-        "and if the result asks you to reproduce it, reproduce it."
+        "This is the FIRST turn of a demo. Open in this order, and keep the whole "
+        "thing to about four short lines:\n"
+        "1. Who you are — one line. Aspen, a research assistant for this group, "
+        "for exploring HPC computational chemistry results from Slack.\n"
+        "2. What is about to happen — say plainly that you'll walk them through "
+        "what using Aspen actually looks like, from being a stranger to getting a "
+        "plot back. Lead with this; it is what they typed DEMO for.\n"
+        "3. Only then, ONE short clause noting the data is made up so nobody's "
+        "real work is on show. A sentence, not a paragraph, and not the opener — "
+        "starting with a disclaimer makes a tour feel like a waiver.\n"
+        "4. Begin: normally they'd be turned away here because they aren't on the "
+        "allowlist. Show what that looks like by calling demo_request_card.\n"
+        "Never claim to have shown them something you did not: the card exists "
+        "only once that tool has run, and if the result asks you to reproduce it, "
+        "reproduce it."
     ),
     "request": (
-        "They have seen the request card. Wait for them to say something like "
-        "'approve' — then call demo_approve. If they ask what happens if the admin "
-        "says no, tell them honestly: nothing, and the request stays in the queue "
-        "for the admin to see with `aspen-users requests`."
+        "They have seen the request card. Ask them ONCE, in your own words, to say "
+        "'approve' so the tour can continue — the card deliberately doesn't ask, "
+        "so this is the only place it is asked. Don't repeat the request in a "
+        "later message; if they say something else, just answer it and let them "
+        "come back to it. When they do approve, call demo_approve. If they ask "
+        "what happens when a real admin says no, tell them honestly: nothing, and "
+        "the request waits in the queue for `aspen-users requests`."
     ),
     "approved": (
         "They are 'in'. Next beat: the workflow. Explain what a workflow file is "

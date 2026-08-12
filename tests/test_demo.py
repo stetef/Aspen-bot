@@ -321,6 +321,28 @@ def test_the_spin_states_can_be_compared(sut, session):
     assert "high-spin" in out and "low-spin" in out
 
 
+def test_the_card_does_not_ask_for_approval_itself(sut, session):
+    """It is a reproduction of an admin's DM, which would not address the
+    visitor — and the agent asks in its own words right after, so a prompt here
+    is the same request twice."""
+    posted = []
+    sut.dispatch("demo_request_card", {"what": "access"},
+                 dict(_ctx(session), on_interim=posted.append))
+    assert "approve" not in posted[0].lower()
+    # ...and asking is delegated, exactly once.
+    guidance = "\n".join(sut.demo.guidance_lines(session))
+    assert "ONCE" in guidance and "approve" in guidance
+
+
+def test_the_opening_leads_with_the_tour_not_the_disclaimer(sut, session):
+    """A tour that opens with a waiver reads like a waiver."""
+    guidance = "\n".join(sut.demo.guidance_lines(session))
+    tour = guidance.index("What is about to happen")
+    disclaimer = guidance.index("data is made up")
+    assert tour < disclaimer
+    assert "not the opener" in guidance
+
+
 def test_the_guidance_walks_through_the_stages(sut, session):
     first = "\n".join(sut.demo.guidance_lines(session))
     assert "demo_request_card" in first
