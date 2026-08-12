@@ -180,7 +180,9 @@ def _progress_phrase(tool_name: str, tool_input: dict) -> str:
     if name == "attach_file":
         return f"attaching {_shorten(inp.get('path')) or 'a file'}…"
     if name == "write_metadata":
-        return "updating metadata.md…"
+        # Not "updating metadata.md" — that names a file in the user's project
+        # directory, which is exactly where this does NOT write.
+        return "updating my notes on this project…"
     if tool_name == "Bash":
         command = str(inp.get("command", "")).strip()
         verb = command.split()[0] if command else ""

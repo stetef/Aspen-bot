@@ -26,6 +26,16 @@ why it is *not* served through ``read_file``: an agent that cannot tell its own
 past notes from ground truth will eventually believe one for the other. It comes
 back through ``read_metadata`` with its authorship stated, exactly as a workflow
 does.
+
+**A README is not this file.** The sidecar is *Aspen's* notes; a ``README.md`` in
+the project directory is the *scientist's* — ground truth, written by them, and
+visible to colleagues, backups, and every tool that is not Aspen. Keeping them
+apart is the same distinction ``read_metadata``'s wrapper draws, so the two must
+not be collapsed into one document. Aspen cannot write a README (no root is
+writable to it), so the only move available is to draft one and ask the user to
+save it; ``describes`` and ``nudge_lines`` below are that offer, rationed. Anyone
+who would rather not keep a file gets the sidecar instead — same content, no
+markdown, nothing to save.
 """
 
 import logging
@@ -44,6 +54,13 @@ FILENAME = "metadata.md"
 SHARED_PREFIX = "_shared__"
 # A project is one directory name — never a nested path, never '..'.
 _PROJECT_RE = re.compile(r"\A[^/\\]+\Z")
+
+# In-tree files that already describe a project. A README under any of these
+# names, or a pre-migration metadata.md, means the project is documented and
+# there is nothing to nudge about.
+README_NAMES = ("README.md", "README.txt", "README.rst", "README",
+                "readme.md", "readme.txt", "readme")
+IN_TREE_NAMES = (FILENAME, *README_NAMES)
 
 
 # --------------------------------------------------------------------------- #
@@ -134,6 +151,40 @@ def exists(project: str, scope: dict) -> bool:
     return bool(target and target.is_file())
 
 
+def in_tree_notes(project: str, scope: dict) -> Optional[Path]:
+    """A README (or pre-migration metadata.md) the owner keeps in the project.
+
+    Read-only and best-effort: an unreadable or missing root simply means "no
+    description", never an error — this only ever decides whether to *offer*
+    something.
+    """
+    base = scope.get("path")
+    if not base or not _PROJECT_RE.match(project or "") or project in (".", ".."):
+        return None
+    try:
+        directory = (Path(base) / project).resolve()
+        directory.relative_to(Path(base).resolve())
+    except (ValueError, OSError):
+        return None
+    for name in IN_TREE_NAMES:
+        try:
+            candidate = directory / name
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def describes(project: str, scope: dict) -> bool:
+    """Does anything at all say what this project is?
+
+    Any one source is enough. Nudging someone who already told Aspen the same
+    thing through a different door is the nagging this is meant to avoid.
+    """
+    return exists(project, scope) or in_tree_notes(project, scope) is not None
+
+
 # --------------------------------------------------------------------------- #
 # Read
 # --------------------------------------------------------------------------- #
@@ -147,7 +198,13 @@ def read(project: str, owner: str, viewer_uid: str) -> str:
         return error
     label = roots.qualify(scope["name"], project)
     if not target.is_file():
-        return (f"No metadata recorded for {label} yet. "
+        # Point at the owner's own README if they keep one: it is a better answer
+        # to "what is this project?" than Aspen's empty notes, and it is theirs.
+        own = in_tree_notes(project, scope)
+        pointer = (f" {label} has its own {own.name} — read_file(path=\"{project}/{own.name}\""
+                   + (f", owner=\"{scope['name']}\"" if scope.get("name") else "")
+                   + ") for the owner's description of it." if own else "")
+        return (f"No metadata recorded for {label} yet.{pointer} "
                 "Use write_metadata to start one once you know something worth keeping.")
     try:
         raw = target.read_text(encoding="utf-8", errors="replace")
@@ -171,6 +228,62 @@ def summary_line(project: str, scope: dict) -> str:
             f'read_metadata(project="{project}"'
             + (f', owner="{scope["name"]}"' if scope.get("name") else "")
             + "))")
+
+
+# --------------------------------------------------------------------------- #
+# Encouraging a description (the nudge, not a requirement)
+# --------------------------------------------------------------------------- #
+# The shape of the draft Aspen offers. Deliberately short and deliberately not a
+# blank template: a form to fill in is work, and the whole point is that Aspen has
+# just read the directory and can fill it in *for* them. Only the last section is
+# ever parsed (the tool server looks for a heading containing "librar" to build
+# the import advisory); everything else is read as prose, which is why plain
+# sentences are fine and why nobody needs to know markdown to write one.
+README_SHAPE = """\
+# <project> — <one line: system, technique, software>
+
+## Summary
+<What this is and why, in a sentence or two.>
+
+## Questions of interest
+- <what you actually want out of it>
+
+## Runs
+<which directories are what — groups, variants, what changed between them>
+
+## Where the files are
+<for a run: the input, structure, and log filenames>
+
+## Python libraries available for analysis
+- numpy
+- pandas
+- matplotlib"""
+
+NUDGE_TEMPLATE = (
+    "Nothing describes {label} — no README in the directory, and no notes on "
+    "Aspen's side. If this conversation gives you a natural opening (and only "
+    "then), offer once to write one: draft it FROM WHAT YOU JUST SAW in the "
+    "directory — real run names, real filenames, the software you can identify — "
+    "never a blank form, and keep it short. Show it in a code block and say they "
+    "can save it as `{project}/README.md`; you cannot write it for them, since "
+    "every calculations root is read-only to you. Plain sentences are fine — "
+    "there is no format to get right. If they would rather not keep a file, offer "
+    "to hold the same notes on your side with write_metadata instead. If they are "
+    "not interested either way, call decline_setup(item=\"project_notes\"). Do not "
+    "derail what they actually asked for.\n"
+    "The shape to follow:\n{shape}"
+)
+
+
+def nudge_text(project: str, scope: dict) -> str:
+    """The model-facing offer, or '' if this project already has a description."""
+    if describes(project, scope):
+        return ""
+    return NUDGE_TEMPLATE.format(
+        label=roots.qualify(scope.get("name", ""), project),
+        project=project,
+        shape=README_SHAPE,
+    )
 
 
 # --------------------------------------------------------------------------- #

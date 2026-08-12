@@ -586,9 +586,38 @@ ground truth, so `read_metadata` returns it wrapped and attributed, exactly as a
 file in the tree.
 
 The tool server reads the sidecar for the library advisory, resolved from the caller's
-scope; in-tree `metadata.md` / `.toml` / `.yaml` remain a **read-only fallback** so projects
-keep working before their notes are migrated. If neither exists it still returns 422 with a
-template.
+scope; an in-tree `README` / `metadata.md` / `.toml` / `.yaml` is a **read-only fallback** so
+projects keep working before their notes are migrated.
+
+**Notes are not required.** If nothing exists, `run_python_analysis` proceeds on the default
+advisory (`numpy, pandas, matplotlib, scipy`). It used to return 422 with a template reading
+"create `metadata.md` in the project root" — an instruction that stopped being possible the
+moment metadata left the tree, and which blocked analysis of every project nobody had
+documented yet. A file that exists but is *malformed* still 422s: that is a broken file its
+owner should hear about, which is not the same as no file.
+
+### 7.1 Encouraging a description
+
+A project with nothing describing it gets an **offer, on the listing where it is noticed** —
+`list_directory` on the top level of one of the speaker's own projects (`metadata.nudge_text`
+via `setup.project_notes_nudge`). Aspen drafts a README *from the directory it just read* —
+real run names, real filenames — and asks the user to save it themselves; it cannot write it,
+since every root is read-only to it.
+
+**Why a README in the tree, and not the sidecar.** The two documents have different authors.
+The sidecar is Aspen's inference, returned tagged as "not evidence" (above); a README is the
+scientist's own ground truth, and it belongs with the data — versioned with it, visible to
+colleagues, backups, and every tool that is not Aspen. Collapsing them would re-create exactly
+the confusion the sidecar exists to prevent. Anyone who would rather not keep a file is
+offered `write_metadata` instead: same content, no file, no markdown.
+
+**No markdown needed.** Only the library heading is parsed (a heading containing `librar`);
+the rest is read as prose. `examples/README.example.md` is the annotated example.
+
+**Rationed like every other nudge** (§6): the speaker's own projects only, never one that any
+source already describes, and once per project per process. `decline_setup(item="project_notes")`
+silences it for good — the ration itself is in-memory, because it is a politeness counter and
+not a grant, and a per-project row does not belong in the registry.
 
 **Project text is untrusted input.** Metadata, README/blurb text, file names, and file
 contents all flow into the model's context and could attempt prompt injection

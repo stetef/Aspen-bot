@@ -81,9 +81,12 @@ SHARED_CALC_ROOTS     = _shared_roots()
 DEMO_ROOT             = Path(os.getenv(
     "ASPEN_DEMO_ROOT", str(Path(__file__).resolve().parent / "examples" / "demo-calculations")
 )).resolve()
-# The demo tree carries no metadata.md, and requiring one would make the payoff
-# beat 422 instead of plotting. This is the advisory list for demo runs only.
-DEMO_LIBRARIES        = ["numpy", "pandas", "matplotlib", "scipy"]
+# The import advisory used when a project states no list of its own. It was once
+# the demo tree's special case — the demo carries no notes, and requiring them
+# would have made its payoff beat 422 instead of plotting. That reasoning was
+# never specific to the demo: no project's notes are required to analyse it (see
+# load_metadata), so every project without a list gets this one.
+DEFAULT_LIBRARIES     = ["numpy", "pandas", "matplotlib", "scipy"]
 
 MAX_STDOUT_CHARS      = int(os.getenv("MAX_STDOUT_CHARS", "10000"))
 MAX_STDERR_CHARS      = int(os.getenv("MAX_STDERR_CHARS", "2000"))
@@ -326,32 +329,6 @@ def _safe_run_path(project_path: Path, run_name: str) -> Path:
 # ---------------------------------------------------------------------------
 # Metadata loading
 # ---------------------------------------------------------------------------
-_METADATA_TEMPLATE = """\
-Create `metadata.md` in the project root — plain markdown the AI assistant reads to
-understand the project. Example:
-
-# <Project name> — <one-line description>
-
-## Summary
-<What this project is, in a sentence or two.>
-
-## What to look at / questions of interest
-- <question 1>
-- <question 2>
-
-## Datasets (groups of runs)
-### <dataset-name> — <what makes this group>
-Runs: run_001, run_002, run_003
-
-## Where the files are
-For a run `<run>`: input `<run>/<run>.in`, structure `<run>/<run>.xyz`, log `<run>/<run>.log`
-
-## Python libraries available for analysis
-- numpy
-- pandas
-- matplotlib"""
-
-
 def _parse_markdown_metadata(text: str, project_name: str) -> dict:
     """
     Best-effort parse of metadata.md. The document as a whole is the agent-facing
@@ -374,7 +351,7 @@ def _parse_markdown_metadata(text: str, project_name: str) -> dict:
                 if item and item[0] not in "_(<" and "fill in" not in item.lower():
                     libs.append(item)
     if not libs:
-        libs = ["numpy", "pandas", "matplotlib"]  # sensible advisory default
+        libs = list(DEFAULT_LIBRARIES)
     return {"name": project_name, "allowed_libraries": libs, "description": text}
 
 
@@ -395,26 +372,56 @@ def _sidecar_metadata(scope_dir: str, project_name: str) -> Optional[Path]:
     return candidate if candidate.is_file() else None
 
 
+# A project's own description, if its owner wrote one. README is the name people
+# already use for "what this directory is", and it is the one Aspen asks for now
+# (aspen/metadata.py) — the bot cannot write into a calculations root, so the
+# in-tree file has to be one the scientist would plausibly write by hand.
+_README_NAMES = ("README.md", "README.txt", "README", "readme.md", "readme.txt", "readme")
+
+
+def _in_tree_notes(project_path: Path) -> Optional[Path]:
+    """The first in-tree file describing this project, if any."""
+    for name in ("metadata.md", *_README_NAMES):
+        candidate = project_path / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def load_metadata(project_path: Path, scope_dir: str = "", demo: bool = False) -> dict:
     """
-    Load project metadata. Prefers Aspen's sidecar, then in-tree metadata.md
-    (natural-language markdown), then metadata.toml / metadata.yaml. Raises
-    HTTPException(422) if none found.
+    Load project metadata. Prefers Aspen's sidecar, then an in-tree metadata.md or
+    README (natural-language markdown), then metadata.toml / metadata.yaml.
+
+    **Notes are never required.** A project with none analyses fine, on the
+    DEFAULT_LIBRARIES advisory. This used to raise 422 with a template telling the
+    user to "create metadata.md in the project root" — an instruction that stopped
+    being possible once metadata moved out of the tree (the agent writes nothing
+    inside any calculations root), and which blocked analysis of every project
+    nobody had documented yet. Encouraging a description is now a *nudge* on a
+    directory listing, not a precondition for running anything: see
+    aspen/metadata.py:describes and aspen/tools.py:_list_directory.
+
+    A file that exists but is malformed still raises — that is a broken file the
+    owner should hear about, which is a different thing from no file at all.
     """
     if demo:
-        return {"name": project_path.name, "allowed_libraries": list(DEMO_LIBRARIES),
+        return {"name": project_path.name, "allowed_libraries": list(DEFAULT_LIBRARIES),
                 "description": "Synthetic demo project."}
 
     sidecar = _sidecar_metadata(scope_dir, project_path.name)
     if sidecar is not None:
         return _parse_markdown_metadata(sidecar.read_text(), project_path.name)
 
-    md_path = project_path / "metadata.md"
+    in_tree = _in_tree_notes(project_path)
+    if in_tree is not None:
+        return _parse_markdown_metadata(
+            in_tree.read_text(errors="replace"), project_path.name
+        )
+
     toml_path = project_path / "metadata.toml"
     yaml_path = project_path / "metadata.yaml"
 
-    if md_path.exists():
-        return _parse_markdown_metadata(md_path.read_text(), project_path.name)
     if toml_path.exists():
         try:
             return tomllib.loads(toml_path.read_text())
@@ -435,26 +442,21 @@ def load_metadata(project_path: Path, scope_dir: str = "", demo: bool = False) -
                 detail=f"Malformed metadata.yaml in {project_path.name}: {e}",
             )
 
-    raise HTTPException(
-        status_code=422,
-        detail=(
-            f"No metadata.md (or metadata.toml/metadata.yaml) found in {project_path.name}/. "
-            f"Please create one.\n\n{_METADATA_TEMPLATE}"
-        ),
-    )
+    return {"name": project_path.name, "allowed_libraries": list(DEFAULT_LIBRARIES),
+            "description": ""}
 
 
 def _validate_metadata(metadata: dict) -> list[str]:
-    """Return allowed_libraries from metadata, raising HTTPException if missing."""
+    """Return the import advisory, falling back to the default list.
+
+    Only a structured metadata.toml / .yaml can reach here without the field —
+    every other path fills it in. An old file that predates the field is not a
+    reason to refuse to analyse the project, so it gets the same default as a
+    project with no notes at all.
+    """
     libs = metadata.get("allowed_libraries")
     if not libs or not isinstance(libs, list):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "metadata file is missing required field 'allowed_libraries' "
-                "(must be a list of strings)."
-            ),
-        )
+        return list(DEFAULT_LIBRARIES)
     return [str(lib) for lib in libs]
 
 

@@ -348,7 +348,7 @@ def read(token: str, viewer_uid: str) -> str:
 # --------------------------------------------------------------------------- #
 def _backup(target: Path, uid: str) -> None:
     """Snapshot the version about to be overwritten. Best-effort, never fatal —
-    same contract as the metadata.md history in tools._backup_metadata."""
+    same contract as the metadata history in metadata._backup."""
     try:
         hist = config.WORKSPACE_ROOT / "workflow_history" / uid
         hist.mkdir(parents=True, exist_ok=True)

@@ -186,10 +186,12 @@ def test_a_demo_run_does_not_need_project_metadata(ts, tmp_path, monkeypatch):
     assert "numpy" in meta["allowed_libraries"]
 
 
-def test_a_normal_run_still_requires_metadata(ts):
+def test_a_normal_run_does_not_need_metadata_either(ts):
+    """No notes is not an error: the project analyses on the default advisory."""
     mod, roots = ts
-    with pytest.raises(Exception):           # HTTPException(422) + template
-        mod.load_metadata(roots["default"] / "thermolysin", "sam__U0SAM", demo=False)
+    meta = mod.load_metadata(roots["default"] / "thermolysin", "sam__U0SAM", demo=False)
+    assert meta["allowed_libraries"] == mod.DEFAULT_LIBRARIES
+    assert meta["name"] == "thermolysin"
 
 
 # --------------------------------------------------------------------------- #
@@ -219,10 +221,49 @@ def test_in_tree_metadata_still_works_before_migration(ts):
     assert "numpy" in meta["allowed_libraries"]
 
 
-def test_no_metadata_anywhere_still_asks_for_one(ts):
+def test_an_in_tree_readme_supplies_the_advisory(ts):
+    """A README is the file users are now asked for, so the server reads it."""
     mod, roots = ts
-    with pytest.raises(Exception):                 # HTTPException(422) + template
-        mod.load_metadata(roots["default"] / "thermolysin", "sam__U0SAM")
+    project = roots["default"] / "thermolysin"
+    (project / "README.md").write_text(
+        "Zn K-edge models.\n\n## Python libraries available for analysis\n- scipy\n")
+    meta = mod.load_metadata(project, "sam__U0SAM")
+    assert meta["allowed_libraries"] == ["scipy"]
+    assert "Zn K-edge" in meta["description"]
+
+
+def test_metadata_md_wins_over_a_readme(ts):
+    """Both is possible; the file that exists to configure Aspen is the one to trust."""
+    mod, roots = ts
+    project = roots["default"] / "thermolysin"
+    (project / "README.md").write_text(
+        "## Python libraries available for analysis\n- scipy\n")
+    (project / "metadata.md").write_text(
+        "## Python libraries available for analysis\n- numpy\n")
+    assert mod.load_metadata(project, "sam__U0SAM")["allowed_libraries"] == ["numpy"]
+
+
+def test_no_metadata_anywhere_analyses_anyway(ts):
+    """The 422-with-a-template told users to write a file Aspen no longer uses."""
+    mod, roots = ts
+    meta = mod.load_metadata(roots["default"] / "thermolysin", "sam__U0SAM")
+    assert meta["allowed_libraries"] == mod.DEFAULT_LIBRARIES
+    assert meta["description"] == ""
+
+
+def test_a_malformed_file_is_still_an_error(ts):
+    """Absence is fine; a broken file its owner should fix is not."""
+    mod, roots = ts
+    project = roots["default"] / "thermolysin"
+    (project / "metadata.yaml").write_text("- not: a\n- mapping: b\n")
+    with pytest.raises(Exception):                 # HTTPException(422)
+        mod.load_metadata(project, "sam__U0SAM")
+
+
+def test_structured_metadata_without_a_library_list_defaults(ts):
+    """An old .toml predating allowed_libraries is not a reason to refuse to run."""
+    mod, _roots = ts
+    assert mod._validate_metadata({"name": "x"}) == mod.DEFAULT_LIBRARIES
 
 
 def test_the_sidecar_lookup_cannot_traverse_out(ts):

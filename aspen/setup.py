@@ -31,15 +31,23 @@ import logging
 from datetime import date
 from typing import Optional
 
-from . import config, pending, registry, roots, workflows
+from . import config, demo, metadata, pending, registry, roots, workflows
 
 log = logging.getLogger("aspen")
 
 ITEMS = ("workflow", "calc_root")
 
+# Declinable, but not a first-turn item. A project description is per *project*,
+# so there is no "they have it" to derive for the person — only for the directory
+# in front of them. It is offered where it is noticed (a listing) rather than on
+# the way in, and declining it silences the offer everywhere.
+PROJECT_NOTES = "project_notes"
+DECLINABLE = (*ITEMS, PROJECT_NOTES)
+
 _LABEL = {
     "workflow": "a workflow file",
     "calc_root": "their own calculations directory",
+    PROJECT_NOTES: "notes describing their projects",
 }
 
 
@@ -57,6 +65,8 @@ def has(uid: str, item: str) -> bool:
     """Derived, never stored — the filesystem and the registry are the truth."""
     if item == "workflow":
         return workflows.has_workflow(uid)
+    if item == PROJECT_NOTES:
+        return False        # per-project; nothing about the person settles it
     user = registry.by_id(uid)
     return bool(user and user.get("calc_root"))
 
@@ -80,8 +90,8 @@ def decline(uid: str, item: str) -> str:
     is a reduction in what it does, not an escalation — unlike everything that
     grants access, which stays CLI-only.
     """
-    if item not in ITEMS:
-        return f"Error: '{item}' is not something to set up (expected: {', '.join(ITEMS)})."
+    if item not in DECLINABLE:
+        return f"Error: '{item}' is not something to set up (expected: {', '.join(DECLINABLE)})."
     user = registry.by_id(uid)
     if user is None:
         return "Error: you are not in Aspen's user registry, so there's nothing to record."
@@ -103,6 +113,9 @@ def decline(uid: str, item: str) -> str:
         return ("Noted — you don't have calculations of your own, so I won't ask "
                 "again. I'll always need you to say whose files you mean "
                 "(e.g. @arun/thermolysin), since there's no default for you.")
+    if item == PROJECT_NOTES:
+        return ("Noted — I won't suggest project READMEs again. Everything still "
+                "works without them; ask any time if you want one drafted.")
     return ("Noted — I won't ask about a workflow again. Say the word any time "
             "if you change your mind.")
 
@@ -151,6 +164,42 @@ def nudge_lines(uid: str, first_turn: bool) -> list[str]:
         "set it). If they don't have any of their own — a reader rather than a "
         "runner — call decline_setup(item=\"calc_root\")."
     ]
+
+
+# Which (person, project) pairs have already had the offer this process. Held in
+# memory on purpose: it is a politeness counter, not a decision. Writing it to the
+# registry would put a row per project in a file whose whole point is that it
+# holds grants, and a restart re-offering once is a far smaller cost than that.
+# Someone who actually does not want them declines, which *is* persisted.
+_offered: set = set()
+_OFFERED_CAP = 2048
+
+
+def project_notes_nudge(uid: str, project: str, scope: dict) -> str:
+    """Offer to draft a README for a project of the speaker's that has none.
+
+    Rationed three ways, because a line on every listing is nagging: their own
+    projects only (a colleague's directory is not theirs to document), nothing
+    that already has a description from any source, and once per project per
+    process. A recorded decline silences it everywhere.
+    """
+    if not uid or not project or demo.active_for(uid) is not None:
+        return ""
+    if scope.get("owner_id") != uid or scope.get("kind") == "shared":
+        return ""
+    if registry.by_id(uid) is None or declined(uid, PROJECT_NOTES):
+        return ""
+
+    key = (uid, str(scope.get("path", "")), project)
+    if key in _offered:
+        return ""
+    text = metadata.nudge_text(project, scope)
+    if not text:
+        return ""
+    if len(_offered) >= _OFFERED_CAP:       # unbounded growth is the only real risk
+        _offered.clear()
+    _offered.add(key)
+    return text
 
 
 def request_root(uid: str, path: str, client=None) -> str:

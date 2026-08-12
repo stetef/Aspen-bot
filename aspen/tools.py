@@ -58,9 +58,15 @@ def _list_directory(rel: str, owner: str = "", viewer_uid: str = "") -> str:
         entries = sorted(path.iterdir(), key=lambda e: (e.is_file(), e.name))
         lines = [f"{'[dir]' if e.is_dir() else '[file]'} {e.name}" for e in entries]
         header = f"Contents of '{rel}' ({len(entries)} entries):"
+        project = _project_of(rel, path, scope)
         # Metadata lives outside the tree now, so a listing is the only place a
-        # project's notes can announce themselves.
-        note = metadata.summary_line(_project_of(rel, path, scope), scope)
+        # project's notes can announce themselves — and, when there are none, the
+        # place to offer to write some. The offer rides the project's *top-level*
+        # listing only: from a run directory two levels down, "this project has no
+        # README" is noise about something the user is not looking at.
+        note = metadata.summary_line(project, scope)
+        if not note and project and path.parent == scope.get("path"):
+            note = setup.project_notes_nudge(viewer_uid, project, scope)
         body = header + "\n" + "\n".join(lines) if lines else f"'{rel}' is empty."
         return f"{body}\n{note}" if note else body
     except PermissionError:
@@ -781,9 +787,11 @@ TOOL_SPECS = [
             "up, so Aspen stops offering it. Call this as soon as they say no, or "
             "that it doesn't apply to them — otherwise they'll be asked again in "
             "the next conversation. Use item='workflow' when they don't want to "
-            "record how they work, and item='calc_root' when they have no "
+            "record how they work, item='calc_root' when they have no "
             "calculations of their own (someone who reads colleagues' work rather "
-            "than running their own). It only ever makes Aspen quieter; it grants "
+            "than running their own), and item='project_notes' when they don't "
+            "want to be offered a README or notes describing their projects. It "
+            "only ever makes Aspen quieter; it grants "
             "and removes nothing, and they can change their mind later."
         ),
         "input_schema": {
@@ -791,7 +799,7 @@ TOOL_SPECS = [
             "properties": {
                 "item": {
                     "type": "string",
-                    "enum": ["workflow", "calc_root"],
+                    "enum": ["workflow", "calc_root", "project_notes"],
                     "description": "What they don't want set up.",
                 }
             },
@@ -854,8 +862,10 @@ TOOL_SPECS = [
                 "code": {
                     "type": "string",
                     "description": (
-                        "Python code to execute. Import only libraries listed under "
-                        "'Python libraries available for analysis' in the project's metadata.md. "
+                        "Python code to execute. Projects need no notes to be analysed: "
+                        "numpy, pandas, matplotlib and scipy are always available, and a "
+                        "project whose notes or README list libraries under a 'Python "
+                        "libraries available for analysis' heading gets that list instead. "
                         "Project data is at /projects/<project_name>/. "
                         "Save figures with plt.savefig('/aspen_workspace/figures/<name>.png', dpi=150)."
                     ),

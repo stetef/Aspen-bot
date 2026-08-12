@@ -22,7 +22,7 @@ def test_phrases_name_the_actual_work(sut):
     assert "browsing" in _phrase(sut, "mcp__aspen__list_directory", {"path": "runs"})
     assert "spin" in _phrase(sut, "mcp__aspen__search_files", {"pattern": "spin"})
     assert _phrase(sut, "mcp__aspen__run_python_analysis") == "running analysis code…"
-    assert _phrase(sut, "mcp__aspen__write_metadata") == "updating metadata.md…"
+    assert _phrase(sut, "mcp__aspen__write_metadata") == "updating my notes on this project…"
     # Bash reports the command, which is what the user cares about on the cluster.
     assert _phrase(sut, "Bash", {"command": "squeue -u alice"}) == "running squeue…"
 

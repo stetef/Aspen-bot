@@ -119,7 +119,7 @@ Two single-instance processes:
 | Tool | Bound by |
 |---|---|
 | `list_directory`, `read_file`, `search_files`, `attach_file` | In-process Python, **path-fenced to the calculations root** (`_safe_path`); cannot read outside it |
-| `write_metadata` | One file (`<project>/metadata.md`), prior version snapshotted first |
+| `write_metadata` | One file, in Aspen's own sidecar (`$ASPEN_METADATA_ROOT/<scope>/<project>/metadata.md`) and never in a calculations tree; prior version snapshotted first |
 | `read_workflow` | In-process, path-fenced to the workflows root; another user's file is tagged `trust="reference-only"` (C10) |
 | `write_workflow` | Only the **speaking user's own** file — the destination is the Slack event's `user_id`, and the tool has no owner parameter (C9); `_group` gated on the admin; prior version snapshotted |
 | `run_python_analysis` | The **bwrap jail + seccomp** (no network, read-only project mount, only `figures/`+`cache/` writable, `prlimit` caps) |
@@ -139,7 +139,7 @@ Two single-instance processes:
 | C1 | **`.env` set to `0600`** (was world-readable) | Other local users could read all bot secrets | filesystem (run-time) |
 | C2 | **Bash allowlist → Slurm-only** (dropped `cat/grep/head/tail/ls/wc/sort/uniq`) | With Sandbox B off, those run as the bot user with no path limit — an allowlisted user could `cat ~/.ssh/id_ed25519` or `.env`. Demonstrated live. | `config.py`, `.env(.example)` |
 | C3 | **`search_files`** — a path-fenced, in-process grep | Restores content search **without** an unfenced reader: allowlist fence > Sandbox B's denylist, and it's our code | `tools.py` |
-| C4 | **`metadata.md` versioned backups** | `write_metadata` is a whole-file replace; careless overwrite is the top integrity risk. Prior version saved to `<workspace>/metadata_history/<project>/<UTC>.md` | `tools.py` |
+| C4 | **`metadata.md` versioned backups** | `write_metadata` is a whole-file replace; careless overwrite is the top integrity risk. Prior version saved to `$ASPEN_METADATA_HISTORY_ROOT/<scope>/<project>/<UTC>.md` (keyed by owner as well as project, so two users' same-named projects cannot overwrite each other) | `metadata.py` |
 | C5 | **Bot ↔ tool server over a Unix socket** (was `127.0.0.1` TCP) | A loopback port is connectable by any local user; a socket in a `0700` dir is not | `tool_server.py`, `tools.py`, `config.py` |
 | C6 | **seccomp syscall denylist on the analysis jail** | The one lever on the kernel→root path from inside the jail on this old kernel; blocks namespace/mount/keyring/ptrace/module/bpf/io_uring/userfaultfd/etc. | `tool_server.py` |
 | C7 | **Group-DM participant gate** | In a group DM, the per-mentioner allowlist leaks Aspen's answers and the read thread context to *every* member — including people who could never DM it (a new prompt-injection + disclosure surface). Require **every human member** allowlisted; **fail closed** if membership can't be verified. App/bot members are exempt (only humans need approval). | `slack_app.py`, `config.py` |
@@ -218,9 +218,11 @@ When the service account exists, do all of the following:
       beta group with `./aspen-users add` (the dominant blast-radius risk is gone).
       Drop the `ASPEN_ALLOWED_SLACK_USER_IDS` bootstrap from the new `.env` once the
       registry is in place, so there is exactly one source of truth. For the
-      careful-insider model, also confirm the calculations
-      tree's `metadata.md` files are backed up / version-controlled (C4 protects
-      against in-bot overwrite; off-host backup protects against everything else).
+      careful-insider model, also confirm `$ASPEN_METADATA_ROOT` is backed up /
+      version-controlled (C4 protects against in-bot overwrite; off-host backup
+      protects against everything else). Nothing in a calculations tree is at risk
+      from `write_metadata` — it has not written there since the sidecar migration,
+      and a project README stays entirely in its owner's hands.
 
 **If/when the agent is given a Bash *write or exec* surface** (e.g. the ORCA→CORVUS
 Slurm-submission roadmap), additionally:

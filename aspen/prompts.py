@@ -91,6 +91,12 @@ SYSTEM_PROMPT = (
     "first and pass the complete updated contents. You may write notes for the "
     "speaker's own projects and for shared group projects; someone else's are "
     "readable but theirs to change.\n"
+    "A project needs NO notes and no metadata file to be read or analysed — "
+    "never tell anyone to create one before you can help them, and never treat a "
+    "missing description as a blocker. A README in a project directory is the "
+    "owner's own description of their work: read it with read_file, prefer it to "
+    "your own notes when they disagree, and remember you cannot write or edit it "
+    "— you can only draft one and let them save it.\n"
     "To work the way each scientist works: use read_workflow and write_workflow "
     "(see 'User workflows' below).\n"
     + _BASH_SECTION

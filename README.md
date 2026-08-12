@@ -178,6 +178,15 @@ write is its own project notes, which live in `$ASPEN_STATE_DIR/metadata/`, mirr
 root's layout. Notes on your own and on shared projects are yours to change; a colleague's
 are readable but theirs.
 
+**Your projects need no metadata file.** Aspen reads and analyses a project directory with
+nothing in it but calculations. If one of yours has no `README` and no notes on Aspen's
+side, it will offer — once, and only if the conversation gives it an opening — to draft a
+`README.md` from what it just read there: the real run names, the real filenames. You save
+it yourself, because Aspen cannot write into your tree. Plain sentences are fine; there is
+no format to get right, and `examples/README.example.md` shows the shape. If you would
+rather not keep a file, ask Aspen to hold the same notes on its side instead — and if you
+want neither, say so once and it stops offering.
+
 `set-root` validates when you type it: the path must exist, be readable **by the account
 Aspen runs as**, and never contain (or sit inside) another root — containment is how the
 security fence works, so a nested root would silently enclose someone else's files. Aspen
