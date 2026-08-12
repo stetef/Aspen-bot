@@ -37,6 +37,7 @@ what it did:
 
 import argparse
 import getpass
+import json
 import os
 import subprocess
 import sys
@@ -562,6 +563,178 @@ def cmd_setup(args) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# Slurm jobs (spec §19.8)
+#
+# The operator's path into the job ledger, deliberately outside the agent and
+# outside Slack. It exists because the beta's realistic failure mode is a runaway
+# batch at 2 a.m., and debugging that through a Slack thread is the wrong tool.
+#
+# `cancel` here is the ONE place that can cancel on someone else's behalf — an
+# operator acting as a human, at a terminal, with the whole ledger visible. The
+# agent has no equivalent, exactly as with admission and calculations roots: the
+# things that grant or destroy stay CLI-only.
+# --------------------------------------------------------------------------- #
+def _job_state(row: dict) -> str:
+    if row.get("cancelled_at"):
+        return "cancelled"
+    return row.get("state") or "unreconciled"
+
+
+def cmd_jobs_list(args) -> int:
+    from . import jobs
+
+    who = ""
+    if args.who:
+        user = registry.resolve(args.who)
+        if not user:
+            print(f"No such user: {args.who}")
+            return 1
+        who = user["slack_user_id"]
+
+    rows = jobs.active_rows(who) if not args.all else _all_rows()
+    if not rows:
+        print("No active Aspen jobs." if not args.all else "The ledger is empty.")
+        return 0
+
+    print(f"{'JOBID':<12} {'KIND':<12} {'WHO':<16} {'PROJECT':<20} {'STATE':<14} BATCH")
+    for r in sorted(rows, key=lambda r: str(r.get("submitted_at") or "")):
+        print(f"{str(r['job_id']):<12} {(r.get('kind') or '-'):<12} "
+              f"{(r.get('alias') or '?'):<16} {(r.get('project') or '-'):<20} "
+              f"{_job_state(r):<14} {r['batch_id']}")
+    print(f"\n{len(rows)} job(s). Ledger: {config.JOBS_LEDGER}")
+    return 0
+
+
+def _all_rows() -> list:
+    from . import jobs
+    with jobs.connect() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT j.*, b.alias, b.project, b.slack_user_id FROM jobs j "
+            "JOIN batches b ON b.batch_id = j.batch_id ORDER BY j.submitted_at")]
+
+
+def cmd_jobs_show(args) -> int:
+    from . import jobs
+
+    with jobs.connect() as conn:
+        batch = conn.execute("SELECT * FROM batches WHERE batch_id = ?",
+                             (args.batch_id,)).fetchone()
+    if batch is None:
+        print(f"No such batch: {args.batch_id}")
+        return 1
+    batch = dict(batch)
+    print(f"Batch {batch['batch_id']}")
+    print(f"  requested by  {batch['alias']} ({batch['slack_user_id']})")
+    print(f"  thread        {batch['thread_ts']}")
+    print(f"  project       {batch['project'] or '-'}  (scope {batch['owner_scope'] or '-'})")
+    print(f"  mode          {batch['template_mode']}")
+    print(f"  structures    {batch['structures']}")
+    print(f"  staging       {batch['staging_dir']}")
+    print(f"  submitted     {batch['submitted_at']}")
+    print(f"  argv          {' '.join(json.loads(batch['argv']))}")
+    rows = jobs.jobs_for_batch(args.batch_id)
+    print(f"\n  {len(rows)} scheduler job(s):")
+    for r in rows:
+        print(f"    {str(r['job_id']):<12} {(r.get('kind') or '-'):<12} "
+              f"{_job_state(r):<14} {r.get('elapsed') or ''} {r.get('total_cpu') or ''}")
+    return 0
+
+
+def cmd_jobs_cancel(args) -> int:
+    """Cancel on a user's behalf, going through the *same* verification the agent does.
+
+    Deliberately not a raw ``scancel``: an operator typing a job ID at 2 a.m. is
+    exactly as capable of typing the wrong one as a model is, and the WorkDir check
+    is what catches that. ``--force`` skips only the interactive prompt, never the
+    verification.
+    """
+    from . import jobs
+
+    user = registry.resolve(args.who)
+    if not user:
+        print(f"No such user: {args.who}")
+        return 1
+    uid = user["slack_user_id"]
+
+    try:
+        approved, refused = jobs.resolve_cancellable(uid, args.selector)
+    except jobs.JobsError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    for jid, reason in refused:
+        print(f"  skip {jid}: {reason}")
+    if not approved:
+        print("Nothing to cancel.")
+        return 0
+
+    print(f"Would cancel {len(approved)} job(s) for {user['alias']}:")
+    for r in approved:
+        print(f"  {r['job_id']}  {r.get('kind') or '-'}  {r.get('project') or '-'}  "
+              f"[{r.get('live_state') or '?'}]")
+    if not args.force and input("Cancel these? [y/N] ").strip().lower() not in ("y", "yes"):
+        print("Left alone.")
+        return 0
+
+    try:
+        result = jobs.cancel(uid, args.selector)
+    except jobs.JobsError as exc:
+        print(f"Error: {exc}")
+        return 1
+    print(f"Cancelled {len(result['cancelled'])} job(s).")
+    return 0
+
+
+def cmd_jobs_panic(args) -> int:
+    """Cancel every non-terminal ledger job, for every user.
+
+    The 2 a.m. button. Still per-ID and still verified — a panic that used
+    ``scancel -u`` would take out the operator's own research jobs alongside
+    Aspen's, which is the opposite of what someone reaching for this wants.
+    """
+    from . import jobs
+
+    rows = jobs.active_rows()
+    if not rows:
+        print("No active Aspen jobs. Nothing to do.")
+        return 0
+
+    by_user: dict = {}
+    for r in rows:
+        by_user.setdefault(r["slack_user_id"], []).append(r)
+    print(f"{len(rows)} active job(s) across {len(by_user)} user(s):")
+    for uid, rs in by_user.items():
+        print(f"  {registry.label(uid)}: {len(rs)}")
+    if not args.force and input("\nCancel ALL of them? [y/N] ").strip().lower() not in ("y", "yes"):
+        print("Left alone.")
+        return 0
+
+    total, failed = 0, 0
+    for uid in by_user:
+        try:
+            result = jobs.cancel(uid, "all")
+            total += len(result["cancelled"])
+        except jobs.JobsError as exc:
+            failed += 1
+            print(f"  {registry.label(uid)}: {exc}")
+    print(f"Cancelled {total} job(s)" + (f"; {failed} user(s) errored." if failed else "."))
+    return 0
+
+
+def cmd_jobs_reconcile(args) -> int:
+    from . import jobs
+
+    try:
+        result = jobs.reconcile(days=args.days)
+    except jobs.JobsError as exc:
+        print(f"Error: {exc}")
+        return 1
+    print(f"Reconciled {result['updated']} of {result['scanned']} matching sacct row(s) "
+          f"since {result['since']}.")
+    return 0
+
+
 def cmd_whois(args) -> int:
     user = registry.resolve(args.who)
     if user is None:
@@ -962,6 +1135,58 @@ def build_parser() -> argparse.ArgumentParser:
     w = wsub.add_parser("show", help="print one workflow in full")
     w.add_argument("who", help="alias, Slack ID, or '_group'")
     w.set_defaults(func=cmd_workflow_show)
+
+    # --- slurm jobs --------------------------------------------------------- #
+    # The operator's way into the job ledger, outside the agent and outside Slack.
+    # `cancel` is the only path that can cancel for someone else — a human at a
+    # terminal — and it still goes through the same WorkDir verification the agent
+    # does, because an operator can mistype a job ID just as easily as a model can.
+    s = sub.add_parser(
+        "jobs",
+        help="inspect and cancel Aspen-submitted Slurm jobs",
+        description="Aspen's own job ledger. Cancellation here runs the same "
+                    "verification the agent does (the job must be Aspen's, and its "
+                    "WorkDir must be inside that user's staging area), so a mistyped "
+                    "ID is refused rather than obeyed.",
+    )
+    jsub = s.add_subparsers(dest="jobs_command", required=True)
+
+    j = jsub.add_parser("list", help="active Aspen jobs (all users by default)")
+    j.add_argument("who", nargs="?", default="", help="limit to one alias or Slack ID")
+    j.add_argument("--all", action="store_true",
+                   help="every ledger row, including finished ones")
+    j.set_defaults(func=cmd_jobs_list)
+
+    j = jsub.add_parser("show", help="one batch in full, with its jobs and argv")
+    j.add_argument("batch_id")
+    j.set_defaults(func=cmd_jobs_show)
+
+    j = jsub.add_parser("cancel", help="cancel a user's Aspen jobs (verified per job)")
+    j.add_argument("who", help="alias or Slack ID whose jobs to cancel")
+    j.add_argument("selector", nargs="?", default="all",
+                   help="'all' (default), a job ID, a batch ID, or a project name")
+    j.add_argument("-f", "--force", action="store_true", help="skip the confirmation prompt")
+    j.set_defaults(func=cmd_jobs_cancel)
+
+    j = jsub.add_parser(
+        "panic",
+        help="cancel EVERY active Aspen job, all users",
+        description="The 2 a.m. button. Still per-job-ID and still verified, so it "
+                    "cannot take out your own hand-submitted research jobs the way "
+                    "`scancel -u $USER` would.",
+    )
+    j.add_argument("-f", "--force", action="store_true", help="skip the confirmation prompt")
+    j.set_defaults(func=cmd_jobs_panic)
+
+    j = jsub.add_parser(
+        "reconcile",
+        help="fill in what jobs actually consumed, from sacct",
+        description="Attribution is two-phase: submit time knows who and what, but "
+                    "elapsed time, CPU-hours and exit state exist only after a job "
+                    "ends. Run this to answer 'who used the compute'.",
+    )
+    j.add_argument("--days", type=int, default=30, help="how far back to scan (default 30)")
+    j.set_defaults(func=cmd_jobs_reconcile)
 
     # --- telemetry ---------------------------------------------------------- #
     # Metrics and question text are switched separately on purpose: metrics stay

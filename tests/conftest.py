@@ -42,6 +42,21 @@ _MODMAP = {
     "SEARCH_MAX_FILES_ALL": "aspen.config",
     "BOOTSTRAP_USER_IDS": "aspen.config",
     "ADMIN_OVERRIDE": "aspen.config",
+    # Slurm jobs (spec §19)
+    "JOBS_SUBMIT_ENABLED": "aspen.config",
+    "JOBS_LEDGER": "aspen.config",
+    "JOBS_STAGING_ROOT": "aspen.config",
+    "JOBS_PIPELINE_BIN": "aspen.config",
+    "JOBS_SCHEDULER": "aspen.config",
+    "JOBS_MAX_STRUCTURES": "aspen.config",
+    "JOBS_MAX_ACTIVE_PER_USER": "aspen.config",
+    "JOBS_MAX_ACTIVE_TOTAL": "aspen.config",
+    "JOBS_MAX_SUBMITS_PER_DAY": "aspen.config",
+    "JOBS_CONFIRM_TTL": "aspen.config",
+    "JOBS_SUBMIT_TIMEOUT": "aspen.config",
+    "JOBS_SLURM_TIMEOUT": "aspen.config",
+    "JOBS_SBATCH_EXPORT": "aspen.config",
+    "JOBS_ENV_PASSTHROUGH": "aspen.config",
     # prompts
     "SYSTEM_PROMPT": "aspen.prompts",
     # tools
@@ -82,6 +97,8 @@ _MODMAP = {
     "pending": "aspen",
     "setup": "aspen",
     "demo": "aspen",
+    "jobs": "aspen",
+    "staging": "aspen",
     "DEMO_ENABLED": "aspen.config",
     "DEMO_ROOT": "aspen.config",
     "DEMO_MAX_TURNS": "aspen.config",
@@ -124,7 +141,15 @@ class _Facade:
         modname = _MODMAP.get(name)
         if modname is None:
             raise AttributeError(name)
-        return getattr(importlib.import_module(modname), name)
+        module = importlib.import_module(modname)
+        try:
+            return getattr(module, name)
+        except AttributeError:
+            # A whole-module entry (``"jobs": "aspen"``) resolves only once the
+            # submodule has been imported by something — which, run in isolation, a
+            # test file may be the first to need. Import it explicitly rather than
+            # depending on another test having pulled it in first.
+            return importlib.import_module(f"{modname}.{name}")
 
     def __setattr__(self, name, value):
         modname = _MODMAP.get(name)
@@ -278,6 +303,12 @@ class AspenEnv:
         monkeypatch.setattr(sut, "REQUESTS_FILE", self.state / "requests.json")
         monkeypatch.setattr(sut, "WORKSPACE_ROOT", self.workspace)
         monkeypatch.setattr(sut, "SHARED_CALC_ROOTS", {})
+        # Slurm jobs: the ledger and staging live in STATE_DIR for the reason the
+        # registry does — a sandbox-writable ledger is a forgeable cancel, and
+        # sandbox-writable staging is a job body the model can plant.
+        monkeypatch.setattr(sut, "JOBS_LEDGER", self.state / "jobs.sqlite")
+        monkeypatch.setattr(sut, "JOBS_STAGING_ROOT", self.state / "jobs-staging")
+        monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", True)
         (self.state / "workflows").mkdir(exist_ok=True)
         sut.registry.invalidate()
 
