@@ -1,9 +1,10 @@
 # Aspen — Threat Model & Security Measures
 
-_Last updated: 2026-08-07. Scope: the system **as built** after the
-`security/interim-hardening` pass, the group-DM participant gate (C7), and the user
-registry + per-user workflows (C8–C11), plus the security work still owed (notably
-the move to a dedicated service account). Companion to [`spec.md`](spec.md) (design)
+_Last updated: 2026-08-12. Scope: the system **as built** after the
+`security/interim-hardening` pass, the group-DM participant gate (C7), the user
+registry + per-user workflows (C8–C11), and **Slurm job submission in beta**
+(C12–C14, spec §19), plus the security work still owed (notably the move to a
+dedicated service account). Companion to [`spec.md`](spec.md) (design)
 and [`probe_isolation.sh`](probe_isolation.sh) (host-fact verification)._
 
 This document records **why** Aspen is locked down the way it is: the context it
@@ -21,7 +22,7 @@ tell a deliberate decision from an accident.
 | Users | The SMB/SSRL research group, via a **SLAC-managed (SSO) Slack** workspace | The user-ID allowlist is a *strong* auth gate; spoofing/external entry is low-risk. Multi-user rooms (group DMs) are gated so the allowlist also bounds *who can read along*, not just who can invoke (C7) |
 | Data sensitivity | **Public / publishable** computational chemistry | Confidentiality is low priority; **integrity & availability** matter more |
 | Host | A **shared multi-user login node** (`sdfiana*`) | `127.0.0.1` ports and the bot's files are reachable/visible to other lab users |
-| Bot identity (interim) | Runs as a **developer's personal Unix account** with SSH keys + munge (job submission) + group data access | If any confinement is bypassed, the blast radius is that whole cluster identity — this is the dominant interim risk, fixed only by the service account (§7) |
+| Bot identity (interim) | Runs as a **developer's personal Unix account** with SSH keys + munge (job submission) + group data access | If any confinement is bypassed, the blast radius is that whole cluster identity — this is the dominant interim risk, fixed only by the service account (§7). It also **inverts** the cancel boundary: the developer's own hand-submitted jobs are inside the bot's `scancel` range, so C12's checks are the only thing protecting them, not defense in depth |
 | Insider trust | Defend against the **careless** allowlisted member, not a malicious one | Favor guardrails, backups, and fenced tools over hard inter-user isolation |
 
 ## 2. Assets (ranked)
@@ -31,8 +32,10 @@ tell a deliberate decision from an accident.
    *(Highest: theft = impersonate Aspen, lateral movement, spend compute.)*
 2. **Integrity & availability of calculation data** (public, so not secrecy —
    don't corrupt or destroy it).
-3. **Cluster compute / fair-share** (rises sharply if/when the agent can submit
-   Slurm jobs — see §7).
+3. **Cluster compute / fair-share** — now a **live** asset, not a conditional one:
+   the agent submits jobs (spec §19). Ranked here rather than higher because a
+   runaway batch is recoverable and visible; note it is the only asset whose
+   damage is *shared with the whole group* rather than confined to Aspen.
 4. **Bot availability & answer correctness.**
 5. Data confidentiality — **low** (public), with a mild pre-publication caveat.
 
@@ -123,7 +126,9 @@ Two single-instance processes:
 | `read_workflow` | In-process, path-fenced to the workflows root; another user's file is tagged `trust="reference-only"` (C10) |
 | `write_workflow` | Only the **speaking user's own** file — the destination is the Slack event's `user_id`, and the tool has no owner parameter (C9); `_group` gated on the admin; prior version snapshotted |
 | `run_python_analysis` | The **bwrap jail + seccomp** (no network, read-only project mount, only `figures/`+`cache/` writable, `prlimit` caps) |
-| `Bash` | A **Slurm read-only allowlist** + `can_use_tool` deny; everything else refused |
+| `Bash` | A **Slurm read-only allowlist** + `can_use_tool` deny; everything else refused. `sbatch`/`scancel` are **not** on it and never will be — a prefix rule cannot express "only this user's own jobs", and `Bash(sbatch:*)` grants `--wrap` |
+| `submit_orca_batch` | A fixed `template_mode` enum + a root-resolved structure path — **no script path or body** (C13); inputs copied into staging outside every writable area; env scrubbed (C14); per-user/global caps; dry-run + single-use confirm token |
+| `cancel_orca_batch` | Ledger enumeration filtered to the Slack event's `user_id`, then per-ID `WorkDir` verification against live Slurm, then explicit-ID `scancel` (C12) |
 
 **The "two sandboxes" distinction** (a common confusion):
 
@@ -147,11 +152,15 @@ Two single-instance processes:
 | C8 | **Admission out of the agent's reach** | The user registry is written *only* by the `aspen-users` CLI — no Slack command, no tool. Nothing the model can be told to do adds or removes a user. Reads are hot-reloaded, so a revocation applies on the target's next message rather than at the next restart. Failure never widens: a corrupt file keeps the last good copy. | `registry.py`, `config.py`, `users_cli.py` |
 | C9 | **Workflow ownership taken from the Slack event** | `write_workflow` has no owner parameter; the destination is `context["user_id"]`. A model can be argued into passing any argument it is given — it cannot pass a value it never receives. `_group` edits gate on `ADMIN_USER_ID`. Prior versions snapshotted like C4. | `tools.py`, `workflows.py` |
 | C10 | **Trust tiers on cross-user workflow text** | A workflow is user-authored text meant to be *followed*, so cross-user reading is a lateral prompt-injection path. Another user's file is delivered tagged `trust="reference-only"` with an explicit prompt rule that directives inside it are not addressed to the model, and that no workflow can grant tools, relax the sandbox, or change file access. Defense in depth only — the real limit stays the Python-enforced tool surface. | `workflows.py`, `prompts.py` |
-| C11 | **State-location guard at startup** | C8/C9 hold only if the registry and workflow tree aren't reachable through a writable path. Startup refuses if either resolves inside `WORKSPACE_ROOT` or `ASPEN_SANDBOX_WRITE_PATHS`, where sandboxed analysis code could edit them directly; the state dir is `chmod 0700` against other users on the shared node. | `main.py`, `config.py` |
+| C11 | **State-location guard at startup** | C8/C9 hold only if the registry and workflow tree aren't reachable through a writable path. Startup refuses if either resolves inside `WORKSPACE_ROOT` or `ASPEN_SANDBOX_WRITE_PATHS`, where sandboxed analysis code could edit them directly; the state dir is `chmod 0700` against other users on the shared node. Now also covers the **job ledger and the staging tree** (C12/C13) — a writable ledger is a forgeable cancel, and writable staging is a job body the model can plant. | `main.py`, `config.py` |
+| C12 | **Cancel scoped by ledger, then verified against live Slurm** | The Slurm surface (spec §19) is the one capability that spends a shared resource, and under the beta account model Unix ownership protects nothing — the bot *is* the developer, so every hand-submitted research job is in `scancel` range. Three checks replace it: the ID must be a row in Aspen's own ledger; the row's `slack_user_id` must equal the Slack event's `user_id` (the tool has no `owner` parameter, as C9); and `scontrol show job` must report a `WorkDir` inside *that requester's* staging directory. Fail-closed at every step. `scancel` filter flags (`-u`/`-n`/`-A`/`-p`/`-q`/`-t`/`--me`) are never built — they delegate enumeration to Slurm, which is precisely what makes per-job verification impossible. | `jobs.py`, `tools.py` |
+| C13 | **The model never authors a job body** | A submitted job runs unjailed on a compute node as the bot's Unix user, so *what* runs there is the whole security question. `submit_orca_batch` takes a `template_mode` from a fixed enum and a root-resolved structure path — no script path, no script content. The pipeline renders its own job scripts from its own packaged templates. What reaches a node is pipeline code plus the user's `.xyz` data. Inputs are copied, never symlinked, so nothing writes back into a calculations root. | `jobs.py`, `staging.py` |
+| C14 | **Orchestrator environment scrubbed to an allowlist** | `load_dotenv` puts `SLACK_BOT_TOKEN` and `AGENT_INTERNAL_SECRET` in the bot's `os.environ`, and `sbatch` defaults to `--export=ALL` — so a naive submission copies Aspen's Slack tokens onto every compute node. The subprocess gets an explicit allowlist instead; a denylist of secret *names* would silently miss the next secret added to `.env`. Deliberately **not** `--export=NONE`: the pipeline's ORCA script finds `xas-rerun-orca` on an inherited `PATH` behind a `command -v` guard, so `NONE` turns auto-rerun triage into a silent no-op — a security change whose cost would have been invisible. | `jobs.py` |
 
-All controls are covered by the hermetic test suite (`pytest -q`, 215 tests),
-including contract tests that fail if a file-reader re-enters the allowlist, the
-seccomp denylist loses a key entry, or `write_workflow` grows an owner parameter.
+All controls are covered by the hermetic test suite (`pytest -q`), including
+contract tests that fail if a file-reader re-enters the allowlist, the seccomp
+denylist loses a key entry, `write_workflow` grows an owner parameter, a `scancel`
+argv gains a filter flag, or a job tool starts accepting a script path.
 
 ## 7. ⭐ Security work owed at the service-account cutover
 
@@ -224,32 +233,71 @@ When the service account exists, do all of the following:
       from `write_metadata` — it has not written there since the sidecar migration,
       and a project README stays entirely in its owner's hands.
 
-**If/when the agent is given a Bash *write or exec* surface** (e.g. the ORCA→CORVUS
-Slurm-submission roadmap), additionally:
+**Slurm submission — what this section asked for, and where it landed.** The
+ORCA→CORVUS capability is now built (spec §19), and it deliberately did **not** take
+the Bash route this section anticipated:
 
-- [ ] **Turn on Sandbox B (the Claude Code Bash OS sandbox) — fail-closed.** Add a
-      startup self-test (the `verify_sandbox.sh` logic) that **refuses to start** if
-      the sandbox isn't actually enforcing, so its silent fail-open-when-nested
-      behavior can never apply unnoticed. Set `denyRead` on the secret paths as a
-      backstop; keep the fenced in-process tools as the primary read boundary.
-- [ ] **Bound submissions**: per-user submission budget, a hard cap on concurrent
-      agent-submitted jobs, dry-run + confirmation by default, and a fixed
-      `template_mode` allowlist with path validation. Project/user text must never
-      reach the `qsub`/`sbatch` argv. Cancel only the agent's own job IDs.
+- [x] **Bound submissions** — done as C12–C14: per-user daily submission budget,
+      hard caps on concurrent agent-submitted jobs (per-user and global), dry-run +
+      single-use confirmation token, a fixed `template_mode` enum with path
+      validation, and cancellation restricted to the agent's own ledger rows filtered
+      by the requesting Slack ID. No project or user text reaches the argv; the model
+      never supplies a script.
+- [~] **Sandbox B is not the answer here, and stays off.** Its checkbox was
+      conditioned on the agent gaining a Bash *write/exec* surface. Building
+      submission as **structured tools** instead means Bash gained nothing — it is
+      still the read-only Slurm allowlist — so there is no new Bash surface for
+      Sandbox B to confine. It would still confine nothing (§8). If anyone ever adds
+      `Bash(sbatch:*)`, this checkbox comes back and so does the fail-closed
+      startup self-test.
+- [ ] **The residual is the account, not the controls.** A submitted job runs
+      unjailed on a compute node as the bot's Unix user and can read
+      `$ASPEN_STATE_DIR`, the repo `.env` and `~/.ssh`. No Aspen-side control fixes
+      that; the service-account split above is the fix. Accepted for the beta (§8).
+- [ ] **Give `aspen-agent` a munge credential at cutover** — the first item in this
+      section says "no munge credential unless/until Slurm submission is enabled".
+      It is now enabled, so the service account needs one, plus a Slurm association.
+      Decide then whether jobs charge one shared account or each user's (an admin
+      question, not a code one).
+- [ ] **Plumb `--comment` through the pipeline** so attribution has a second,
+      Slurm-maintained key beside `WorkDir` (`AccountingStoreFlags = job_comment` is
+      confirmed on s3df). Strictly `--comment` and a job-name prefix — **not** a
+      generic `--sbatch-extra-args`, which is `--wrap` by another name.
 
 ## 8. Accepted risks (deliberate, for the interim)
 
 - **Bot runs as a personal privileged account** (SSH keys + munge). Accepted only
-  because the allowlist is **developer-only** until §7. Do not widen users first.
+  because the allowlist is small and trusted until §7. Now carries two extra
+  consequences, both from job submission:
+  - **A submitted job runs unjailed as the developer** on a compute node, so it can
+    read `$ASPEN_STATE_DIR`, the repo `.env`, and `~/.ssh`. Bounded by C13 (the job
+    body is pipeline code, never model output) and by the beta registry being a
+    handful of trusted colleagues — *not* by any confinement. This is the single
+    biggest reason to keep the beta small.
+  - **The developer's own hand-submitted jobs are inside the bot's `scancel`
+    range.** C12's `WorkDir` check is what keeps them safe, because a job launched
+    from a personal tree cannot have a `WorkDir` inside Aspen's staging root. Note
+    the asymmetry: under the service account this would be enforced by Slurm itself
+    and C12 would be redundancy; today C12 *is* the control.
 - **Secrets not rotated** despite the brief world-readable `.env` window — short
   exposure, usage is monitored, rotation folded into the §7 cutover.
 - **No per-project / per-user authorization** among allowlisted users — acceptable
   while data is public and members are trusted-but-careless. Revisit if either
   changes.
-- **Sandbox B is off** — correct for now: it wraps only the `Bash` tool (not the
-  in-process tools), and the only allowlisted Bash commands (Slurm) are *excluded*
-  from it by necessity (they need cluster network/munge), so it would currently
-  confine nothing. Enable it (fail-closed) when Bash gains a write/exec surface — §7.
+- **Sandbox B is off** — still correct, and job submission did not change it: it
+  wraps only the `Bash` tool (not the in-process tools), and the only allowlisted Bash
+  commands (Slurm reads) are *excluded* from it by necessity (they need cluster
+  network/munge), so it would confine nothing. Submission is a structured tool, not a
+  Bash command, so it adds no Bash surface. Enable it (fail-closed) if Bash ever
+  gains a write/exec surface — §7.
+
+- **Compute is spent on a shared allocation with per-user accounting kept only by
+  Aspen.** Jobs charge the developer's Slurm association (`ssrl:SMBXAS`), so "who used
+  the compute" is a ledger fact, not a cluster fact, until the service account gets
+  its own association. The ledger is reconciled against `sacct` manually
+  (`aspen-users jobs reconcile`), not on a cron, so consumption figures are as fresh
+  as the last time someone ran it. Bounded by the caps in C12; watch it during the
+  beta rather than trusting it.
 - **DEMO spends model budget for people who are not users.** Anyone in the
   workspace can trigger a walkthrough, and it runs the real agent. Accepted
   because it is capped three ways (per session, per day across everyone, and by
