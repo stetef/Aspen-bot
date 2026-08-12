@@ -49,8 +49,16 @@ _TOOL_PREFIX = f"mcp__{_SERVER}__"
 class SdkSession:
     """Warm, parked Claude Agent SDK conversation session."""
 
-    def __init__(self, key: str):
+    def __init__(self, key: str, allow_bash: bool = True):
         self.key = key
+        # Demo sessions get no Bash at all (see sessions._claim_session). The
+        # Slurm clients read the REAL cluster — job names carry project names and
+        # the queue says who is running what — and a demo visitor may not even
+        # have a cluster account. Enforced by leaving the patterns out of
+        # ``allowed_tools`` rather than by asking the model not to: a pre-approved
+        # command never reaches ``_can_use_tool``, so a prompt-level rule here
+        # would be advice, not a control.
+        self._allow_bash = allow_bash
         self._client = None
         self._current: dict | None = None   # current turn's context (attachment sink)
 
@@ -76,6 +84,13 @@ class SdkSession:
         import claude_agent_sdk as sdk
         if tool_name.startswith(_TOOL_PREFIX):
             return sdk.PermissionResultAllow()     # defensive; normally auto-approved
+        if tool_name == "Bash" and not self._allow_bash:
+            return sdk.PermissionResultDeny(message=(
+                "Slurm and other shell commands are switched off for this demo: "
+                "they would read the REAL cluster, and everything in a demo is "
+                "fabricated. Say so plainly — describe what squeue/sacct would "
+                "show a real user instead of running anything."
+            ))
         if tool_name == "Bash":
             cmd = (tool_input or {}).get("command", "")
             return sdk.PermissionResultDeny(message=(
@@ -132,7 +147,8 @@ class SdkSession:
         # Auto-approve our MCP tools plus the configured read-only Bash patterns
         # (e.g. "Bash(squeue:*)"). Anything else falls through to the can_use_tool
         # backstop, which denies it.
-        allowed = [f"{_TOOL_PREFIX}{s['name']}" for s in tools.TOOL_SPECS] + list(config.BASH_ALLOWLIST)
+        bash_patterns = list(config.BASH_ALLOWLIST) if self._allow_bash else []
+        allowed = [f"{_TOOL_PREFIX}{s['name']}" for s in tools.TOOL_SPECS] + bash_patterns
         opts = dict(
             system_prompt=prompts.SYSTEM_PROMPT,   # plain string -> replaces (no preset)
             model=config.MODEL,

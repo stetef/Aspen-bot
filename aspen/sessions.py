@@ -93,13 +93,26 @@ class SessionManager:
 
     # --- pre-warming ------------------------------------------------------- #
     def _claim_session(self, key: str):
-        """A session for ``key`` — a pre-connected spare if one is ready, else new."""
+        """A session for ``key`` — a pre-connected spare if one is ready, else new.
+
+        A demo thread never adopts a spare: spares are built with the ordinary
+        options, and a demo session must be created without the Bash allowlist so
+        the Slurm clients cannot reach the real cluster. Costs that one turn the
+        warm-start saving, which is the right trade for a control that actually
+        holds. The demo session exists before the turn runs (the Slack front-end
+        starts it ahead of the allowlist gate), so the key alone is enough to
+        know.
+        """
+        from . import demo
+        from .agent import SdkSession
+        if demo.get(key) is not None:
+            log.debug("Demo thread %s — fresh session with Bash disabled", key)
+            return SdkSession(key, allow_bash=False)
         if self._spares:
             session = self._spares.pop()
             session.key = key              # spares are keyless until adopted
             log.debug("Adopted pre-warmed session for %s", key)
             return session
-        from .agent import SdkSession
         return SdkSession(key)
 
     def warm(self) -> None:

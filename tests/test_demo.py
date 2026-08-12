@@ -461,5 +461,66 @@ def test_the_guidance_walks_through_the_stages(sut, session):
     assert "run_python_analysis" in "\n".join(sut.demo.guidance_lines(session))
 
 
+# --------------------------------------------------------------------------- #
+# Slurm is off in a demo, and the wrap says what was skipped
+# --------------------------------------------------------------------------- #
+def test_a_demo_session_has_no_bash_allowlist(sut, session):
+    """Enforced by omission from allowed_tools, not by asking the model.
+
+    A pre-approved command never reaches _can_use_tool, so a prompt-level rule
+    would be advice. The Slurm clients read the REAL cluster — job names carry
+    project names, the queue says who is running what — and a demo visitor may
+    not even have a cluster account.
+    """
+    import importlib
+    agent = importlib.import_module("aspen.agent")
+    demo_session = agent.SdkSession(session.thread, allow_bash=False)
+    normal = agent.SdkSession("some-other-thread")
+    assert demo_session._allow_bash is False
+    assert normal._allow_bash is True
+
+
+def test_a_demo_thread_never_adopts_a_warm_spare(sut, session, monkeypatch):
+    """Spares carry the ordinary options, so a demo must build its own."""
+    import importlib
+    agent = importlib.import_module("aspen.agent")
+    spare = agent.SdkSession("")                      # a pre-warmed, Bash-enabled one
+    sut.MANAGER._spares.append(spare)
+
+    claimed = sut.MANAGER._claim_session(session.thread)
+    assert claimed is not spare
+    assert claimed._allow_bash is False
+    assert sut.MANAGER._spares == [spare]             # the spare is still waiting
+
+    # A normal thread still gets the warm one.
+    assert sut.MANAGER._claim_session("plain-thread") is spare
+
+
+def test_the_capabilities_beat_covers_what_the_tour_skipped(sut, session):
+    session.advance("capabilities")
+    guidance = "\n".join(sut.demo.guidance_lines(session))
+    assert "demo_request_card" in guidance and "calc_root" in guidance
+    assert "set-root" in guidance
+    assert "squeue" in guidance and "OFF in this demo" in guidance
+    assert "@alias" in guidance
+
+
+def test_saving_notes_moves_on_to_the_capabilities_beat(sut, session):
+    session.advance("analyze")
+    sut.dispatch("write_metadata",
+                 {"project": "fe-porphyrin-scan", "content": "minimum near 1.95"},
+                 _ctx(session))
+    assert session.stage == "capabilities"
+
+
+def test_the_root_card_names_a_path_the_visitor_gave(sut, session):
+    posted = []
+    sut.dispatch("demo_request_card",
+                 {"what": "calc_root", "path": "/sdf/home/a/ada/calcs"},
+                 dict(_ctx(session), on_interim=posted.append))
+    assert "set-root ada-lovelace /sdf/home/a/ada/calcs" in posted[0]
+    assert "not actually sent" in posted[0].replace("*", "")
+
+
 def test_the_guidance_says_the_data_is_fabricated(sut, session):
     assert "fabricated" in "\n".join(sut.demo.guidance_lines(session))

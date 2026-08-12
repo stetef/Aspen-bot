@@ -80,6 +80,10 @@ Three properties make it safe to offer to a whole workspace:
 - **Nobody is paged.** The admin request is rendered *into the thread* — the card
   your admin would have received, so you can see and approve it — rather than sent.
 
+Slurm commands are switched off inside a demo — they would query the real cluster, and
+everything else in the walkthrough is fabricated. The tour says so and describes what
+`squeue` would show instead, alongside the other capabilities it didn't have time for.
+
 It still costs model time, so it's capped per session, per day across everyone, and
 by the ordinary rate limiter. Switch it off with `ASPEN_DEMO_ENABLED=false`.
 

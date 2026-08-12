@@ -387,6 +387,19 @@ properties, each asserted in `tests/test_demo.py` against the real tool surface:
   demo anyone can trigger must not be able to page a human. `ASPEN_DEMO_REAL_ADMIN_DM=true`
   opts into the real thing.
 
+**Bash is off in a demo.** The Slurm clients read the *real* cluster — job names carry
+project names, the queue says who is running what — and a demo visitor may not even have a
+cluster account. A demo thread therefore builds its own SDK session with the Bash patterns
+left out of `allowed_tools`, so a `squeue` call lands on the `can_use_tool` deny instead of
+being pre-approved. It is enforced by omission rather than by instruction because a
+pre-approved command never reaches that callback: a prompt-level rule there would be advice,
+not a control. The cost is that a demo thread cannot adopt a pre-warmed spare (those carry
+the ordinary options), which is one turn of warm-start latency.
+
+The `capabilities` beat then covers what the tour did not reach — asking for a calculations
+root (rendering the second card, with the `aspen-users set-root` command), reading
+colleagues' work by name, Slurm status and *why* it is off here, and attachments.
+
 Model time is the one real cost, so demo turns are rate-limited like any other and capped
 per session, per day across everyone, and by a session TTL. The walkthrough advances
 through `demo.STAGES`, with per-stage guidance injected in place of the usual `<aspen_context>`

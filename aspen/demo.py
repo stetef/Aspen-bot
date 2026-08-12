@@ -48,7 +48,8 @@ SCOPE_NAME = "demo"
 # the agent does the talking. Stages advance on what the visitor and agent
 # actually do, not on a timer, so someone who wanders off-script is followed
 # rather than corrected.
-STAGES = ("welcome", "request", "approved", "workflow", "explore", "analyze", "done")
+STAGES = ("welcome", "request", "approved", "workflow", "explore", "analyze",
+          "capabilities", "done")
 
 
 @dataclass
@@ -240,6 +241,7 @@ def read_workflow(session: DemoSession) -> str:
 
 def save_notes(session: DemoSession, project: str, content: str) -> str:
     session.notes[project] = content
+    session.advance("capabilities")
     return (f"Recorded notes for @{SCOPE_NAME}/{project} — in memory for the demo, "
             "and in Aspen's own storage for a real user (never in the calculations "
             "tree).")
@@ -348,7 +350,27 @@ _GUIDANCE = {
         "Fe-O distance from the directory name, and plot energy against distance. "
         "Say where the minimum is. Then offer to record what you found with "
         "write_metadata, and explain those notes live in Aspen's own storage — you "
-        "never write inside anyone's calculations."
+        "never write inside anyone's calculations. When that lands, move on to "
+        "what the tour has not covered yet."
+    ),
+    "capabilities": (
+        "They have seen the core loop. Now cover what the tour did NOT reach, "
+        "briefly — a few lines, not a brochure:\n"
+        "• Their own calculations directory. Offer to show what asking for one "
+        "looks like: call demo_request_card(what=\"calc_root\", path=…) with a "
+        "plausible path (theirs if they name one) so they see the second kind of "
+        "card and the `aspen-users set-root` command an admin would run. Say that "
+        "you cannot set it yourself — an admin approves it — and that until then "
+        "an unqualified path means the shared default.\n"
+        "• Reading colleagues' work by name (@alias/project), since everyone can "
+        "read every root, and that 'who else has run this?' is a normal question.\n"
+        "• Slurm job status — squeue/sacct/sinfo, read-only, never submitting or "
+        "cancelling. Say plainly that it is OFF in this demo because it would "
+        "query the REAL cluster and everything here is fabricated; describe what "
+        "it would show instead of pretending to run it.\n"
+        "• Attaching files to a reply, and that Aspen never writes into anyone's "
+        "calculations directory — its notes live in its own storage.\n"
+        "Then ask if they want to see any of it in more detail before you wrap up."
     ),
     "done": (
         "Wrap up when they're ready: what they saw, that everything was fabricated, "
