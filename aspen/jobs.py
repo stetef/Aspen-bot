@@ -1,0 +1,669 @@
+"""
+Slurm job submission and cancellation — the ledger, the argv, and who may cancel what.
+
+This is the only capability that spends a **shared** resource, and during the beta
+it runs under the developer's own Unix account (spec §19). That account model
+changes what the code here is load-bearing *for*, and the distinction is worth
+stating once at the top because it is the reason for nearly every check below.
+
+Under a dedicated ``aspen-agent`` service account, Unix and Slurm ownership are a
+free outer layer: the account simply cannot ``scancel`` anyone else's job, and
+everything in this module is defense in depth. Running as the developer removes
+that layer **and inverts it** — every job the developer ever submitted by hand is
+inside ``scancel`` range of the credentials the bot holds. So the three checks in
+:func:`resolve_cancellable` are not redundancy. They are the only thing between a
+confused or injected model and somebody's queue.
+
+The tag that replaces Unix ownership is ``WorkDir``, which Slurm records itself.
+Aspen cannot set ``--comment``: the pipeline invokes ``sbatch`` on its own, and
+Slurm offers no ``SBATCH_COMMENT`` environment variable to inject one through
+(``--wckey`` is dropped too — s3df reports ``TrackWCKey = no``). What Slurm does
+record unasked is the submission directory, and the pipeline's scripts run with
+``--chdir=.`` from their staging run directory. That makes ``WorkDir``:
+
+* set by Slurm rather than by Aspen, so conversation text cannot forge it;
+* per-user by construction, since staging is ``<root>/<alias>__<slack-id>/<thread>/``,
+  which reuses the path fence used everywhere else instead of inventing a second
+  notion of ownership;
+* structurally absent from hand-submitted jobs — a job launched from a personal
+  tree *cannot* have a ``WorkDir`` under the staging root, so it fails the check by
+  construction rather than by policy. This is what restores the protection that
+  Unix ownership would otherwise give.
+
+Job IDs are reused (s3df: ``MaxJobId = 67043328``, and the counter resets on a
+controller rebuild), which is why verification runs against live Slurm state at
+cancel time instead of trusting the ledger alone.
+"""
+
+import json
+import logging
+import os
+import re
+import sqlite3
+import subprocess
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Iterable, Optional
+
+from . import config, registry
+
+log = logging.getLogger("aspen")
+
+# Terminal Slurm states — a job in one of these cannot be cancelled and is not
+# counted against the concurrency caps.
+TERMINAL_STATES = frozenset({
+    "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL",
+    "PREEMPTED", "BOOT_FAIL", "DEADLINE", "OUT_OF_MEMORY", "REVOKED",
+    "SPECIAL_EXIT",
+})
+
+# Job kinds the pipeline creates, in dependency order.
+JOB_KINDS = ("orca", "corvus", "postprocess")
+
+# ``scancel`` flags that select jobs by predicate rather than by ID. NEVER built.
+#
+# Every one of them delegates enumeration to Slurm, which contradicts the rule
+# that the ledger is the only source of candidate IDs — and it makes per-job
+# verification impossible, because you cannot check the WorkDir of a job you never
+# enumerated. ``scancel -u <user>`` is one word away from the entire queue.
+# A contract test asserts none of these appears in a built argv.
+FORBIDDEN_SCANCEL_FLAGS = frozenset({
+    "-u", "--user", "-n", "--name", "--jobname", "-A", "--account",
+    "-p", "--partition", "-q", "--qos", "-t", "--state", "--me",
+    "-w", "--nodelist", "-R", "--reservation", "--wckey", "--cron",
+})
+
+_JOB_ID_RE = re.compile(r"^\d+(_\d+)?$")          # 12345 or 12345_7 (array task)
+_SLACK_ID_RE = re.compile(r"^[A-Z0-9]+$")
+
+
+class JobsError(Exception):
+    """A submission or cancellation was refused. The message is user-facing."""
+
+
+# --------------------------------------------------------------------------- #
+# Ledger
+# --------------------------------------------------------------------------- #
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS batches (
+    batch_id      TEXT PRIMARY KEY,
+    slack_user_id TEXT NOT NULL,
+    alias         TEXT NOT NULL,
+    thread_ts     TEXT NOT NULL,
+    project       TEXT NOT NULL,
+    owner_scope   TEXT NOT NULL,
+    template_mode TEXT NOT NULL,
+    staging_dir   TEXT NOT NULL,
+    structures    INTEGER NOT NULL,
+    argv          TEXT NOT NULL,
+    submitted_at  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id        TEXT NOT NULL,
+    batch_id      TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    job_name      TEXT,
+    work_dir      TEXT NOT NULL,
+    submitted_at  TEXT NOT NULL,
+    -- Reconciler-owned columns; everything above is immutable.
+    state         TEXT,
+    elapsed       TEXT,
+    total_cpu     TEXT,
+    alloc_tres    TEXT,
+    exit_code     TEXT,
+    reconciled_at TEXT,
+    cancelled_at  TEXT,
+    PRIMARY KEY (job_id, batch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_batches_user ON batches(slack_user_id);
+CREATE INDEX IF NOT EXISTS idx_batches_at   ON batches(submitted_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_batch   ON jobs(batch_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_state   ON jobs(state);
+"""
+
+
+def connect() -> sqlite3.Connection:
+    """Open the ledger, creating it (and its parent) on first use.
+
+    No WAL: the ledger sits in ``STATE_DIR``, which on this deployment is a
+    parallel filesystem where WAL's ``-shm`` mmap is unreliable (spec §12). A
+    ``busy_timeout`` covers the bot and the CLI touching it at once.
+    """
+    path = config.JOBS_LEDGER
+    registry.ensure_private_dir(path.parent)
+    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(_SCHEMA)
+    conn.commit()
+    return conn
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def record_batch(*, slack_user_id: str, alias: str, thread_ts: str, project: str,
+                 owner_scope: str, template_mode: str, staging_dir: Path,
+                 structures: int, argv: list) -> str:
+    """Write the batch row and return its id. Called BEFORE the pipeline runs.
+
+    Spec §18.2's "every submission is fully logged before sbatch" requirement,
+    kept literally: this raises on failure, and the caller lets that abort the
+    submission. A job running with no ledger row is a job nobody can cancel
+    through Aspen and nobody can attribute — strictly worse than not submitting.
+    """
+    batch_id = uuid.uuid4().hex[:16]
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO batches (batch_id, slack_user_id, alias, thread_ts, "
+            "project, owner_scope, template_mode, staging_dir, structures, argv, "
+            "submitted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (batch_id, slack_user_id, alias, thread_ts, project, owner_scope,
+             template_mode, str(staging_dir), int(structures),
+             json.dumps(list(argv)), _utc_now()),
+        )
+    return batch_id
+
+
+def record_jobs(batch_id: str, entries: Iterable[dict]) -> int:
+    """Record the scheduler jobs a batch produced. Immutable once written."""
+    rows = [
+        (str(e["job_id"]), batch_id, e.get("kind", ""), e.get("job_name", ""),
+         str(e["work_dir"]), _utc_now())
+        for e in entries
+    ]
+    if not rows:
+        return 0
+    with connect() as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO jobs (job_id, batch_id, kind, job_name, "
+            "work_dir, submitted_at) VALUES (?,?,?,?,?,?)",
+            rows,
+        )
+    return len(rows)
+
+
+def batches_for(slack_user_id: str, limit: int = 20) -> list:
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM batches WHERE slack_user_id = ? "
+            "ORDER BY submitted_at DESC LIMIT ?", (slack_user_id, limit))]
+
+
+def jobs_for_batch(batch_id: str) -> list:
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM jobs WHERE batch_id = ? ORDER BY submitted_at, kind",
+            (batch_id,))]
+
+
+def active_rows(slack_user_id: str = "") -> list:
+    """Ledger rows not known to be terminal, joined to their batch.
+
+    ``state IS NULL`` counts as active: the reconciler may not have run yet, and
+    treating unknown as finished would let the caps be walked past by never
+    reconciling.
+    """
+    sql = (
+        "SELECT j.*, b.slack_user_id, b.alias, b.project, b.thread_ts, "
+        "       b.staging_dir, b.template_mode "
+        "FROM jobs j JOIN batches b ON b.batch_id = j.batch_id "
+        "WHERE j.cancelled_at IS NULL "
+        "  AND (j.state IS NULL OR j.state NOT IN (%s))"
+        % ",".join("?" * len(TERMINAL_STATES))
+    )
+    params = list(TERMINAL_STATES)
+    if slack_user_id:
+        sql += " AND b.slack_user_id = ?"
+        params.append(slack_user_id)
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(sql, params)]
+
+
+def submits_today(slack_user_id: str) -> int:
+    since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(timespec="seconds")
+    with connect() as conn:
+        (n,) = conn.execute(
+            "SELECT COUNT(*) FROM batches WHERE slack_user_id = ? AND submitted_at >= ?",
+            (slack_user_id, since),
+        ).fetchone()
+    return int(n)
+
+
+def mark_cancelled(job_ids: Iterable[str]) -> None:
+    ids = [str(j) for j in job_ids]
+    if not ids:
+        return
+    with connect() as conn:
+        conn.executemany(
+            "UPDATE jobs SET cancelled_at = ? WHERE job_id = ?",
+            [(_utc_now(), j) for j in ids],
+        )
+
+
+def apply_reconciliation(rows: Iterable[dict]) -> int:
+    """Fill in the reconciler-owned columns. The only UPDATE of a submit row's data."""
+    updates = [
+        (r.get("state"), r.get("elapsed"), r.get("total_cpu"), r.get("alloc_tres"),
+         r.get("exit_code"), _utc_now(), str(r["job_id"]))
+        for r in rows
+    ]
+    if not updates:
+        return 0
+    with connect() as conn:
+        conn.executemany(
+            "UPDATE jobs SET state=?, elapsed=?, total_cpu=?, alloc_tres=?, "
+            "exit_code=?, reconciled_at=? WHERE job_id=?",
+            updates,
+        )
+    return len(updates)
+
+
+# --------------------------------------------------------------------------- #
+# Staging paths — the fence that WorkDir verification checks against
+# --------------------------------------------------------------------------- #
+def staging_dir_for(slack_user_id: str, thread_ts: str) -> Path:
+    """``<staging root>/<alias>__<slack-id>/<thread-ts>``.
+
+    Derived entirely from the registry and the Slack event — never from tool
+    input. The ``alias__slack-id`` shape mirrors ``workflows.dir_for`` and
+    ``metadata``: found by ID, so a rename cannot orphan anyone's jobs, and
+    readable by a human scanning the directory.
+    """
+    if not _SLACK_ID_RE.match(slack_user_id or ""):
+        raise JobsError("Internal error: refusing to stage without a Slack user ID.")
+    user = registry.by_id(slack_user_id) or {}
+    alias = user.get("alias") or "unknown"
+    # thread_ts is a Slack timestamp ("1723480000.123456"); keep it filesystem-safe
+    # without losing identity. Slack never puts a separator in it, but a thread_ts
+    # is still event data, so it is sanitised rather than trusted.
+    safe_thread = re.sub(r"[^0-9.]", "", str(thread_ts)) or "nothread"
+    return config.JOBS_STAGING_ROOT / f"{alias}__{slack_user_id}" / safe_thread
+
+
+def user_staging_root(slack_user_id: str) -> Path:
+    """The per-user staging directory — the fence a job's WorkDir must sit inside."""
+    if not _SLACK_ID_RE.match(slack_user_id or ""):
+        raise JobsError("Internal error: refusing to resolve staging without a Slack ID.")
+    user = registry.by_id(slack_user_id) or {}
+    alias = user.get("alias") or "unknown"
+    return config.JOBS_STAGING_ROOT / f"{alias}__{slack_user_id}"
+
+
+def _within(path: Path, parent: Path) -> bool:
+    """True if ``path`` is inside ``parent``, symlinks resolved.
+
+    ``resolve()`` on both sides is the point: a symlink inside staging pointing
+    at someone else's tree must not read as containment.
+    """
+    try:
+        return path.resolve().is_relative_to(parent.resolve())
+    except (OSError, ValueError):
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# Environment for the orchestrator subprocess (and therefore for every job)
+# --------------------------------------------------------------------------- #
+def submit_env() -> dict:
+    """The scrubbed environment the pipeline subprocess runs with.
+
+    ``config.load_dotenv()`` puts ``SLACK_BOT_TOKEN``, ``SLACK_APP_TOKEN`` and
+    ``AGENT_INTERNAL_SECRET`` into this process's ``os.environ``, and ``sbatch``
+    defaults to ``--export=ALL`` — so without scrubbing, every compute node in the
+    batch would receive Aspen's Slack tokens.
+
+    An **allowlist**, deliberately. A denylist of secret names silently fails to
+    cover the next secret someone adds to ``.env``, and the failure is invisible
+    until it is a credential on a shared cluster.
+
+    Not ``--export=NONE``, which looks like the stronger move: the pipeline's ORCA
+    script triages its own failures by calling ``xas-rerun-orca``, found on an
+    inherited ``PATH`` behind a ``command -v`` guard. Under ``--export=NONE`` that
+    guard fails and auto-rerun becomes a *silent* no-op. Scrubbing the parent
+    environment achieves the same security result with no invisible cost.
+    """
+    allowed = set(config.JOBS_ENV_BASE) | set(config.JOBS_ENV_PASSTHROUGH)
+    env = {}
+    for key, value in os.environ.items():
+        keep = key in allowed or key.startswith(tuple(config.JOBS_ENV_PREFIXES))
+        if keep:
+            env[key] = value
+
+    # Belt and braces: nothing on the forbidden list survives, whatever an
+    # operator put in ASPEN_JOBS_ENV_PASSTHROUGH or however a prefix matched.
+    for name in config.JOBS_ENV_FORBIDDEN:
+        env.pop(name, None)
+    # And nothing that merely *looks* like a secret, for the names we cannot
+    # enumerate ahead of time.
+    for key in list(env):
+        if re.search(r"(TOKEN|SECRET|PASSWORD|APIKEY|API_KEY|CREDENTIAL)", key, re.I):
+            env.pop(key, None)
+
+    # Defense in depth beside the scrub: name the exported set explicitly, so a
+    # future sbatch default change cannot widen it.
+    env["SBATCH_EXPORT"] = config.JOBS_SBATCH_EXPORT or ",".join(sorted(env))
+    return env
+
+
+# --------------------------------------------------------------------------- #
+# argv builders — pure functions, so the tests need no cluster
+# --------------------------------------------------------------------------- #
+def build_submit_argv(*, staging_dir: Path, out_dir: Path, template_mode: str,
+                      dry_run: bool) -> list:
+    """The pipeline invocation. A list, never a shell string.
+
+    Note what the model contributes: a ``template_mode`` that has already been
+    validated against a fixed enum, and paths this module derived. It supplies no
+    script, no flags, and no free text. There is nothing here for conversation to
+    steer, which is why this can be a pure function with an exhaustive test.
+    """
+    from . import staging  # local import: staging imports jobs for the enum
+
+    flag = staging.mode_flag(template_mode)   # raises on anything off the enum
+    argv = [
+        config.JOBS_PIPELINE_BIN,
+        str(staging_dir),
+        "--scheduler", config.JOBS_SCHEDULER,
+        "--out-dir", str(out_dir),
+    ]
+    if flag:
+        argv.append(flag)
+    if dry_run:
+        argv.append("--no-submit")
+    return argv
+
+
+def build_scancel_argv(job_ids: Iterable[str]) -> list:
+    """``scancel <id> <id> …`` — explicit IDs only, no predicates.
+
+    Every ID is re-validated here even though it came from the ledger, because
+    this function is the last thing between a string and a process. Filter flags
+    are not merely unused: passing one is a programming error worth crashing on,
+    since it would silently widen what a cancel touches.
+    """
+    ids = [str(j) for j in job_ids]
+    if not ids:
+        raise JobsError("Nothing to cancel.")
+    for jid in ids:
+        if jid in FORBIDDEN_SCANCEL_FLAGS or jid.startswith("-"):
+            raise JobsError(
+                f"Refusing to build a scancel with the option {jid!r}: cancellation "
+                "is by explicit job ID only."
+            )
+        if not _JOB_ID_RE.match(jid):
+            raise JobsError(f"Refusing to cancel {jid!r}: not a Slurm job ID.")
+    return ["scancel", *ids]
+
+
+def build_sacct_argv(*, user: str, since: str) -> list:
+    """The reconciler's read. ``-X`` avoids double-counting ``.batch``/``.extern`` steps."""
+    return [
+        "sacct", "-X", "-n", "-P", "-u", user, "-S", since,
+        "-o", "JobID,JobName,Comment,State,Submit,Start,End,Elapsed,"
+              "TotalCPU,AllocTRES,ExitCode",
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Live Slurm state
+# --------------------------------------------------------------------------- #
+def _run_slurm(argv: list) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        argv, capture_output=True, text=True, check=False,
+        timeout=config.JOBS_SLURM_TIMEOUT, env=submit_env(),
+    )
+
+
+def scontrol_job(job_id: str) -> Optional[dict]:
+    """Parse ``scontrol show job <id> -o`` into a dict, or None if unavailable.
+
+    Returns None — never a partial dict — when Slurm cannot tell us about the job,
+    so callers cannot mistake "no information" for "information that passed".
+    """
+    if not _JOB_ID_RE.match(str(job_id)):
+        return None
+    try:
+        proc = _run_slurm(["scontrol", "show", "job", str(job_id), "-o"])
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("jobs: scontrol failed for %s: %s", job_id, exc)
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    # "JobId=123 JobName=x WorkDir=/p UserId=me(1001) JobState=RUNNING ..."
+    out = {}
+    for token in proc.stdout.split():
+        key, sep, value = token.partition("=")
+        if sep:
+            out.setdefault(key, value)
+    return out or None
+
+
+def whoami() -> str:
+    """The Unix user Aspen runs as — the account whose jobs it may cancel."""
+    from . import roots
+    return roots._whoami()
+
+
+# --------------------------------------------------------------------------- #
+# THE ownership chokepoint
+# --------------------------------------------------------------------------- #
+def resolve_cancellable(requester_uid: str, selector: str = "") -> tuple[list, list]:
+    """What ``requester_uid`` may cancel right now. The single authorization seam.
+
+    Returns ``(approved, refused)`` — ``approved`` is a list of verified ledger
+    rows, ``refused`` a list of ``(job_id, reason)`` pairs kept so the reply can
+    say what was skipped instead of silently narrowing.
+
+    Deliberately **one** implementation, not duplicated into the tool server: the
+    threat model records that both scope escapes in this codebase were a second
+    code path reading the registry directly instead of going through the fence
+    (THREAT_MODEL §3). A cancel check that exists twice is that shape again.
+
+    Three gates, each of which must pass, and each failing closed:
+
+    1. **Ledger membership and ownership.** Candidates come only from rows whose
+       ``slack_user_id`` equals ``requester_uid`` — which callers take from the
+       Slack event, never from tool input (there is no ``owner`` parameter, by
+       design). A ``selector`` may narrow the set; it can never widen it, because
+       it is applied as a filter over rows already restricted to this user.
+    2. **The job is ours to cancel.** ``scontrol`` must report the job, and its
+       ``UserId`` must be the account Aspen runs as.
+    3. **WorkDir inside this requester's staging tree.** This is what makes the
+       beta account model survivable: the developer's own hand-submitted jobs
+       cannot satisfy it, and neither can another Slack user's Aspen jobs. It also
+       closes the recycled-ID window — a stale row pointing at a live unrelated
+       job fails here even though gate 1 passed.
+    """
+    if not _SLACK_ID_RE.match(requester_uid or ""):
+        raise JobsError("Internal error: cancellation requires a Slack user ID.")
+
+    rows = active_rows(requester_uid)
+    if selector:
+        rows = _apply_selector(rows, selector)
+
+    fence = user_staging_root(requester_uid)
+    me = whoami()
+    approved, refused = [], []
+
+    for row in rows:
+        jid = str(row["job_id"])
+        info = scontrol_job(jid)
+        if info is None:
+            refused.append((jid, "Slurm has no current record of it (already finished?)"))
+            continue
+
+        owner = info.get("UserId", "")
+        # "tetef01(1234)" -> "tetef01"
+        owner_name = owner.split("(")[0]
+        if owner_name != me:
+            refused.append((jid, f"it belongs to Unix user {owner_name or '?'}, not {me}"))
+            continue
+
+        work_dir = info.get("WorkDir", "")
+        if not work_dir:
+            refused.append((jid, "Slurm reports no WorkDir, so ownership can't be verified"))
+            continue
+        if not _within(Path(work_dir), fence):
+            # The important refusal: everything else is bookkeeping, this is the
+            # one that stops a cancel crossing a person.
+            refused.append((jid, "its working directory is outside your own staging area"))
+            log.warning(
+                "jobs: refused cancel of %s for %s — WorkDir %s outside %s",
+                jid, requester_uid, work_dir, fence,
+            )
+            continue
+
+        comment = info.get("Comment", "")
+        if comment and comment.startswith("aspen/v1/"):
+            # Not yet set by the pipeline (spec §19.9). When it is, it becomes a
+            # second independent check rather than replacing WorkDir.
+            expected = f"aspen/v1/{requester_uid}/"
+            if not comment.startswith(expected):
+                refused.append((jid, "its Aspen tag names a different user"))
+                log.warning("jobs: comment mismatch on %s: %r", jid, comment)
+                continue
+
+        row = dict(row)
+        row["live_state"] = info.get("JobState", "")
+        row["live_work_dir"] = work_dir
+        approved.append(row)
+
+    return approved, refused
+
+
+def _apply_selector(rows: list, selector: str) -> list:
+    """Narrow ``rows`` by job ID, batch ID, or project name. Never widens.
+
+    Applied *after* the per-user filter, so the worst a hostile selector achieves
+    is selecting fewer of the requester's own jobs.
+    """
+    sel = selector.strip()
+    if not sel or sel.lower() == "all":
+        return rows
+    hits = [r for r in rows if str(r["job_id"]) == sel]
+    if hits:
+        return hits
+    hits = [r for r in rows if r["batch_id"] == sel]
+    if hits:
+        return hits
+    low = sel.lower()
+    hits = [r for r in rows if (r.get("project") or "").lower() == low]
+    if hits:
+        return hits
+    return []
+
+
+def cancel(requester_uid: str, selector: str = "") -> dict:
+    """Verify, then ``scancel`` the approved IDs. Returns a report for the reply."""
+    approved, refused = resolve_cancellable(requester_uid, selector)
+    if not approved:
+        return {"cancelled": [], "refused": refused, "ok": False}
+
+    ids = [str(r["job_id"]) for r in approved]
+    argv = build_scancel_argv(ids)
+    try:
+        proc = _run_slurm(argv)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise JobsError(f"Could not run scancel: {exc}") from exc
+
+    if proc.returncode != 0:
+        # scancel exits non-zero if *any* ID failed; it does not say which. The
+        # ledger is not marked, so a retry re-verifies rather than assuming.
+        raise JobsError(
+            "scancel reported an error: "
+            + (proc.stderr.strip() or f"exit {proc.returncode}")
+        )
+
+    mark_cancelled(ids)
+    log.info("jobs: cancelled %s for %s", ",".join(ids), requester_uid)
+    return {"cancelled": approved, "refused": refused, "ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# Caps
+# --------------------------------------------------------------------------- #
+def check_caps(requester_uid: str, structures: int) -> None:
+    """Raise :class:`JobsError` if this submission would exceed a cap.
+
+    Python-enforced rather than described in the prompt: the primary threat actor
+    is the careless allowlisted member and the asset is compute shared with the
+    whole group, so "the model was asked not to" is not a control.
+    """
+    if structures > config.JOBS_MAX_STRUCTURES:
+        raise JobsError(
+            f"That's {structures} structures; the per-submission cap is "
+            f"{config.JOBS_MAX_STRUCTURES}. Split it into smaller batches."
+        )
+    if structures <= 0:
+        raise JobsError("No structures to submit.")
+
+    mine = len(active_rows(requester_uid))
+    if mine + structures * len(JOB_KINDS) > config.JOBS_MAX_ACTIVE_PER_USER:
+        raise JobsError(
+            f"You already have {mine} active Aspen jobs; this batch would add about "
+            f"{structures * len(JOB_KINDS)} and the per-user cap is "
+            f"{config.JOBS_MAX_ACTIVE_PER_USER}. Wait for some to finish, or cancel some."
+        )
+
+    everyone = len(active_rows())
+    if everyone + structures * len(JOB_KINDS) > config.JOBS_MAX_ACTIVE_TOTAL:
+        raise JobsError(
+            f"Aspen has {everyone} active jobs across everyone, and the global cap is "
+            f"{config.JOBS_MAX_ACTIVE_TOTAL}. Try again once the queue drains."
+        )
+
+    today = submits_today(requester_uid)
+    if today >= config.JOBS_MAX_SUBMITS_PER_DAY:
+        raise JobsError(
+            f"You've made {today} submissions in the last 24 h, which is the daily "
+            f"limit ({config.JOBS_MAX_SUBMITS_PER_DAY}). This resets on a rolling window."
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Dry-run → confirm tokens
+# --------------------------------------------------------------------------- #
+# In-process, single-use, TTL'd, and keyed by (thread, user). The confirmation has
+# to be a Python control rather than a system-prompt instruction: a model can be
+# talked out of asking, but it cannot mint a token it was never given. Same
+# reasoning as pending.py, and as write_workflow taking its target from the event.
+_PENDING: dict = {}
+
+
+def issue_token(kind: str, requester_uid: str, thread_ts: str, payload: dict) -> str:
+    token = uuid.uuid4().hex[:12]
+    _PENDING[token] = {
+        "kind": kind, "uid": requester_uid, "thread": thread_ts,
+        "payload": payload, "at": time.monotonic(),
+    }
+    _expire_tokens()
+    return token
+
+
+def redeem_token(token: str, kind: str, requester_uid: str, thread_ts: str) -> dict:
+    """Consume a token, or raise. Single-use even on a failed downstream action."""
+    _expire_tokens()
+    entry = _PENDING.pop((token or "").strip(), None)
+    if entry is None:
+        raise JobsError(
+            "That confirmation has expired or was already used — run the dry run again."
+        )
+    if entry["kind"] != kind:
+        raise JobsError("That confirmation was for a different action.")
+    # The token is bound to who and where, so one cannot be replayed by another
+    # user or carried into a different thread.
+    if entry["uid"] != requester_uid or entry["thread"] != thread_ts:
+        log.warning("jobs: token replay attempt by %s in %s", requester_uid, thread_ts)
+        raise JobsError("That confirmation belongs to a different conversation.")
+    return entry["payload"]
+
+
+def _expire_tokens() -> None:
+    cutoff = time.monotonic() - config.JOBS_CONFIRM_TTL
+    for token in [t for t, e in _PENDING.items() if e["at"] < cutoff]:
+        _PENDING.pop(token, None)
