@@ -722,6 +722,15 @@ def cmd_jobs_panic(args) -> int:
     return 0
 
 
+def cmd_jobs_prune(args) -> int:
+    from . import jobs
+
+    result = jobs.prune_staging(max_age_hours=args.hours)
+    print(f"Removed {result['removed']} abandoned staging dir(s), freeing "
+          f"{result['bytes'] / 1e6:.1f} MB; kept {result['kept']}.")
+    return 0
+
+
 def cmd_jobs_reconcile(args) -> int:
     from . import jobs
 
@@ -1177,6 +1186,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     j.add_argument("-f", "--force", action="store_true", help="skip the confirmation prompt")
     j.set_defaults(func=cmd_jobs_panic)
+
+    j = jsub.add_parser(
+        "prune",
+        help="delete staging directories no batch ever claimed",
+        description="A dry run stages a copy of the structures before the pipeline "
+                    "validates them; if the user then declines, that copy is "
+                    "orphaned. Only directories with no ledger row and older than "
+                    "--hours are removed, so nothing submitted is ever touched. "
+                    "Runs opportunistically on each dry run too.",
+    )
+    j.add_argument("--hours", type=float, default=48.0,
+                   help="minimum age to remove (default 48)")
+    j.set_defaults(func=cmd_jobs_prune)
 
     j = jsub.add_parser(
         "reconcile",

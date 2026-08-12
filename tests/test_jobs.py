@@ -447,3 +447,87 @@ def test_discard_staging_refuses_paths_outside_the_staging_root(sut, jobs_env, t
     (victim / "important.txt").write_text("hello")
     sut.jobs._discard_staging(victim)
     assert (victim / "important.txt").exists(), "cleanup must never leave the staging root"
+
+
+# --------------------------------------------------------------------------- #
+# Operational: the caps must not jam, and staging must not grow without bound
+# --------------------------------------------------------------------------- #
+def test_the_active_cap_reconciles_before_refusing(sut, jobs_env, monkeypatch):
+    """Otherwise the cap jams permanently and the advice it gives cannot work.
+
+    A row with no state counts as active (treating unknown as finished would let
+    the caps be walked past by never reconciling). But reconciliation is a manual
+    CLI step, so a user whose jobs all finished weeks ago would still be refused
+    and told to "wait for some to finish".
+    """
+    monkeypatch.setattr(sut, "JOBS_MAX_ACTIVE_PER_USER", 3)
+    batch = sut.jobs.record_batch(
+        slack_user_id="U0SAM", alias="sam", thread_ts="1", project="p",
+        owner_scope="sam", template_mode="ca-fixed",
+        staging_dir=sut.JOBS_STAGING_ROOT / "x", structures=1, argv=["x"])
+    sut.jobs.record_jobs(batch, [
+        {"job_id": str(9000 + i), "kind": "orca", "work_dir": "/x"} for i in range(3)])
+
+    # Without a reconcile these three unreconciled rows block everything.
+    with pytest.raises(sut.jobs.JobsError):
+        sut.jobs.check_caps("U0SAM", 1)
+
+    # Now let the reconciler see that Slurm considers them finished.
+    monkeypatch.setattr(sut.jobs, "reconcile", lambda days=90: sut.jobs.apply_reconciliation(
+        [{"job_id": str(9000 + i), "state": "COMPLETED"} for i in range(3)]))
+    sut.jobs.check_caps("U0SAM", 1)          # must no longer raise
+
+
+def test_a_reconcile_failure_does_not_break_submission(sut, jobs_env, monkeypatch):
+    """Housekeeping must never turn into a submission error the user can't act on."""
+    monkeypatch.setattr(sut, "JOBS_MAX_ACTIVE_PER_USER", 1)
+    batch = sut.jobs.record_batch(
+        slack_user_id="U0SAM", alias="sam", thread_ts="1", project="p",
+        owner_scope="sam", template_mode="ca-fixed",
+        staging_dir=sut.JOBS_STAGING_ROOT / "x", structures=1, argv=["x"])
+    sut.jobs.record_jobs(batch, [{"job_id": "9100", "kind": "orca", "work_dir": "/x"}])
+
+    def boom(days=90):
+        raise sut.jobs.JobsError("sacct is down")
+
+    monkeypatch.setattr(sut.jobs, "reconcile", boom)
+    with pytest.raises(sut.jobs.JobsError) as exc:
+        sut.jobs.check_caps("U0SAM", 1)
+    # The user hears about the cap, not about sacct.
+    assert "per-user cap" in str(exc.value)
+
+
+def test_prune_removes_abandoned_staging_but_never_a_submitted_batch(sut, jobs_env):
+    """A declined preview orphans a full copy of the user's structures."""
+    import os, time as _time
+
+    files, scope = sut.staging.collect_structures("thermolysin/structures", "", "U0SAM")
+    abandoned = sut.staging.stage(
+        requester_uid="U0SAM", thread_ts="1111111111.1", structures=files,
+        scope=scope, template_mode="ca-fixed", source_rel="thermolysin/structures")
+    submitted = sut.staging.stage(
+        requester_uid="U0SAM", thread_ts="2222222222.2", structures=files,
+        scope=scope, template_mode="ca-fixed", source_rel="thermolysin/structures")
+    sut.jobs.record_batch(
+        slack_user_id="U0SAM", alias="sam", thread_ts="2222222222.2", project="thermolysin",
+        owner_scope="sam", template_mode="ca-fixed", staging_dir=submitted,
+        structures=2, argv=["x"])
+
+    # Age both well past the window; only the unclaimed one may go.
+    old = _time.time() - 200 * 3600
+    for d in (abandoned, submitted):
+        os.utime(d, (old, old))
+
+    result = sut.jobs.prune_staging(max_age_hours=48)
+    assert result["removed"] == 1
+    assert not abandoned.exists()
+    assert submitted.exists(), "a directory a batch row points at must never be pruned"
+
+
+def test_prune_keeps_a_recent_preview_awaiting_confirmation(sut, jobs_env):
+    files, scope = sut.staging.collect_structures("thermolysin/structures", "", "U0SAM")
+    fresh = sut.staging.stage(
+        requester_uid="U0SAM", thread_ts="3333333333.3", structures=files,
+        scope=scope, template_mode="ca-fixed", source_rel="thermolysin/structures")
+    assert sut.jobs.prune_staging(max_age_hours=48)["removed"] == 0
+    assert fresh.exists()

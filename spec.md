@@ -1322,7 +1322,13 @@ the risks visible:
   `WorkDir`, recoverable from `sacct -o Comment` even if the ledger is lost — worth doing,
   since `AccountingStoreFlags = job_comment` is confirmed on s3df. Deliberately **not** a
   generic `--sbatch-extra-args` pass-through, which would be `--wrap` by another name.
-- **The reconciler is manual** (`aspen-users jobs reconcile`), not a cron job.
+- **The reconciler is manual** (`aspen-users jobs reconcile`), not a cron job —
+  though the caps reconcile once on their own before refusing, since a row with no
+  state counts as active and an unreconciled ledger would otherwise jam the cap
+  permanently while advising the user to "wait for jobs to finish" that already had.
+  Abandoned staging (a preview the user declined) is pruned opportunistically on the
+  next dry run, and by `aspen-users jobs prune`; a directory a batch row points at is
+  never touched.
   Attribution is two-phase and the second phase is the one that answers "who used the
   compute": at submit time you know *who and what*, but elapsed time, CPU-hours and exit
   state exist only after a job ends, so a design that logged only at submission would yield

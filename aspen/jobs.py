@@ -626,16 +626,34 @@ def check_caps(requester_uid: str, structures: int) -> None:
     if structures <= 0:
         raise JobsError("No structures to submit.")
 
-    mine = len(active_rows(requester_uid))
-    if mine + structures * len(JOB_KINDS) > config.JOBS_MAX_ACTIVE_PER_USER:
+    wanted = structures * len(JOB_KINDS)
+    mine, everyone = len(active_rows(requester_uid)), len(active_rows())
+    over_user = mine + wanted > config.JOBS_MAX_ACTIVE_PER_USER
+    over_all = everyone + wanted > config.JOBS_MAX_ACTIVE_TOTAL
+
+    if over_user or over_all:
+        # A row with no state counts as active, because treating "unknown" as
+        # finished would let the caps be walked past by simply never reconciling.
+        # But reconciliation is a manual CLI step, so without this the caps jam
+        # permanently: a user whose jobs all finished weeks ago is still refused,
+        # and told to "wait for some to finish" — advice that can never work.
+        # Refresh once, from Slurm's own accounting, before refusing.
+        try:
+            reconcile(days=90)
+        except JobsError:
+            log.warning("jobs: could not reconcile before a cap check", exc_info=True)
+        else:
+            mine, everyone = len(active_rows(requester_uid)), len(active_rows())
+            over_user = mine + wanted > config.JOBS_MAX_ACTIVE_PER_USER
+            over_all = everyone + wanted > config.JOBS_MAX_ACTIVE_TOTAL
+
+    if over_user:
         raise JobsError(
             f"You already have {mine} active Aspen jobs; this batch would add about "
-            f"{structures * len(JOB_KINDS)} and the per-user cap is "
-            f"{config.JOBS_MAX_ACTIVE_PER_USER}. Wait for some to finish, or cancel some."
+            f"{wanted} and the per-user cap is {config.JOBS_MAX_ACTIVE_PER_USER}. "
+            "Wait for some to finish, or cancel some."
         )
-
-    everyone = len(active_rows())
-    if everyone + structures * len(JOB_KINDS) > config.JOBS_MAX_ACTIVE_TOTAL:
+    if over_all:
         raise JobsError(
             f"Aspen has {everyone} active jobs across everyone, and the global cap is "
             f"{config.JOBS_MAX_ACTIVE_TOTAL}. Try again once the queue drains."
@@ -777,6 +795,14 @@ def dry_run(*, requester_uid: str, thread_ts: str, rel: str, owner: str,
     structures, scope = staging.collect_structures(rel, owner, requester_uid)
     check_caps(requester_uid, len(structures))
 
+    # Opportunistic, and here rather than on a cron because this is the moment
+    # more staging is about to be created. Failures are logged, never fatal: a
+    # housekeeping problem must not block a submission.
+    try:
+        prune_staging()
+    except Exception:
+        log.warning("jobs: staging prune failed", exc_info=True)
+
     staging_dir = staging.stage(
         requester_uid=requester_uid, thread_ts=thread_ts, structures=structures,
         scope=scope, template_mode=mode, source_rel=rel,
@@ -890,6 +916,53 @@ def _discard_staging(staging_dir: Path) -> None:
             shutil.rmtree(staging_dir, ignore_errors=True)
     except Exception:
         log.warning("jobs: could not clean up %s", staging_dir, exc_info=True)
+
+
+def prune_staging(max_age_hours: float = 48.0) -> dict:
+    """Delete staging directories no batch ever claimed.
+
+    A dry run stages a full copy of the user's structures *before* the pipeline
+    validates them, because the pipeline is what does the validating. If the user
+    then says "no thanks" — the correct and expected outcome of a preview — that
+    copy is orphaned. Only *failed* dry runs clean up after themselves, so without
+    this, ordinary polite use grows the staging tree without bound.
+
+    Safe by construction: a directory is removed only when **no ledger row points
+    at it** (so nothing submitted is ever touched, however old) and it is older
+    than ``max_age_hours`` (so a preview waiting on a confirmation survives).
+    """
+    root = config.JOBS_STAGING_ROOT
+    if not root.is_dir():
+        return {"removed": 0, "kept": 0, "bytes": 0}
+
+    with connect() as conn:
+        claimed = {row["staging_dir"] for row in conn.execute(
+            "SELECT staging_dir FROM batches")}
+
+    cutoff = time.time() - max_age_hours * 3600
+    removed, kept, freed = 0, 0, 0
+    for user_dir in root.iterdir():
+        if not user_dir.is_dir():
+            continue
+        for run_dir in user_dir.iterdir():
+            if not run_dir.is_dir():
+                continue
+            if str(run_dir) in claimed:
+                kept += 1
+                continue
+            try:
+                if run_dir.stat().st_mtime > cutoff:
+                    kept += 1
+                    continue
+                freed += sum(f.stat().st_size for f in run_dir.rglob("*") if f.is_file())
+            except OSError:
+                kept += 1
+                continue
+            _discard_staging(run_dir)
+            removed += 1
+    if removed:
+        log.info("jobs: pruned %d abandoned staging dir(s), %.1f MB", removed, freed / 1e6)
+    return {"removed": removed, "kept": kept, "bytes": freed}
 
 
 def _project_of(rel: str) -> str:
