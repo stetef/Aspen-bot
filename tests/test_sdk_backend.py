@@ -231,10 +231,14 @@ def test_can_use_tool_allows_only_aspen_tools(sut):
     assert "rm -rf /" in deny_bash.message
 
 
-def test_build_options_locks_down_tools(sut):
+def test_build_options_locks_down_tools(sut, monkeypatch):
     from aspen.agent import SdkSession
     from aspen import config, prompts
 
+    # Pin the job-tool flag rather than inheriting the deployment's .env: this test
+    # is about the base surface, and it must not start failing the day an operator
+    # turns submission on. The job tools have their own test below.
+    monkeypatch.setattr(config, "JOBS_SUBMIT_ENABLED", False)
     s = SdkSession("C:1")
     opts = s._build_options(sdk)
 
@@ -364,6 +368,49 @@ def test_bash_allowlist_override_flows_into_allowed_tools(sut, monkeypatch):
         "Bash(squeue:*)",
         "Bash(sacct:*)",
     ]
+
+
+def test_job_tools_are_withheld_unless_submission_is_enabled(sut, monkeypatch):
+    """The job tools are advertised only where they are usable.
+
+    Withholding by omission is the control (as for the demo's Bash): a tool that
+    never enters ``allowed_tools`` is never pre-approved, so it cannot reach the
+    model. A prompt-level "don't submit jobs" would be advice.
+    """
+    from aspen.agent import SdkSession
+    from aspen import config
+
+    monkeypatch.setattr(config, "BASH_ALLOWLIST", [])
+    monkeypatch.setattr(config, "JOBS_SUBMIT_ENABLED", False)
+    off = SdkSession("C:1")._build_options(sdk).allowed_tools
+    for name in ("submit_orca_batch", "cancel_orca_batch", "list_my_jobs"):
+        assert f"mcp__aspen__{name}" not in off
+
+    monkeypatch.setattr(config, "JOBS_SUBMIT_ENABLED", True)
+    on = SdkSession("C:1")._build_options(sdk).allowed_tools
+    for name in ("submit_orca_batch", "cancel_orca_batch", "list_my_jobs"):
+        assert f"mcp__aspen__{name}" in on
+
+    # ...and a demo session never gets them, even with submission enabled: a
+    # visitor is not in the registry and must not spend the group's compute.
+    demo_tools = SdkSession("C:1", allow_bash=False, allow_jobs=False)._build_options(sdk).allowed_tools
+    for name in ("submit_orca_batch", "cancel_orca_batch", "list_my_jobs"):
+        assert f"mcp__aspen__{name}" not in demo_tools
+
+
+def test_sbatch_and_scancel_never_enter_the_bash_allowlist(sut):
+    """Job control must stay a structured tool, not a Bash prefix rule.
+
+    ``Bash(sbatch:*)`` would grant ``--wrap`` — arbitrary code execution as the
+    bot's Unix user on a compute node, outside every jail — and ``Bash(scancel:*)``
+    would grant ``-u``, i.e. the whole queue. A prefix rule cannot express "only
+    this user's own jobs"; ``jobs.resolve_cancellable`` can.
+    """
+    from aspen import config
+
+    cmds = " ".join(config.BASH_ALLOWLIST)
+    for forbidden in ("sbatch", "scancel", "srun", "salloc", "scontrol update", "qsub", "qdel"):
+        assert forbidden not in cmds, f"{forbidden!r} must never be Bash-allowlisted"
 
 
 def test_bash_deny_message_lists_the_allowlist(sut, monkeypatch):

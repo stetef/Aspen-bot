@@ -294,6 +294,30 @@ def user_staging_root(slack_user_id: str) -> Path:
     return config.JOBS_STAGING_ROOT / f"{alias}__{slack_user_id}"
 
 
+def require_registered(slack_user_id: str) -> dict:
+    """The requester must be an active registry user. Returns their record.
+
+    The tool surface already withholds the job tools from a demo session
+    (``tools.active_specs``), and admission already gates every turn — so this is
+    the third check on the same thing, which is deliberate. Withholding is session
+    state, admission is per-turn, and this is per-action; the demo escapes recorded
+    in THREAT_MODEL §3 were both a path that skipped the fence its neighbours went
+    through. Compute is the one asset a mistake here spends irrecoverably, so it
+    verifies rather than assuming an earlier gate held.
+    """
+    if not _SLACK_ID_RE.match(slack_user_id or ""):
+        raise JobsError("Internal error: no Slack user ID on this request.")
+    user = registry.by_id(slack_user_id, include_removed=False)
+    if not user or user.get("status") != "active":
+        raise JobsError(
+            "Job submission is only available to registered Aspen users. "
+            "Ask an admin to add you with `aspen-users add`."
+        )
+    if not user.get("alias"):
+        raise JobsError("Internal error: your registry entry has no alias.")
+    return user
+
+
 def _within(path: Path, parent: Path) -> bool:
     """True if ``path`` is inside ``parent``, symlinks resolved.
 
@@ -479,8 +503,7 @@ def resolve_cancellable(requester_uid: str, selector: str = "") -> tuple[list, l
        closes the recycled-ID window — a stale row pointing at a live unrelated
        job fails here even though gate 1 passed.
     """
-    if not _SLACK_ID_RE.match(requester_uid or ""):
-        raise JobsError("Internal error: cancellation requires a Slack user ID.")
+    require_registered(requester_uid)
 
     rows = active_rows(requester_uid)
     if selector:
@@ -667,3 +690,190 @@ def _expire_tokens() -> None:
     cutoff = time.monotonic() - config.JOBS_CONFIRM_TTL
     for token in [t for t, e in _PENDING.items() if e["at"] < cutoff]:
         _PENDING.pop(token, None)
+
+
+# --------------------------------------------------------------------------- #
+# Submission
+# --------------------------------------------------------------------------- #
+def _run_pipeline(argv: list, cwd: Path) -> subprocess.CompletedProcess:
+    """Run the pipeline entry point with a scrubbed environment.
+
+    ``check=False``: a non-zero exit is a normal outcome to report back (bad
+    inputs, a missing template), not an exception. The timeout matters because the
+    orchestrator only *submits* — it does not wait for jobs — so a hang means
+    something is wrong rather than something is slow.
+    """
+    return subprocess.run(
+        argv, capture_output=True, text=True, check=False,
+        cwd=str(cwd), timeout=config.JOBS_SUBMIT_TIMEOUT, env=submit_env(),
+    )
+
+
+def dry_run(*, requester_uid: str, thread_ts: str, rel: str, owner: str,
+            template_mode: str) -> dict:
+    """Stage, validate, and run the pipeline with ``--no-submit``.
+
+    Nothing is submitted. Returns a payload describing what *would* be, plus a
+    single-use token the caller must redeem to commit — spec §19.7's dry-run-first
+    requirement, with the confirmation enforced in Python rather than asked for in
+    the prompt.
+    """
+    from . import staging
+
+    if not config.JOBS_SUBMIT_ENABLED:
+        raise JobsError(
+            "Job submission is switched off on this deployment "
+            "(ASPEN_JOBS_SUBMIT_ENABLED=false)."
+        )
+    require_registered(requester_uid)
+    mode = (template_mode or "ca-fixed").strip().lower()
+    staging.mode_flag(mode)                       # validate before doing any work
+
+    structures, scope = staging.collect_structures(rel, owner, requester_uid)
+    check_caps(requester_uid, len(structures))
+
+    staging_dir = staging.stage(
+        requester_uid=requester_uid, thread_ts=thread_ts, structures=structures,
+        scope=scope, template_mode=mode, source_rel=rel,
+    )
+    argv = build_submit_argv(staging_dir=staging_dir, out_dir=staging_dir,
+                             template_mode=mode, dry_run=True)
+    try:
+        proc = _run_pipeline(argv, staging_dir)
+    except subprocess.TimeoutExpired:
+        raise JobsError("The pipeline dry run timed out.") from None
+    except OSError as exc:
+        raise JobsError(
+            f"Could not run {config.JOBS_PIPELINE_BIN!r}: {exc}. Is the pipeline "
+            "installed and on PATH?"
+        ) from exc
+
+    if proc.returncode != 0:
+        raise JobsError(
+            "The pipeline rejected these inputs during the dry run:\n"
+            + (proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}")
+        )
+
+    payload = {
+        "rel": rel, "owner": owner, "template_mode": mode,
+        "staging_dir": str(staging_dir),
+        "structures": [s.name for s in structures],
+        "scope": scope.get("name", ""),
+        "project": _project_of(rel),
+    }
+    token = issue_token("submit", requester_uid, thread_ts, payload)
+    return {**payload, "token": token, "stdout": proc.stdout[-4000:]}
+
+
+def commit(*, requester_uid: str, thread_ts: str, token: str) -> dict:
+    """Redeem a dry-run token and submit for real.
+
+    The ledger row is written **before** the pipeline runs and a failure to write
+    aborts: a job with no ledger row is one nobody can cancel through Aspen and
+    nobody can attribute, which is strictly worse than not submitting.
+    """
+    from . import staging
+
+    if not config.JOBS_SUBMIT_ENABLED:
+        raise JobsError("Job submission is switched off on this deployment.")
+
+    require_registered(requester_uid)
+    payload = redeem_token(token, "submit", requester_uid, thread_ts)
+    staging_dir = Path(payload["staging_dir"])
+    if not _within(staging_dir, user_staging_root(requester_uid)):
+        # Cannot happen via dry_run, which derives the path; this catches a future
+        # caller that starts trusting a client-supplied payload.
+        raise JobsError("Internal error: that staging directory is not yours.")
+    if not staging_dir.is_dir():
+        raise JobsError("The staged inputs have gone — run the dry run again.")
+
+    structures = payload["structures"]
+    check_caps(requester_uid, len(structures))     # re-check: time passed
+
+    user = registry.by_id(requester_uid) or {}
+    argv = build_submit_argv(staging_dir=staging_dir, out_dir=staging_dir,
+                             template_mode=payload["template_mode"], dry_run=False)
+
+    batch_id = record_batch(
+        slack_user_id=requester_uid, alias=user.get("alias", "unknown"),
+        thread_ts=thread_ts, project=payload.get("project", ""),
+        owner_scope=payload.get("scope", ""), template_mode=payload["template_mode"],
+        staging_dir=staging_dir, structures=len(structures), argv=argv,
+    )
+
+    try:
+        proc = _run_pipeline(argv, staging_dir)
+    except subprocess.TimeoutExpired:
+        raise JobsError(
+            f"Submission timed out. Batch {batch_id} may have submitted some jobs — "
+            "check with 'what are my jobs'."
+        ) from None
+    except OSError as exc:
+        raise JobsError(f"Could not run the pipeline: {exc}") from exc
+
+    entries = staging.parse_submitted_jobs(proc.stdout, staging_dir)
+    recorded = record_jobs(batch_id, entries)
+
+    if proc.returncode != 0:
+        # Partial submission is possible: the pipeline submits per structure, so
+        # some jobs may exist. Whatever was parsed is already in the ledger, which
+        # is what makes them cancellable.
+        raise JobsError(
+            f"The pipeline reported an error (batch {batch_id}, {recorded} job(s) "
+            "recorded so far):\n"
+            + (proc.stderr.strip() or f"exit {proc.returncode}")
+        )
+
+    log.info("jobs: batch %s submitted %d job(s) for %s", batch_id, recorded, requester_uid)
+    return {
+        "batch_id": batch_id, "jobs": entries, "recorded": recorded,
+        "structures": structures, "staging_dir": str(staging_dir),
+        "stdout": proc.stdout[-4000:],
+    }
+
+
+def _project_of(rel: str) -> str:
+    """The project name a relative path sits under — its first component."""
+    parts = [p for p in str(rel).replace("\\", "/").split("/") if p and p not in (".", "..")]
+    if parts and parts[0].startswith("@"):
+        parts = parts[1:]
+    return parts[0] if parts else ""
+
+
+# --------------------------------------------------------------------------- #
+# Reconciliation
+# --------------------------------------------------------------------------- #
+def reconcile(days: int = 30) -> dict:
+    """Join the ledger against Slurm's own accounting.
+
+    Attribution is two-phase and this is the phase that answers "who used the
+    compute": at submit time you know who and what, but elapsed time, CPU-hours and
+    exit state exist only after a job ends. The two copies also fail differently —
+    the ledger can be deleted and Slurm's copy survives; slurmdbd purges on a
+    site schedule and the ledger survives that.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    argv = build_sacct_argv(user=whoami(), since=since)
+    try:
+        proc = _run_slurm(argv)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise JobsError(f"Could not run sacct: {exc}") from exc
+    if proc.returncode != 0:
+        raise JobsError("sacct failed: " + (proc.stderr.strip() or f"exit {proc.returncode}"))
+
+    known = {str(r["job_id"]) for r in _all_job_ids()}
+    rows = []
+    for line in proc.stdout.splitlines():
+        f = line.split("|")
+        if len(f) < 11 or f[0] not in known:
+            continue
+        rows.append({
+            "job_id": f[0], "state": f[3], "elapsed": f[7],
+            "total_cpu": f[8], "alloc_tres": f[9], "exit_code": f[10],
+        })
+    return {"updated": apply_reconciliation(rows), "scanned": len(rows), "since": since}
+
+
+def _all_job_ids() -> list:
+    with connect() as conn:
+        return [dict(r) for r in conn.execute("SELECT job_id FROM jobs")]

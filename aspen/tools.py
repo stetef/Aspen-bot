@@ -21,7 +21,7 @@ from typing import Optional
 
 import httpx
 
-from . import config, demo, metadata, roots, setup, workflows
+from . import config, demo, jobs, metadata, roots, setup, staging, workflows
 
 log = logging.getLogger("aspen")
 
@@ -394,6 +394,167 @@ def _demo_approve(inp: dict, context: dict) -> tuple[str, list[str]]:
     if session is None:
         return "Error: that's only available inside a demo.", []
     return demo.approve(session), []
+
+
+# --------------------------------------------------------------------------- #
+# Slurm jobs (spec §19)
+#
+# Note what none of these three take: an `owner`. The requester is always
+# ``context["user_id"]`` — the ID Slack itself attached to the event — exactly as
+# with `write_workflow` (C9). A model can be argued into passing any argument it is
+# handed; it cannot pass a value it never receives. There is deliberately no way to
+# submit or cancel on someone else's behalf through the agent, not even for the
+# admin: that path is the CLI, outside the model's reach, like every other
+# administrative action.
+# --------------------------------------------------------------------------- #
+def _submit_orca_batch(inp: dict, context: dict) -> tuple[str, list[str]]:
+    """Dry run, or commit a dry run. Two calls by construction, never one.
+
+    The confirmation is a token this function issues and later requires — not an
+    instruction in the system prompt. A model can be talked out of asking a
+    question; it cannot mint a token it was never given.
+    """
+    uid = context.get("user_id", "")
+    thread = context.get("thread_ts", "")
+    token = (inp.get("confirm_token") or "").strip()
+
+    try:
+        if token:
+            result = jobs.commit(requester_uid=uid, thread_ts=thread, token=token)
+            lines = [
+                f"Submitted batch `{result['batch_id']}` — "
+                f"{len(result['structures'])} structure(s), "
+                f"{result['recorded']} scheduler job(s) recorded.",
+            ]
+            for job in result["jobs"][:12]:
+                kind = job.get("kind") or "job"
+                lines.append(f"  {job['job_id']}  {kind}  {job.get('job_name', '')}".rstrip())
+            if len(result["jobs"]) > 12:
+                lines.append(f"  … and {len(result['jobs']) - 12} more")
+            lines.append(
+                "Tell the user these are queued, that you can check them with "
+                "squeue/sacct, and that they can ask you to cancel them."
+            )
+            return "\n".join(lines), []
+
+        preview = jobs.dry_run(
+            requester_uid=uid, thread_ts=thread, rel=inp.get("path", ""),
+            owner=inp.get("owner", ""), template_mode=inp.get("template_mode", "ca-fixed"),
+        )
+        names = preview["structures"]
+        shown = ", ".join(names[:10]) + (f" … (+{len(names) - 10})" if len(names) > 10 else "")
+        return (
+            "DRY RUN ONLY — nothing has been submitted yet.\n"
+            f"Would run the {preview['template_mode']} pipeline on "
+            f"{len(names)} structure(s): {shown}\n"
+            f"Staged at: {preview['staging_dir']}\n\n"
+            "Show the user this summary and ask them to confirm. If they agree, call "
+            "submit_orca_batch again with confirm_token="
+            f"{preview['token']} and no other changes. The token is single-use and "
+            f"expires in {config.JOBS_CONFIRM_TTL // 60} minutes.",
+            [],
+        )
+    except jobs.JobsError as exc:
+        return f"Error: {exc}", []
+
+
+def _cancel_orca_batch(inp: dict, context: dict) -> tuple[str, list[str]]:
+    """Preview, then cancel — the speaker's own jobs only.
+
+    Every ID is verified against live Slurm before anything is cancelled, and the
+    refusals are reported rather than quietly dropped, so a partial result never
+    reads as a complete one.
+    """
+    uid = context.get("user_id", "")
+    thread = context.get("thread_ts", "")
+    selector = (inp.get("selector") or "all").strip()
+    token = (inp.get("confirm_token") or "").strip()
+
+    try:
+        if token:
+            payload = jobs.redeem_token(token, "cancel", uid, thread)
+            result = jobs.cancel(uid, payload.get("selector", "all"))
+            if not result["ok"]:
+                return _no_cancellables(result["refused"]), []
+            ids = ", ".join(str(r["job_id"]) for r in result["cancelled"])
+            out = [f"Cancelled {len(result['cancelled'])} job(s): {ids}."]
+            if result["refused"]:
+                out.append(_refusal_lines(result["refused"]))
+            return "\n".join(out), []
+
+        approved, refused = jobs.resolve_cancellable(uid, selector)
+        if not approved:
+            return _no_cancellables(refused), []
+        lines = [f"About to cancel {len(approved)} job(s) — NOT cancelled yet:"]
+        for row in approved[:15]:
+            lines.append(
+                f"  {row['job_id']}  {row.get('kind') or 'job'}  "
+                f"{row.get('project') or ''}  [{row.get('live_state') or '?'}]".rstrip()
+            )
+        if len(approved) > 15:
+            lines.append(f"  … and {len(approved) - 15} more")
+        if refused:
+            lines.append(_refusal_lines(refused))
+        tok = jobs.issue_token("cancel", uid, thread, {"selector": selector})
+        lines.append(
+            "\nShow this list to the user and ask them to confirm. If they agree, call "
+            f"cancel_orca_batch again with confirm_token={tok}."
+        )
+        return "\n".join(lines), []
+    except jobs.JobsError as exc:
+        return f"Error: {exc}", []
+
+
+def _no_cancellables(refused: list) -> str:
+    """The refusal path. Says *why*, because 'nothing to cancel' invites a retry."""
+    if not refused:
+        return (
+            "You have no active Aspen-submitted jobs to cancel. Note that Aspen can "
+            "only cancel jobs it submitted for you — not jobs you submitted yourself, "
+            "and not anyone else's."
+        )
+    return "Nothing was cancelled.\n" + _refusal_lines(refused)
+
+
+def _refusal_lines(refused: list) -> str:
+    head = f"Skipped {len(refused)} job(s):"
+    body = [f"  {jid}: {reason}" for jid, reason in refused[:10]]
+    if len(refused) > 10:
+        body.append(f"  … and {len(refused) - 10} more")
+    return "\n".join([head, *body])
+
+
+def _list_my_jobs(inp: dict, context: dict) -> tuple[str, list[str]]:
+    uid = context.get("user_id", "")
+    try:
+        rows = jobs.active_rows(uid)
+    except jobs.JobsError as exc:
+        return f"Error: {exc}", []
+    if not rows:
+        recent = jobs.batches_for(uid, limit=3)
+        if not recent:
+            return "You have no Aspen-submitted jobs on record.", []
+        lines = ["No active jobs. Recent batches:"]
+        for b in recent:
+            lines.append(
+                f"  {b['batch_id']}  {b['project'] or '?'}  {b['template_mode']}  "
+                f"{b['structures']} structure(s)  {b['submitted_at']}"
+            )
+        return "\n".join(lines), []
+    lines = [f"{len(rows)} active Aspen job(s):"]
+    for row in rows[:25]:
+        lines.append(
+            f"  {row['job_id']}  {row.get('kind') or 'job'}  "
+            f"{row.get('project') or ''}  batch {row['batch_id']}  "
+            f"{row.get('state') or 'state unknown (not reconciled)'}".rstrip()
+        )
+    if len(rows) > 25:
+        lines.append(f"  … and {len(rows) - 25} more")
+    lines.append(
+        "These are only the jobs Aspen submitted for this user. Use squeue/sacct to "
+        "see the wider queue, including their own hand-submitted jobs."
+    )
+    return "\n".join(lines), []
 
 
 def _tool_server_post(path: str, payload: dict, timeout: int) -> httpx.Response:
@@ -884,10 +1045,118 @@ TOOL_SPECS = [
         },
         "impl": _call_tool_server,
     },
+    {
+        "name": "submit_orca_batch",
+        "description": (
+            "Submit an ORCA -> CORVUS pipeline batch for the person you are talking "
+            "to. ALWAYS two calls: call it once WITHOUT confirm_token to get a dry "
+            "run, show that summary to the user and ask them to confirm, then call it "
+            "again WITH the confirm_token you were given. The first call submits "
+            "nothing. You cannot submit for anyone but the person speaking."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Path to an .xyz file, or a directory of .xyz files, in the "
+                        "speaker's calculations (e.g. 'thermolysin/structures'). "
+                        "Ignored when confirm_token is given."
+                    ),
+                },
+                "owner": _OWNER_PROPERTY,
+                "template_mode": {
+                    "type": "string",
+                    "enum": sorted(staging.TEMPLATE_MODES),
+                    "description": (
+                        "Which ORCA template to use. 'ca-fixed' is the default. Ask the "
+                        "user if it matters and you are unsure -- this changes what is "
+                        "calculated. Ignored when confirm_token is given."
+                    ),
+                },
+                "confirm_token": {
+                    "type": "string",
+                    "description": (
+                        "The single-use token from your dry-run call. Supply it ONLY "
+                        "after the user has explicitly agreed to the dry-run summary. "
+                        "Never invent one."
+                    ),
+                },
+            },
+            "required": [],
+        },
+        "impl": _submit_orca_batch,
+    },
+    {
+        "name": "cancel_orca_batch",
+        "description": (
+            "Cancel Slurm jobs Aspen submitted FOR THE PERSON SPEAKING. Two calls, "
+            "like submit: once without confirm_token to see exactly what would be "
+            "cancelled, then again with the token once the user agrees. It can never "
+            "cancel a job Aspen did not submit, a job belonging to another user, or "
+            "the user's own hand-submitted jobs -- every ID is verified against Slurm "
+            "first. If they want those cancelled, they run scancel themselves."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": (
+                        "What to cancel: 'all' (default), a single job ID, a batch ID, "
+                        "or a project name. Only ever narrows the speaker's own jobs."
+                    ),
+                },
+                "confirm_token": {
+                    "type": "string",
+                    "description": (
+                        "The single-use token from your preview call. Supply it ONLY "
+                        "after the user has explicitly confirmed. Never invent one."
+                    ),
+                },
+            },
+            "required": [],
+        },
+        "impl": _cancel_orca_batch,
+    },
+    {
+        "name": "list_my_jobs",
+        "description": (
+            "List the Slurm jobs Aspen submitted for the person speaking, with their "
+            "last known state. This is Aspen's own record, not the whole queue -- use "
+            "squeue/sacct via Bash for that."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "impl": _list_my_jobs,
+    },
 ]
 
 # name → impl(input, context) -> (text, attachments)
 TOOL_FNS = {s["name"]: s["impl"] for s in TOOL_SPECS}
+
+# Tools that spend shared compute. Advertised only where they are usable.
+JOB_TOOLS = frozenset({"submit_orca_batch", "cancel_orca_batch", "list_my_jobs"})
+
+
+def active_specs(allow_jobs: bool = True) -> list[dict]:
+    """The specs to advertise to the model for this session.
+
+    Filtered at *call* time rather than at import, so ``config`` stays
+    monkeypatchable and an operator toggling submission does not need the tool
+    table rebuilt by hand.
+
+    Withheld by **omission**, which is the same reasoning the demo uses for Bash:
+    a tool that is never advertised is never pre-approved, so it cannot reach the
+    model at all. Asking the model in the prompt not to submit jobs would be
+    advice. The impls refuse independently as well (``jobs.dry_run`` checks the
+    flag, and the registry check refuses a non-user), because two of these three
+    withholding conditions are session state and one is config — belt and braces
+    is cheap here and the failure would be expensive.
+    """
+    if allow_jobs and config.JOBS_SUBMIT_ENABLED:
+        return list(TOOL_SPECS)
+    return [s for s in TOOL_SPECS if s["name"] not in JOB_TOOLS]
 
 
 def dispatch(name: str, tool_input: dict, context: dict) -> str:

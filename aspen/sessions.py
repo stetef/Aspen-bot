@@ -97,7 +97,9 @@ class SessionManager:
 
         A demo thread never adopts a spare: spares are built with the ordinary
         options, and a demo session must be created without the Bash allowlist so
-        the Slurm clients cannot reach the real cluster. Costs that one turn the
+        the Slurm clients cannot reach the real cluster — nor with the job tools,
+        which would let a visitor who is not even in the registry spend the
+        group's compute. Costs that one turn the
         warm-start saving, which is the right trade for a control that actually
         holds. The demo session exists before the turn runs (the Slack front-end
         starts it ahead of the allowlist gate), so the key alone is enough to
@@ -106,8 +108,8 @@ class SessionManager:
         from . import demo
         from .agent import SdkSession
         if demo.get(key) is not None:
-            log.debug("Demo thread %s — fresh session with Bash disabled", key)
-            return SdkSession(key, allow_bash=False)
+            log.debug("Demo thread %s — fresh session, no Bash and no job tools", key)
+            return SdkSession(key, allow_bash=False, allow_jobs=False)
         if self._spares:
             session = self._spares.pop()
             session.key = key              # spares are keyless until adopted

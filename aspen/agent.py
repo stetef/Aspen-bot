@@ -49,7 +49,7 @@ _TOOL_PREFIX = f"mcp__{_SERVER}__"
 class SdkSession:
     """Warm, parked Claude Agent SDK conversation session."""
 
-    def __init__(self, key: str, allow_bash: bool = True):
+    def __init__(self, key: str, allow_bash: bool = True, allow_jobs: bool = True):
         self.key = key
         # Demo sessions get no Bash at all (see sessions._claim_session). The
         # Slurm clients read the REAL cluster — job names carry project names and
@@ -59,6 +59,12 @@ class SdkSession:
         # command never reaches ``_can_use_tool``, so a prompt-level rule here
         # would be advice, not a control.
         self._allow_bash = allow_bash
+        # Job submission is withheld from a demo for a stronger version of the same
+        # reason: a visitor is not in the registry, has no calculations of their
+        # own, and must never be able to spend the group's compute. Also withheld
+        # deployment-wide when ASPEN_JOBS_SUBMIT_ENABLED is false, so a deployment
+        # that has not thought about compute budgets does not advertise the tools.
+        self._allow_jobs = allow_jobs
         self._client = None
         self._current: dict | None = None   # current turn's context (attachment sink)
 
@@ -70,7 +76,7 @@ class SdkSession:
 
     def _make_tools(self, sdk):
         built = []
-        for spec in tools.TOOL_SPECS:
+        for spec in tools.active_specs(self._allow_jobs):
             @sdk.tool(spec["name"], spec["description"], spec["input_schema"])
             async def _handler(args, _name=spec["name"]):
                 return await self._tool_handler(_name, args)
@@ -148,7 +154,8 @@ class SdkSession:
         # (e.g. "Bash(squeue:*)"). Anything else falls through to the can_use_tool
         # backstop, which denies it.
         bash_patterns = list(config.BASH_ALLOWLIST) if self._allow_bash else []
-        allowed = [f"{_TOOL_PREFIX}{s['name']}" for s in tools.TOOL_SPECS] + bash_patterns
+        allowed = [f"{_TOOL_PREFIX}{s['name']}"
+                   for s in tools.active_specs(self._allow_jobs)] + bash_patterns
         opts = dict(
             system_prompt=prompts.SYSTEM_PROMPT,   # plain string -> replaces (no preset)
             model=config.MODEL,
