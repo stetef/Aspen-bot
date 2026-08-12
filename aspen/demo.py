@@ -341,7 +341,9 @@ _GUIDANCE = {
         "with search_files and say which one."
     ),
     "analyze": (
-        "The payoff: plot something. Use run_python_analysis on fe-porphyrin-scan "
+        "The payoff: plot something, for real — the sandbox can reach the demo "
+        "project and will upload the figure into this thread. Use "
+        "run_python_analysis on fe-porphyrin-scan "
         "to pull FINAL SINGLE POINT ENERGY out of each */*-orca.log, parse the "
         "Fe-O distance from the directory name, and plot energy against distance. "
         "Say where the minimum is. Then offer to record what you found with "

@@ -426,6 +426,11 @@ def _call_tool_server(inp: dict, context: dict) -> tuple[str, list[str]]:
         # A NAME, not a path — the tool server does its own registry lookup, so
         # nothing here can point the sandbox at an arbitrary directory.
         "owner":     inp.get("owner", ""),
+        # From the CONTEXT, never from ``inp``: the model must not be able to
+        # claim (or disclaim) demo mode. Without this the tool server, which is a
+        # separate process with no idea demo sessions exist, would resolve a
+        # visitor to the real PROJECTS_ROOT and run their code against real data.
+        "demo":      bool(context.get("demo")),
     }
     timeout = int(os.getenv("EXECUTION_TIMEOUT_SECONDS", "120")) + 10
     try:

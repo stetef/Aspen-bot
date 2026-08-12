@@ -71,6 +71,20 @@ def _shared_roots() -> dict:
 
 SHARED_CALC_ROOTS     = _shared_roots()
 
+# DEMO mode (see aspen/demo.py). A demo visitor is not in the registry, so
+# without this they would resolve to PROJECTS_ROOT — the real tree — and naming a
+# project that exists there would mount real research data into the jail. The
+# in-process read tools are fenced by aspen/roots.py, but this process is
+# separate and knows nothing about demo sessions, so the bot has to say so and
+# this has to honor it. Demo analysis is confined to the demo tree and nothing
+# else.
+DEMO_ROOT             = Path(os.getenv(
+    "ASPEN_DEMO_ROOT", str(Path(__file__).resolve().parent / "examples" / "demo-calculations")
+)).resolve()
+# The demo tree carries no metadata.md, and requiring one would make the payoff
+# beat 422 instead of plotting. This is the advisory list for demo runs only.
+DEMO_LIBRARIES        = ["numpy", "pandas", "matplotlib", "scipy"]
+
 MAX_STDOUT_CHARS      = int(os.getenv("MAX_STDOUT_CHARS", "10000"))
 MAX_STDERR_CHARS      = int(os.getenv("MAX_STDERR_CHARS", "2000"))
 MAX_FIGURE_BYTES      = int(os.getenv("MAX_FIGURE_BYTES", str(5 * 1024 * 1024)))
@@ -253,7 +267,7 @@ def _users() -> list:
     return _registry_users(stamp)
 
 
-def resolve_scope(user_id: str, owner: str = "") -> tuple[Path, str]:
+def resolve_scope(user_id: str, owner: str = "", demo: bool = False) -> tuple[Path, str]:
     """(root, scope-directory-name) for a request, resolved from the registry.
 
     ``owner`` is a *name* (alias / Slack ID / shared root), never a path — the
@@ -261,6 +275,11 @@ def resolve_scope(user_id: str, owner: str = "") -> tuple[Path, str]:
     owner falls back to the caller's own root, and a caller we don't know falls
     back to PROJECTS_ROOT, which is exactly the single-root behavior.
     """
+    # A demo session is confined to the demo tree, whatever it names. The flag
+    # comes from the bot's own session state, never from the model.
+    if demo:
+        return DEMO_ROOT, ""
+
     token = (owner or "").strip().lstrip("@").lower()
     if token and token in SHARED_CALC_ROOTS:
         return SHARED_CALC_ROOTS[token], f"_shared__{token}"
@@ -376,12 +395,16 @@ def _sidecar_metadata(scope_dir: str, project_name: str) -> Optional[Path]:
     return candidate if candidate.is_file() else None
 
 
-def load_metadata(project_path: Path, scope_dir: str = "") -> dict:
+def load_metadata(project_path: Path, scope_dir: str = "", demo: bool = False) -> dict:
     """
     Load project metadata. Prefers Aspen's sidecar, then in-tree metadata.md
     (natural-language markdown), then metadata.toml / metadata.yaml. Raises
     HTTPException(422) if none found.
     """
+    if demo:
+        return {"name": project_path.name, "allowed_libraries": list(DEMO_LIBRARIES),
+                "description": "Synthetic demo project."}
+
     sidecar = _sidecar_metadata(scope_dir, project_path.name)
     if sidecar is not None:
         return _parse_markdown_metadata(sidecar.read_text(), project_path.name)
@@ -792,6 +815,9 @@ class AnalysisRequest(BaseModel):
     # path. resolve_scope turns it into a directory; an unknown name simply falls
     # back to the caller's own root.
     owner: str = ""
+    # Set by the BOT from its own session state (never by the model, and never
+    # from a tool argument): confine this run to the demo tree.
+    demo: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -814,11 +840,11 @@ def run_python_analysis(
         log.exception("Figure archive cleanup failed (non-fatal)")
 
     # Whose calculations — resolved HERE from the registry, never taken as a path.
-    root, scope_dir = resolve_scope(req.user_id, req.owner)
+    root, scope_dir = resolve_scope(req.user_id, req.owner, req.demo)
     project_path = _safe_project_path(project_name, root)
 
     # Load and validate metadata (Aspen's sidecar first, then in-tree legacy)
-    metadata = load_metadata(project_path, scope_dir)
+    metadata = load_metadata(project_path, scope_dir, req.demo)
     allowed_libs = _validate_metadata(metadata)
 
     # Validate inputs

@@ -330,6 +330,64 @@ def test_the_demo_tools_do_nothing_outside_a_demo(sut, visitor):
 
 
 # --------------------------------------------------------------------------- #
+# The analysis bridge
+# --------------------------------------------------------------------------- #
+def test_the_demo_flag_reaches_the_tool_server(sut, session, monkeypatch):
+    """The bot must tell the tool server, because that process cannot know.
+
+    It is a separate process with no view of demo sessions, so without this a
+    visitor resolves to the real PROJECTS_ROOT there — fenced everywhere else,
+    wide open on the one path that runs code.
+    """
+    seen = {}
+
+    class FakeResp:
+        status_code, is_success = 200, True
+
+        def json(self):
+            return {"status": "success", "duration_seconds": 0.1, "stdout": "", "figures": []}
+
+    monkeypatch.setattr(sut, "_tool_server_post",
+                        lambda path, payload, timeout: seen.update(payload) or FakeResp())
+    monkeypatch.setattr(sut, "AGENT_INTERNAL_SECRET", "s")
+    sut.dispatch("run_python_analysis",
+                 {"project_name": "fe-porphyrin-scan", "code": "print(1)",
+                  "dataset": ["d1.95"], "question": "q"}, _ctx(session))
+    assert seen["demo"] is True
+
+
+def test_the_model_cannot_claim_or_disclaim_demo_mode(sut, session, monkeypatch):
+    """It comes from the session, not from the tool arguments."""
+    seen = {}
+
+    class FakeResp:
+        status_code, is_success = 200, True
+
+        def json(self):
+            return {"status": "success", "duration_seconds": 0.1, "stdout": "", "figures": []}
+
+    monkeypatch.setattr(sut, "_tool_server_post",
+                        lambda path, payload, timeout: seen.update(payload) or FakeResp())
+    monkeypatch.setattr(sut, "AGENT_INTERNAL_SECRET", "s")
+    # A model trying to switch it off mid-demo...
+    sut.dispatch("run_python_analysis",
+                 {"project_name": "fe-porphyrin-scan", "code": "print(1)",
+                  "dataset": ["d1.95"], "question": "q", "demo": False}, _ctx(session))
+    assert seen["demo"] is True
+    # ...and a real user's turn is never marked as one.
+    sut.dispatch("run_python_analysis",
+                 {"project_name": "thermolysin", "code": "print(1)",
+                  "dataset": ["r"], "question": "q", "demo": True},
+                 {"user_id": "U0SAM", "attachments": []})
+    assert seen["demo"] is False
+
+
+def test_the_analysis_schema_has_no_demo_field(sut):
+    spec = next(s for s in sut.TOOL_SPECS if s["name"] == "run_python_analysis")
+    assert "demo" not in spec["input_schema"]["properties"]
+
+
+# --------------------------------------------------------------------------- #
 # The walkthrough over realistic output
 # --------------------------------------------------------------------------- #
 def test_the_scan_reads_like_orca_output(sut, session):

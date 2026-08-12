@@ -123,6 +123,76 @@ def test_the_registry_is_re_read_when_it_changes(ts, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# DEMO confinement
+#
+# The read tools are fenced in aspen/roots.py, but this is a SEPARATE process
+# that knows nothing about demo sessions. Without the flag a visitor -- who is
+# not in the registry -- resolved to PROJECTS_ROOT, so naming a project that
+# happens to exist in the real tree would have mounted real research data into
+# the jail and run generated code against it. Found by a live demo failing to
+# plot; the only reason it read as "can't plot" is that the demo project name
+# doesn't exist in the real tree.
+# --------------------------------------------------------------------------- #
+def test_a_demo_run_is_confined_to_the_demo_tree(ts, tmp_path, monkeypatch):
+    mod, roots = ts
+    demo_root = tmp_path / "demo-calcs"
+    (demo_root / "fe-porphyrin-scan").mkdir(parents=True)
+    monkeypatch.setattr(mod, "DEMO_ROOT", demo_root.resolve())
+
+    root, scope = mod.resolve_scope("U0STRANGER", demo=True)
+    assert root == demo_root.resolve()
+    assert scope == ""                       # no sidecar for a demo
+
+
+def test_a_demo_run_cannot_reach_a_real_project(ts, tmp_path, monkeypatch):
+    """The bug, pinned: 'thermolysin' exists in the real tree and must not resolve."""
+    mod, roots = ts
+    demo_root = tmp_path / "demo-calcs"
+    demo_root.mkdir()
+    monkeypatch.setattr(mod, "DEMO_ROOT", demo_root.resolve())
+
+    root, _ = mod.resolve_scope("U0STRANGER", demo=True)
+    with pytest.raises(Exception):           # HTTPException(400)
+        mod._safe_project_path("thermolysin", root)
+
+
+def test_a_demo_run_ignores_any_owner_it_is_given(ts, tmp_path, monkeypatch):
+    """Naming a colleague must not widen a demo, however it is spelled."""
+    mod, roots = ts
+    demo_root = tmp_path / "demo-calcs"
+    demo_root.mkdir()
+    monkeypatch.setattr(mod, "DEMO_ROOT", demo_root.resolve())
+    for owner in ("arun", "U01ARUN", "smb", "@arun", str(roots["arun"])):
+        root, _ = mod.resolve_scope("U0STRANGER", owner, demo=True)
+        assert root == demo_root.resolve(), owner
+
+
+def test_a_normal_run_is_unaffected(ts):
+    mod, roots = ts
+    assert mod.resolve_scope("U01ARUN", demo=False)[0] == roots["arun"]
+    assert mod.resolve_scope("U01ARUN")[0] == roots["arun"]
+
+
+def test_a_demo_run_does_not_need_project_metadata(ts, tmp_path, monkeypatch):
+    """Requiring metadata would 422 the demo's payoff beat instead of plotting."""
+    mod, _roots = ts
+    demo_root = tmp_path / "demo-calcs"
+    project = demo_root / "fe-porphyrin-scan"
+    project.mkdir(parents=True)
+    monkeypatch.setattr(mod, "DEMO_ROOT", demo_root.resolve())
+
+    meta = mod.load_metadata(project, "", demo=True)
+    assert "matplotlib" in meta["allowed_libraries"]
+    assert "numpy" in meta["allowed_libraries"]
+
+
+def test_a_normal_run_still_requires_metadata(ts):
+    mod, roots = ts
+    with pytest.raises(Exception):           # HTTPException(422) + template
+        mod.load_metadata(roots["default"] / "thermolysin", "sam__U0SAM", demo=False)
+
+
+# --------------------------------------------------------------------------- #
 # Sidecar metadata
 # --------------------------------------------------------------------------- #
 def test_sidecar_metadata_is_preferred_over_the_tree(ts):
