@@ -351,12 +351,35 @@ def _demo_request_card(inp: dict, context: dict) -> tuple[str, list[str]]:
 
     Rendered into the thread rather than sent, because a demo anyone in the
     workspace can trigger must not be able to page a human. See demo.py.
+
+    The card is **posted to the thread**, not returned to the model. A tool
+    result is only ever seen by the agent, so returning the card left the model
+    saying "here's what that looks like:" about something the visitor was never
+    shown — which is exactly what it did the first time this ran for real.
     """
     session = demo.active_for(context.get("user_id", ""))
     if session is None:
         return "Error: that's only available inside a demo.", []
     session.advance("request")
-    return demo.request_card(session, inp.get("what", "access"), inp.get("path", "")), []
+    card = demo.request_card(session, inp.get("what", "access"), inp.get("path", ""))
+
+    post = context.get("on_interim")
+    if callable(post):
+        try:
+            post(card)
+        except Exception:
+            log.warning("demo: could not post the request card", exc_info=True)
+        else:
+            return ("The card has been posted to the thread — the visitor can see "
+                    "it now. Do NOT repeat it; just carry on from it, and wait for "
+                    "them to say approve."), []
+
+    # No interim channel (ASPEN_INTERIM_UPDATES=false, or the post failed): hand
+    # the card back with instructions, since the model's reply is then the only
+    # thing that reaches the visitor.
+    return ("Include the following in your reply VERBATIM — the visitor cannot "
+            "see this tool result, so it is invisible unless you reproduce it:\n\n"
+            + card), []
 
 
 def _demo_approve(inp: dict, context: dict) -> tuple[str, list[str]]:
@@ -775,8 +798,11 @@ TOOL_SPECS = [
         "description": (
             "DEMO ONLY. Show the visitor the Slack message their admin would "
             "receive if they asked for access (what='access') or their own "
-            "calculations directory (what='calc_root'). Nothing is sent to anyone "
-            "— say so. Outside a demo this does nothing."
+            "calculations directory (what='calc_root'). The card is posted into "
+            "the thread for you, so introduce it and then carry on from it — "
+            "unless the tool result tells you to reproduce it, in which case the "
+            "visitor can only see it if you paste it into your reply. Nothing is "
+            "sent to anyone — say so. Outside a demo this does nothing."
         ),
         "input_schema": {
             "type": "object",

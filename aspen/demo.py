@@ -264,7 +264,9 @@ _GUIDANCE = {
         "chemistry results from Slack, and this walkthrough is fabricated data so "
         "nobody's real work is on show. Then explain that normally they'd be "
         "turned away here because they aren't on the allowlist, and show them what "
-        "that looks like by calling demo_request_card."
+        "that looks like by calling demo_request_card. Never claim to have shown "
+        "them something you did not: the card only exists once that tool has run, "
+        "and if the result asks you to reproduce it, reproduce it."
     ),
     "request": (
         "They have seen the request card. Wait for them to say something like "

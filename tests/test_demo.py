@@ -216,12 +216,47 @@ def test_the_session_is_gone_when_it_ends(sut, session):
 # --------------------------------------------------------------------------- #
 # Nobody is paged
 # --------------------------------------------------------------------------- #
-def test_the_request_card_is_shown_not_sent(sut, session):
-    ctx = _ctx(session)
+def test_the_request_card_reaches_the_visitor(sut, session):
+    """The card must be POSTED, not returned.
+
+    A tool result is only ever seen by the model. Returning the card left the
+    agent saying "here's what that looks like:" about something the visitor was
+    never shown — which is what happened the first time this ran for real.
+    """
+    posted = []
+    ctx = dict(_ctx(session), on_interim=posted.append)
     out = sut.dispatch("demo_request_card", {"what": "access"}, ctx)
-    assert "not* actually sent" in out or "not actually sent" in out.replace("*", "")
+
+    assert len(posted) == 1
+    assert "./aspen-users add" in posted[0]
+    assert "not* actually sent" in posted[0] or "not actually sent" in posted[0].replace("*", "")
+    # And the model is told it is already visible, so it doesn't paste it twice.
+    assert "posted to the thread" in out
+    assert "./aspen-users add" not in out
+
+
+def test_without_an_interim_channel_the_model_is_told_to_paste_it(sut, session):
+    """With ASPEN_INTERIM_UPDATES=false the reply is the only thing that reaches
+    the visitor, so the card has to come back with instructions."""
+    out = sut.dispatch("demo_request_card", {"what": "access"}, _ctx(session))
+    assert "VERBATIM" in out
     assert "./aspen-users add" in out
+
+
+def test_a_failed_post_falls_back_rather_than_vanishing(sut, session):
+    def _boom(_text):
+        raise RuntimeError("slack is down")
+
+    out = sut.dispatch("demo_request_card", {"what": "access"},
+                       dict(_ctx(session), on_interim=_boom))
+    assert "VERBATIM" in out and "./aspen-users add" in out
+
+
+def test_the_card_is_never_sent_to_anyone(sut, session):
+    ctx = dict(_ctx(session), on_interim=lambda _t: None)
+    sut.dispatch("demo_request_card", {"what": "access"}, ctx)
     ctx["slack_client"].chat_postMessage.assert_not_called()
+    ctx["slack_client"].conversations_open.assert_not_called()
 
 
 def test_the_root_request_card_shows_the_set_root_command(sut, session):
