@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -709,6 +710,50 @@ def _run_pipeline(argv: list, cwd: Path) -> subprocess.CompletedProcess:
     )
 
 
+def _pipeline_error_text(proc, limit: int = 1600) -> str:
+    """The useful part of a failed pipeline run, for a Slack reply.
+
+    Three things learned from running this against the real pipeline, none of
+    which were guessable from the code:
+
+    * The **reason** ("ERROR: Missing charge and/or multiplicity in XYZ header…")
+      goes to *stderr*, while the *summary* ("ERROR: 12 of 12 XYZ file(s) failed",
+      then a list of paths) goes to *stdout*. Reading either stream alone gives the
+      user half the story — the paths without the cause, or the cause without
+      knowing how much failed.
+    * stderr also carries a Python traceback, so simply preferring stderr hands the
+      user a stack dump and buries the sentence telling them what to fix.
+    * A batch of 12 bad structures produces a page per structure, which is not a
+      Slack message.
+
+    So: pull the ERROR lines from *both* streams, de-duplicate, drop the traceback,
+    and cap the result.
+    """
+    out, err = (proc.stdout or "").strip(), (proc.stderr or "").strip()
+
+    lines, seen = [], set()
+    for stream in (err, out):                    # cause first, then the summary
+        for raw in stream.splitlines():
+            line = raw.rstrip()
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("Traceback", "File \"", "    ")):
+                continue
+            if stripped.startswith(("ERROR", "-", "WARNING")) or "ERROR:" in stripped:
+                if stripped not in seen:
+                    seen.add(stripped)
+                    lines.append(line)
+
+    text = "\n".join(lines)
+    if not text:
+        # Nothing recognisable — fall back to the tail of whichever stream spoke.
+        tail = (out or err).splitlines()[-15:]
+        text = "\n".join(tail) or f"exit {proc.returncode}"
+    if len(text) > limit:
+        kept = text[:limit].rsplit("\n", 1)[0]
+        text = kept + f"\n… (truncated — {len(lines)} error lines in total)"
+    return text
+
+
 def dry_run(*, requester_uid: str, thread_ts: str, rel: str, owner: str,
             template_mode: str) -> dict:
     """Stage, validate, and run the pipeline with ``--no-submit``.
@@ -741,17 +786,23 @@ def dry_run(*, requester_uid: str, thread_ts: str, rel: str, owner: str,
     try:
         proc = _run_pipeline(argv, staging_dir)
     except subprocess.TimeoutExpired:
+        _discard_staging(staging_dir)
         raise JobsError("The pipeline dry run timed out.") from None
     except OSError as exc:
+        _discard_staging(staging_dir)
         raise JobsError(
             f"Could not run {config.JOBS_PIPELINE_BIN!r}: {exc}. Is the pipeline "
             "installed and on PATH?"
         ) from exc
 
     if proc.returncode != 0:
+        # A rejected dry run leaves nothing behind. Otherwise a user iterating on
+        # bad inputs silently accumulates a staging directory per attempt, each
+        # holding a full copy of their structures.
+        _discard_staging(staging_dir)
         raise JobsError(
             "The pipeline rejected these inputs during the dry run:\n"
-            + (proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}")
+            + _pipeline_error_text(proc)
         )
 
     payload = {
@@ -821,7 +872,7 @@ def commit(*, requester_uid: str, thread_ts: str, token: str) -> dict:
         raise JobsError(
             f"The pipeline reported an error (batch {batch_id}, {recorded} job(s) "
             "recorded so far):\n"
-            + (proc.stderr.strip() or f"exit {proc.returncode}")
+            + _pipeline_error_text(proc)
         )
 
     log.info("jobs: batch %s submitted %d job(s) for %s", batch_id, recorded, requester_uid)
@@ -830,6 +881,15 @@ def commit(*, requester_uid: str, thread_ts: str, token: str) -> dict:
         "structures": structures, "staging_dir": str(staging_dir),
         "stdout": proc.stdout[-4000:],
     }
+
+
+def _discard_staging(staging_dir: Path) -> None:
+    """Remove a staging directory, but only ever one inside the staging root."""
+    try:
+        if _within(staging_dir, config.JOBS_STAGING_ROOT):
+            shutil.rmtree(staging_dir, ignore_errors=True)
+    except Exception:
+        log.warning("jobs: could not clean up %s", staging_dir, exc_info=True)
 
 
 def _project_of(rel: str) -> str:

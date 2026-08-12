@@ -392,3 +392,58 @@ def test_a_removed_user_cannot_submit(sut, env):
                   "status": "removed"})
     with pytest.raises(sut.jobs.JobsError):
         sut.jobs.require_registered("U0GONE")
+
+
+# --------------------------------------------------------------------------- #
+# Reporting a pipeline failure
+#
+# Shaped by what the real pipeline actually does, which was not guessable from
+# its code: the *reason* goes to stderr and the *summary* to stdout, and stderr
+# also carries a Python traceback.
+# --------------------------------------------------------------------------- #
+def test_pipeline_errors_combine_both_streams(sut):
+    proc = FakeProc(
+        returncode=1,
+        stdout="ERROR: 2 of 2 XYZ file(s) failed\n  - /stage/a.xyz\n  - /stage/b.xyz\n",
+        stderr=('Traceback (most recent call last):\n'
+                '  File "/x/orchestrate.py", line 5, in main\n'
+                '    raise SystemExit\n'
+                '  ERROR: Missing charge and/or multiplicity in XYZ header of a.xyz.\n'),
+    )
+    text = sut.jobs._pipeline_error_text(proc)
+    assert "Missing charge" in text, "the cause (stderr) must survive"
+    assert "2 of 2 XYZ file(s) failed" in text, "the summary (stdout) must survive"
+    assert "Traceback" not in text and "orchestrate.py" not in text
+
+
+def test_pipeline_errors_are_capped(sut):
+    proc = FakeProc(returncode=1,
+                    stdout="\n".join(f"ERROR: structure {i} is bad" for i in range(400)))
+    text = sut.jobs._pipeline_error_text(proc)
+    assert len(text) < 2000, "a 400-structure failure is not a Slack message"
+    assert "truncated" in text
+
+
+def test_an_unrecognisable_failure_still_says_something(sut):
+    assert "exit 3" in sut.jobs._pipeline_error_text(FakeProc(returncode=3))
+
+
+def test_a_rejected_dry_run_leaves_no_staging_behind(sut, jobs_env, monkeypatch):
+    """Otherwise a user iterating on bad inputs accumulates a copy per attempt."""
+    monkeypatch.setattr(sut.jobs.subprocess, "run",
+                        lambda argv, **kw: FakeProc(returncode=1, stdout="ERROR: nope"))
+    with pytest.raises(sut.jobs.JobsError):
+        sut.jobs.dry_run(requester_uid="U0SAM", thread_ts="1723480000.1",
+                         rel="thermolysin/structures", owner="", template_mode="ca-fixed")
+    user_root = sut.jobs.user_staging_root("U0SAM")
+    leftovers = list(user_root.glob("*")) if user_root.exists() else []
+    assert leftovers == [], f"a failed dry run left {leftovers} behind"
+
+
+def test_discard_staging_refuses_paths_outside_the_staging_root(sut, jobs_env, tmp_path):
+    """A cleanup helper that can be pointed anywhere is a delete primitive."""
+    victim = tmp_path / "not-staging"
+    victim.mkdir()
+    (victim / "important.txt").write_text("hello")
+    sut.jobs._discard_staging(victim)
+    assert (victim / "important.txt").exists(), "cleanup must never leave the staging root"
