@@ -195,6 +195,7 @@ When the service account exists, do all of the following:
       | `ASPEN_USERS_FILE` dir | `0750`, owner `aspen-agent` | Group can `aspen-users list` / audit; **writes require being the service account**, so admission stays a privileged act (C8). |
       | `ASPEN_WORKFLOWS_ROOT` | `2770`, group `sdf-ssrl-dft` | Users may reasonably edit their own `WORKFLOW.md` in `$EDITOR`; setgid keeps new files group-owned. |
       | `ASPEN_TELEMETRY_DIR` + state file | `0700`, owner `aspen-agent` | The turn log holds users' questions verbatim while a collection window is open. The bot appends; only the service account reads. **Not** group-readable — a colleague's questions are not group business. |
+      | `ASPEN_JOBS_STAGING_ROOT` + `ASPEN_JOBS_LEDGER` | `0700`, owner `aspen-agent` | **Do not give these the `2770` treatment.** The workflows tree is group-writable so people can edit their own file in `$EDITOR`; applying the same reasoning here would collapse C12. Aspen submits every job under one Unix account while several Slack users share it, so "whose job is this" is answered *entirely* by which staging subdirectory it ran from. A group-writable staging tree lets any lab member create a directory named after a colleague, or move files into one, and thereby launder a job into someone else's name — or make their own job appear cancellable by another user. The ledger is worse: a writable row is a cancel that was never verified. |
 
       Two traps. (1) The parent `/sdf/data/ssrl/smb/dft` is already `drwxrwsr-x`,
       so a plain `mkdir` **inherits group-write** and silently gives every account
@@ -259,6 +260,14 @@ the Bash route this section anticipated:
       It is now enabled, so the service account needs one, plus a Slurm association.
       Decide then whether jobs charge one shared account or each user's (an admin
       question, not a code one).
+- [ ] **Confirm the cancel boundary still holds after the move.** It is designed to:
+      the fence is `<staging>/<alias>__<slack-id>/`, which contains no Unix user, and
+      the ownership check compares against whatever account is current — so it
+      transfers unchanged (asserted by
+      `test_cross_user_cancellation_is_refused_under_either_account`). What must be
+      re-checked by hand is the *filesystem*: staging owned by `aspen-agent` at
+      `0700`, and every existing staging directory moved with its name intact, since
+      the directory name is the ownership record.
 - [ ] **Plumb `--comment` through the pipeline** so attribution has a second,
       Slurm-maintained key beside `WorkDir` (`AccountingStoreFlags = job_comment` is
       confirmed on s3df). Strictly `--comment` and a job-name prefix — **not** a

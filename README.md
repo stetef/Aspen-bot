@@ -313,12 +313,8 @@ anyone's calculations directory, as everywhere else in Aspen.
 ./aspen-users jobs list arun         # just one person's
 ./aspen-users jobs show <batch-id>   # one batch: inputs, argv, its jobs
 ./aspen-users jobs cancel arun       # cancel someone's, same verification as the agent
-./aspen-users jobs panic             # cancel every active Aspen job (still per-ID)
 ./aspen-users jobs reconcile         # fill in what jobs actually consumed, from sacct
 ```
-
-`panic` is the 2 a.m. button. It stays per-job-ID rather than using `scancel -u`, so it
-cannot take out your own research jobs alongside Aspen's.
 
 `reconcile` is worth running periodically: the ledger knows *who submitted what*, but
 elapsed time, CPU-hours and exit state only exist once a job has finished, so

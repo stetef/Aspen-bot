@@ -686,42 +686,6 @@ def cmd_jobs_cancel(args) -> int:
     return 0
 
 
-def cmd_jobs_panic(args) -> int:
-    """Cancel every non-terminal ledger job, for every user.
-
-    The 2 a.m. button. Still per-ID and still verified — a panic that used
-    ``scancel -u`` would take out the operator's own research jobs alongside
-    Aspen's, which is the opposite of what someone reaching for this wants.
-    """
-    from . import jobs
-
-    rows = jobs.active_rows()
-    if not rows:
-        print("No active Aspen jobs. Nothing to do.")
-        return 0
-
-    by_user: dict = {}
-    for r in rows:
-        by_user.setdefault(r["slack_user_id"], []).append(r)
-    print(f"{len(rows)} active job(s) across {len(by_user)} user(s):")
-    for uid, rs in by_user.items():
-        print(f"  {registry.label(uid)}: {len(rs)}")
-    if not args.force and input("\nCancel ALL of them? [y/N] ").strip().lower() not in ("y", "yes"):
-        print("Left alone.")
-        return 0
-
-    total, failed = 0, 0
-    for uid in by_user:
-        try:
-            result = jobs.cancel(uid, "all")
-            total += len(result["cancelled"])
-        except jobs.JobsError as exc:
-            failed += 1
-            print(f"  {registry.label(uid)}: {exc}")
-    print(f"Cancelled {total} job(s)" + (f"; {failed} user(s) errored." if failed else "."))
-    return 0
-
-
 def cmd_jobs_prune(args) -> int:
     from . import jobs
 
@@ -1176,16 +1140,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="'all' (default), a job ID, a batch ID, or a project name")
     j.add_argument("-f", "--force", action="store_true", help="skip the confirmation prompt")
     j.set_defaults(func=cmd_jobs_cancel)
-
-    j = jsub.add_parser(
-        "panic",
-        help="cancel EVERY active Aspen job, all users",
-        description="The 2 a.m. button. Still per-job-ID and still verified, so it "
-                    "cannot take out your own hand-submitted research jobs the way "
-                    "`scancel -u $USER` would.",
-    )
-    j.add_argument("-f", "--force", action="store_true", help="skip the confirmation prompt")
-    j.set_defaults(func=cmd_jobs_panic)
 
     j = jsub.add_parser(
         "prune",

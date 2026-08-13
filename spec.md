@@ -1298,10 +1298,12 @@ skipping the question.
 
 ### 19.8 The CLI escape hatch
 
-`aspen-users jobs` — `list`, `show`, `cancel`, `reconcile`, and `panic` (cancel every
-non-terminal ledger job) — is the operator's path in, outside the agent and outside Slack.
-It exists because the beta's failure mode is a runaway batch at 2 a.m., and debugging that
-through a Slack thread is the wrong tool. Like every other granting/administrative action
+`aspen-users jobs` — `list`, `show`, `cancel`, `prune`, and `reconcile` — is the
+operator's path in, outside the agent and outside Slack. It exists because the beta's
+failure mode is a runaway batch at 2 a.m., and debugging that through a Slack thread is the
+wrong tool. `cancel` takes a user and an optional selector, so stopping one person's runaway
+batch is one command; there is deliberately **no** cancel-everything button, because the
+blast radius of a mistyped panic is every user's work at once. Like every other granting/administrative action
 ([§5.1](#51-calculations-roots-aspenrootspy)), it is CLI-only and has no agent-facing
 equivalent.
 

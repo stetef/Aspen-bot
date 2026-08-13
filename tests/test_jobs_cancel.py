@@ -308,3 +308,49 @@ def test_the_tool_reports_what_it_skipped(sut, two_users, monkeypatch):
     text = sut.dispatch("cancel_orca_batch", {"selector": "all"}, ctx)
     assert "Nothing was cancelled" in text
     assert "outside your own staging area" in text
+
+
+# --------------------------------------------------------------------------- #
+# The ownership model is independent of the Unix account
+#
+# Stated as a requirement: Aspen submits as one Unix user (tetef01 today,
+# aspen-agent later) while several Slack users submit through it, and "cancel my
+# jobs" must reach exactly the requester's own. That must hold identically before
+# and after the service-account cutover, because the fence is keyed by Slack ID
+# and the Unix identity is only ever checked against whatever account is current.
+# --------------------------------------------------------------------------- #
+def test_the_fence_is_keyed_by_slack_id_not_unix_user(sut, two_users):
+    """No part of a user's staging path depends on which account Aspen runs as."""
+    import getpass
+
+    for uid, alias in (("U0SAM", "sam"), ("U01ARUN", "arun")):
+        fence = sut.jobs.user_staging_root(uid)
+        assert fence.name == f"{alias}__{uid}"
+        assert getpass.getuser() not in fence.name
+    assert sut.jobs.user_staging_root("U0SAM") != sut.jobs.user_staging_root("U01ARUN")
+
+
+@pytest.mark.parametrize("bot_account", ["tetef01", "aspen-agent"])
+def test_cross_user_cancellation_is_refused_under_either_account(
+        sut, two_users, monkeypatch, bot_account):
+    """Same behaviour before and after the cutover — only the Unix name changes.
+
+    Under `tetef01` this check is the ONLY thing separating Sam from Arun's jobs,
+    since Slurm sees one owner. Under `aspen-agent` Slurm would also refuse a
+    genuinely foreign job, but Aspen's own users still share that one account, so
+    this stays the control that separates them from each other.
+    """
+    monkeypatch.setattr(sut.jobs, "whoami", lambda: bot_account)
+    sam, arun = two_users["U0SAM"], two_users["U01ARUN"]
+    monkeypatch.setattr(sut.jobs, "scontrol_job", fake_scontrol({
+        sam["job_id"]: live(sam["staging"], user=bot_account),
+        arun["job_id"]: live(arun["staging"], user=bot_account),
+    }))
+
+    # Each user reaches their own...
+    for uid, mine, theirs in (("U0SAM", sam, arun), ("U01ARUN", arun, sam)):
+        approved, _ = sut.jobs.resolve_cancellable(uid, "all")
+        assert [r["job_id"] for r in approved] == [mine["job_id"]]
+        # ...and naming the other's ID explicitly reaches nothing.
+        approved, refused = sut.jobs.resolve_cancellable(uid, theirs["job_id"])
+        assert approved == [] and refused == []
