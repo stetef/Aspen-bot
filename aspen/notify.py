@@ -44,7 +44,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from . import config, jobs, registry
+from . import config, jobs, registry, results
 
 log = logging.getLogger("aspen")
 
@@ -159,7 +159,15 @@ def _message(batch: dict, rows: list, failed: list, reason: str) -> str:
         lines.append("")
         lines.append("Ask me to look at the output and I'll pull the log and say what "
                      "went wrong.")
-    lines.append(f"\nResults are in `{batch.get('staging_dir', '')}`.")
+
+    # Both halves of "where did it go", because they answer different questions and
+    # only one of them used to be here. The path alone left the user to work out the
+    # copy themselves, and left Aspen unable to open the file it had just announced.
+    lines.append(f"\nResults are in `{batch.get('staging_dir', '')}` — ask me and I'll "
+                 "read them from there.")
+    command = results.copy_command(batch, batch.get("slack_user_id", ""))
+    if command:
+        lines.append(f"To keep a copy in your own tree:\n```{command}```")
     return "\n".join(lines)
 
 

@@ -175,6 +175,16 @@ def test_the_message_says_where_the_results_are(sut, batch):
     assert str(sut.JOBS_STAGING_ROOT) in text
 
 
+def test_the_message_hands_over_the_copy_command(sut, batch):
+    """The path alone left the user to work out the copy themselves — and the
+    results are in Aspen's staging area, which is not where they keep anything."""
+    bid = batch()
+    _settle(sut, bid, "COMPLETED", "COMPLETED", "COMPLETED")
+    text = sut.notify.due()[0]["text"]
+    assert "cp -r" in text
+    assert "read them from there" in text, "and Aspen can open them itself now"
+
+
 # --------------------------------------------------------------------------- #
 # The remembered preference
 # --------------------------------------------------------------------------- #

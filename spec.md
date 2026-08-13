@@ -1418,8 +1418,11 @@ So any job reaching a failed state is worth interrupting for; a clean run is onl
 interesting once it is actually done.
 
 **One notification per batch**, not one per job — a nine-job batch would otherwise be nine
-pings for one piece of news. The message names what failed, which is the part you would
-go looking for anyway, and where the results are.
+pings for one piece of news. The message names what failed, which is the part you would go
+looking for anyway, and answers "where did it go" both ways: the staging path, and the
+`cp` line that puts the run in the reader's own tree
+([§19.3](#193-staging-the-model-never-authors-a-job)). Aspen can also open those files
+itself now, so the message says so.
 
 **In the thread, falling back to a DM.** The thread holds the context — the diff that was
 approved, the structures chosen — so that is where it belongs. But a channel the bot has
