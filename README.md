@@ -376,6 +376,14 @@ default when someone has several.
 converged and where the optimised geometry is, so "if it converged, run TD-DFT on the
 result" rests on the output rather than on assumption.
 
+**Where the results go.** Jobs run from `$WORKSPACE_ROOT/jobs/<you>__<slack-id>/<thread>/`,
+which is world-readable — so the ORCA output, the optimised geometry and everything else the
+run wrote are there to read or copy out, by you or by Aspen. (In the first build this was
+`~/.aspen` at 0700, and nobody could get the results back.)
+
+**Nothing tells you when a job finishes.** There is no watcher and no follow-up: ask Aspen,
+or use `squeue`. Its silence means nothing either way.
+
 ## What Aspen records (`aspen-users telemetry`)
 
 Aspen keeps a **turn log** — one JSON line per message — so its tools, prompt and

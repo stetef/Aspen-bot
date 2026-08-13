@@ -339,9 +339,13 @@ JOBS_MAX_SUBMITS_PER_DAY = int(os.getenv("ASPEN_JOBS_MAX_SUBMITS_PER_DAY", "10")
 JOBS_CONFIRM_TTL      = int(os.getenv("ASPEN_JOBS_CONFIRM_TTL_SECONDS", "900"))
 # Wall-clock cap on the orchestrator subprocess itself (it only *submits*; it
 # does not wait for jobs to run, so this is generous).
-# Measured: the pipeline took ~13 minutes to submit ONE structure (it generates
-# ORCA inputs and runs prepare stages before sbatch), which blew straight through
-# the original 600s and reported a successful batch as a timeout.
+# Raised from 600s after the first real submission, though NOT because submitting
+# is slow — it is not; that batch reached the queue in about three minutes. What
+# happened is that the orchestrator did not return promptly once it had submitted,
+# and the ledger write comes after it returns. The cause is not established, so the
+# honest fix is two-sided: a timeout generous enough that a slow-to-exit
+# orchestrator is not mistaken for a failure, and `jobs.backfill()` so the job IDs
+# are recovered from the pipeline's own log whichever way this goes wrong.
 JOBS_SUBMIT_TIMEOUT   = int(os.getenv("ASPEN_JOBS_SUBMIT_TIMEOUT_SECONDS", "3600"))
 # Timeout for a single read-only Slurm client call (scontrol/sacct/squeue).
 JOBS_SLURM_TIMEOUT    = int(os.getenv("ASPEN_JOBS_SLURM_TIMEOUT_SECONDS", "30"))

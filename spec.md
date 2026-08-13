@@ -30,6 +30,9 @@ aspen-bot.py / aspen.* package   (Slack Bolt app)
   │         list_directory · read_file · search_files · attach_file
   │         read_metadata · write_metadata · read_workflow · write_workflow
   │         submit_orca_batch · cancel_orca_batch · list_my_jobs
+  │         submit_calculation · check_orca_run
+  │         {list,read,save,delete}_input_template
+  │         {list,read,save,delete}_job_runner
   │         (every path-taking tool takes an `owner` — whose root to read;
   │          the job tools deliberately do not — they act on the speaker)
   │   └── Slurm: read-only via Bash (squeue/sacct/…); submit + cancel via the
@@ -250,7 +253,7 @@ auto-approves exactly the MCP tools below plus a read-only Bash allowlist, and a
 | `save_input_template` | **write** | Save a reusable input as the **speaker's own** template |
 | `delete_input_template` | **write** | Delete one of the speaker's own templates (snapshotted) |
 | `submit_calculation` | **submit** | One job from a template via the speaker's registered runner — [§20.5](#205-submission-and-the-tag-that-comes-back) |
-| `check_orca_run` | read-only | Did a run converge, and where is the optimised geometry — [§20.6](#206-the-follow-on) |
+| `check_orca_run` | read-only | Did a run converge, and where is the optimised geometry — [§20.7](#207-the-follow-on) |
 
 Every path-taking tool takes an **`owner`** — a *name* (alias, Slack ID, or shared-root
 name), never a path. Reading is flat: any root may be read by anyone ([§5.1](#51-calculations-roots-aspenrootspy)).
@@ -846,9 +849,13 @@ ASPEN_MAX_WORKFLOW_BYTES=60000
 # about compute budgets shouldn't gain job submission just by upgrading.
 ASPEN_JOBS_SUBMIT_ENABLED=false
 ASPEN_JOBS_LEDGER=                        # default $ASPEN_STATE_DIR/jobs.sqlite
-ASPEN_JOBS_STAGING_ROOT=                  # default $ASPEN_STATE_DIR/jobs-staging
                                           # MUST be outside WORKSPACE_ROOT + sandbox
                                           # write paths — startup refuses otherwise
+ASPEN_JOBS_STAGING_ROOT=                  # default $WORKSPACE_ROOT/jobs — results
+                                          # live here, so it is NOT held to that rule;
+                                          # refused only inside figures/, cache/ or a
+                                          # sandbox write path (§19.3)
+ASPEN_JOBS_STAGING_MODE=755               # 0700 to keep results private to the bot
 ASPEN_JOBS_PIPELINE_BIN=xas-run-batch     # the pipeline entry point (on PATH)
 ASPEN_JOBS_SCHEDULER=slurm
 ASPEN_JOBS_MAX_STRUCTURES=24              # per submission
@@ -856,7 +863,7 @@ ASPEN_JOBS_MAX_ACTIVE_PER_USER=48         # concurrent non-terminal jobs
 ASPEN_JOBS_MAX_ACTIVE_TOTAL=200
 ASPEN_JOBS_MAX_SUBMITS_PER_DAY=10         # per user
 ASPEN_JOBS_CONFIRM_TTL_SECONDS=900        # dry-run → confirm token lifetime
-ASPEN_JOBS_SUBMIT_TIMEOUT_SECONDS=600     # cap on the orchestrator subprocess
+ASPEN_JOBS_SUBMIT_TIMEOUT_SECONDS=3600    # cap on the orchestrator subprocess
 # Extra env names to pass through to the orchestrator subprocess (and thus to
 # jobs). The base allowlist is PATH/HOME/USER/LANG/TERM/TMPDIR + PIPELINE_*/XAS_*;
 # secrets are never included, whatever is listed here (§19.6).
@@ -895,7 +902,8 @@ Paths and identity-specific values are driven entirely from `.env` (no hardcoded
 | Slack connection | Socket Mode — outbound WebSocket only, no open ports |
 | Tool surface | Locked-down allowlist + `can_use_tool` deny; host settings ignored; Bash = Slurm read-only (`sbatch`/`scancel` are structured tools, never Bash rules) |
 | Slurm submission | Off by default. Model supplies a `template_mode` from a fixed enum, never a script; inputs copied into a staging tree outside every writable area; orchestrator env scrubbed to an allowlist so no token reaches a compute node; per-user and global job caps; dry run + single-use confirmation token ([§19](#19-slurm-job-submission-beta)) |
-| Templates & runners | The **input** may be freely edited by Aspen within a closed directive vocabulary; the **job script** is registered once by a human and frozen, so no shell content ever comes from the model or from a file chosen at request time ([§20](#20-templates-runners-and-single-job-submission-beta)) |
+| Templates & runners | The **input** may be freely edited by Aspen within a closed directive vocabulary; the **job script** is saved once by its owner after Aspen checks it and they confirm, then frozen — so no shell content comes from the model, and none from a file chosen at request time ([§20](#20-templates-runners-and-single-job-submission-beta)) |
+| Job staging | Under `WORKSPACE_ROOT`, world-readable, because it holds the run's **results**. Refused only where the agent could write — the jail's `figures/`/`cache/` binds or a sandbox write path — since that is the route by which a planted script would reach `sbatch` ([§19.3](#193-staging-the-model-never-authors-a-job)) |
 | Slurm cancellation | Enumerated **only** from Aspen's own ledger, filtered to the Slack event's `user_id`, then each ID verified against live Slurm (`WorkDir` inside *that* requester's staging dir) before an explicit-ID `scancel`. No filter flags, ever ([§19.5](#195-verify-before-cancel)) |
 | Read/search tools | Path-fenced in Python to the *resolved* root; can't read `~/.ssh`, `.env`, or hop between roots |
 | Calculations roots | One per user + shared; reads are flat by design, and the tool surface takes a **name**, never a path. Roots may not nest (startup refuses) |
@@ -918,8 +926,9 @@ DM that contains any non-allowlisted human (participant gate, fail-closed); writ
 file inside *any* calculations root; grant itself or anyone else access or a calculations
 root; write another user's workflow or metadata; **cancel a Slurm job it did not submit, or
 one submitted for a different Slack user** ([§19.5](#195-verify-before-cancel));
-**author or choose the shell script a job runs** ([§20.1](#201-why-the-job-script-is-not-user-supplied));
-write into another user's template library;
+**author the shell script a job runs, or pick one at request time**
+([§20.1](#201-why-the-job-script-is-never-chosen-at-request-time)); write into another
+user's template or runner library;
 run `sbatch`/`scancel` through Bash; reach files outside the configured roots / workspace /
 state dir / staging tree; make network calls from inside the analysis jail.
 
@@ -970,6 +979,17 @@ A hermetic pytest suite runs without a live Slack connection, Claude CLI, or net
   enum is refused; no tool accepts a script path or script body; the ledger write precedes
   submission and a failed write aborts it; caps and the confirmation token are enforced in
   Python rather than by prompt.
+
+- **`tests/test_inputs.py`, `test_templates.py`, `test_runners.py`** — the §20 half.
+  Both halves of the input validator are asserted with equal weight: that ordinary
+  chemistry (functional swaps, basis changes, added blocks, geometry, charge) is
+  *accepted*, since a validator that blocks real work is one people route around; and that
+  the directives which stop an input being data are refused. Templates and runners assert
+  the ownership rules they inherit from workflows — no `owner` on a write, a colleague's is
+  `reference-only`, overwrites snapshotted — plus the two that are specific to them: a
+  stored file is re-validated on use, and an override must name the exact warnings shown.
+  `test_runners.py` also pins the `#SBATCH` false positive that would have rejected every
+  real job script in the group.
 
 `tests/conftest.py` provides a facade mapping the legacy flat names onto the `aspen.*`
 package and neutralizes import-time side effects.
@@ -1204,11 +1224,19 @@ copied structure, the requesting Slack ID, and the resolved mode. Nothing in any
 calculations root is written — the invariant from [§7](#7-project-metadata) is unchanged by
 this feature.
 
-The staging root must sit **outside** `WORKSPACE_ROOT` and outside every
-`ASPEN_SANDBOX_WRITE_PATHS` entry, enforced at startup by the same guard that protects the
-registry ([§6 placement guard](#6-per-user-workflows)). If staging were writable by
-sandboxed analysis code, generated Python could plant a script and Aspen would submit it —
-the cross-tool path that makes an otherwise-fenced feature exploitable.
+**Staging lives under `WORKSPACE_ROOT` and is world-readable (0755).** That is a reversal
+of the original placement, forced by the first real submission: staging was in
+`$ASPEN_STATE_DIR` at 0700, and a run's ORCA output and optimised geometry — *the point of
+submitting it* — landed where neither the user nor Aspen could read them back. Results are
+what the workspace is for.
+
+The rule that replaced "staging must be outside `WORKSPACE_ROOT`" is the narrower one that
+was doing the actual work: **no agent-writable surface may reach it.** The analysis jail
+bind-mounts only `figures/` and `cache/` read-write, so a `jobs/` directory beside them is
+not reachable by generated code; startup refuses staging inside those two, or inside any
+`ASPEN_SANDBOX_WRITE_PATHS` entry. That is the cross-tool path that would matter — generated
+Python planting a script that Aspen then submits — and it is still closed. The **ledger**
+keeps the strict rule, because it is an authorization input rather than an output.
 
 ### 19.4 The ledger
 
@@ -1226,6 +1254,19 @@ Submit rows are **immutable**; only the reconciler's columns are ever updated
 invoked and a failure to write **aborts the submission** — the §18.2 requirement, kept
 literally, because a job running with no ledger row is a job nobody can cancel through
 Aspen and nobody can attribute.
+
+**And when the job IDs are missed anyway, they are recovered.** The first real submission
+landed three jobs and recorded none of them, leaving the batch invisible — not listable,
+not cancellable — while its jobs consumed real compute. Two causes compounded. The dry run
+and the commit share a staging directory and therefore a `batch-jobs.log`, so the log held
+the dry run's `SKIPPED` rows with no IDs *followed by* the real `SUBMITTED job_id=…` rows;
+and the orchestrator did not return promptly after submitting, so the parse never ran
+against the finished file. The fixes: the dry run's log is moved aside before the real run,
+so the log describes one run; and **`jobs.backfill()`** re-reads `batch-jobs.log` for any
+batch with no recorded jobs, runs automatically on every ledger read, and is attempted
+before the timeout path reports failure. The IDs were on disk the whole time — nothing read
+them back. A missed parse now self-heals rather than leaving a batch permanently
+untrackable.
 
 **Why `STATE_DIR` and not `<workspace>/db/`.** The per-project SQLite databases of
 [§12](#12-per-project-database--sqlite) live under `WORKSPACE_ROOT`, and putting this one
@@ -1247,9 +1288,13 @@ not duplicated into the tool server ([§18.2](#182-agent-submitted-slurm-jobs--b
    already in the requester's own rows resolves to nothing, whatever the conversation says.
 2. **Verify each ID against live Slurm** — `scontrol show job <id> -o`, requiring
    `UserId` to be the account Aspen runs as, `WorkDir` to resolve inside *that requester's*
-   staging directory, and (when present) `Comment` to match. Fail **closed**: a
-   `scontrol` error, a missing field, or a `WorkDir` outside the fence drops that ID and
-   says so. It never falls through to cancelling.
+   staging directory **or inside the staging directory recorded for that batch**, and
+   (when present) `Comment` to match. The second alternative exists because relocating the
+   staging root would otherwise orphan jobs already running from the old path — as three
+   were when it moved. It is the same guarantee: the recorded path is Aspen-derived and was
+   created under that user's root at submit time. Fail **closed**: a `scontrol` error, a
+   missing field, or a `WorkDir` outside both drops that ID and says so. It never falls
+   through to cancelling.
 3. **Cancel explicit IDs only** — `scancel <id> <id> …`, argv built in Python.
 
 `scancel` **filter flags are never used.** `-u`, `-n/--name`, `-A`, `-p`, `-q`, `-t`,
@@ -1345,6 +1390,11 @@ the risks visible:
   `WorkDir`, recoverable from `sacct -o Comment` even if the ledger is lost — worth doing,
   since `AccountingStoreFlags = job_comment` is confirmed on s3df. Deliberately **not** a
   generic `--sbatch-extra-args` pass-through, which would be `--wrap` by another name.
+- **Nothing notifies you when a job finishes.** Aspen does not offer to follow up, and
+  there is no background watcher; you ask, or you run `squeue`. The pieces exist (the
+  ledger holds each batch's `thread_ts`, and the reconciler already reads terminal state
+  from `sacct`), so this is a small feature rather than a design question — it is simply
+  not built.
 - **The reconciler is manual** (`aspen-users jobs reconcile`), not a cron job —
   though the caps reconcile once on their own before refusing, since a row with no
   state counts as active and an unreconciled ledger would otherwise jam the cap
@@ -1390,7 +1440,7 @@ Three pieces, and the split between them is the whole design:
 | **Template** — the input file | Aspen, with the user, saved on request | `$ASPEN_STATE_DIR/templates/<alias>__<id>/` |
 | **Per-job values** — charge, geometry, resources | the conversation, as typed fields | nowhere; passed per call |
 
-### 20.1 Why the job script is not user-supplied
+### 20.1 Why the job script is never chosen at request time
 
 Two tempting designs were rejected, and the reasons are the load-bearing part of
 this section.
@@ -1529,7 +1579,29 @@ weak link it is on the pipeline path.
 The argv is `sbatch --parsable --job-name=… --comment=… --chdir=<staging> script.sh`
 and nothing else. `--wrap` is asserted absent rather than merely omitted.
 
-### 20.6 The follow-on
+### 20.6 Two things the first weeks of real use changed
+
+Both were cases of Aspen holding a *copy* of something the pipeline owns, and both failed
+silently and against the user.
+
+**Template modes are read from the pipeline, not duplicated.** The mode list started as a
+hardcoded map of the pipeline's mutually-exclusive flags. The pipeline then gained
+`--interp`, and Aspen went on refusing it — telling the user that a mode they had just
+written did not exist. `staging.available_modes()` now runs `xas-run-batch --help` and
+picks out the flags described as "…ORCA template…", caches that briefly, and falls back to
+the curated names only when the pipeline cannot be reached. The tool schema is refreshed
+per session from the same source, so an upstream addition is offered on the next new thread
+rather than after a restart. The set stays closed: the *flag* still comes from the
+discovered map, never from the string the model passed.
+
+**The pipeline source is readable.** `automated-pipeline` sat outside every calculations
+root, so the read tools could not see it and Aspen could not answer questions about its own
+submission machinery. It is now a **shared root** named `@pipeline` — owned by nobody in
+particular, read-only like every root, and a sibling of `calculations/` so the two do not
+nest. Keeping it out of anyone's *personal* root also keeps the executable out of a tree
+whose write permissions would then decide what Aspen runs.
+
+### 20.7 The follow-on
 
 `check_orca_run` reads an ORCA `.out` and reports whether the optimisation converged,
 plus the path to the optimised geometry ORCA leaves beside it. That makes "if it
