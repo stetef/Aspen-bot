@@ -229,6 +229,14 @@ def batches_for(slack_user_id: str, limit: int = 20) -> list:
             "ORDER BY submitted_at DESC LIMIT ?", (slack_user_id, limit))]
 
 
+def batch_by_id(batch_id: str) -> Optional[dict]:
+    """One batch row, or None. The lookup behind reading a run's results back."""
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM batches WHERE batch_id = ?",
+                           (str(batch_id),)).fetchone()
+    return dict(row) if row else None
+
+
 def jobs_for_batch(batch_id: str) -> list:
     with connect() as conn:
         return [dict(r) for r in conn.execute(

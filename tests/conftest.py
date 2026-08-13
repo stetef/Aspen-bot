@@ -100,6 +100,7 @@ _MODMAP = {
     "demo": "aspen",
     "jobs": "aspen",
     "staging": "aspen",
+    "results": "aspen",
     "inputs": "aspen",
     "templates": "aspen",
     "runners": "aspen",

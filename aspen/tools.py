@@ -21,8 +21,8 @@ from typing import Optional
 
 import httpx
 
-from . import (config, demo, inputs, jobs, metadata, notify, roots, runners,
-               setup, staging, templates, workflows)
+from . import (config, demo, inputs, jobs, metadata, notify, results, roots,
+               runners, setup, staging, templates, workflows)
 
 log = logging.getLogger("aspen")
 
@@ -30,15 +30,33 @@ log = logging.getLogger("aspen")
 # --------------------------------------------------------------------------- #
 # Read-only file tools
 # --------------------------------------------------------------------------- #
-def _scoped(rel: str, owner: str = "", viewer_uid: str = "") -> tuple[Optional[Path], dict, str]:
-    """Resolve a path within the root named by ``owner`` (or the speaker's own).
+def _scoped(rel: str, owner: str = "", viewer_uid: str = "",
+            batch_id: str = "") -> tuple[Optional[Path], dict, str]:
+    """Resolve a path — in a calculations root, or inside a batch's results.
 
-    All the fencing lives in ``roots.resolve``; this is the seam every file tool
-    goes through. ``owner`` is a *name*, never a path — the registry does
-    name → root on the trusted side, so no wording in a conversation can point a
-    tool at an arbitrary directory.
+    The seam every file tool goes through, and now the *only* place the two fences
+    are chosen between. Both are name-addressed rather than path-addressed:
+    ``owner`` is an alias the registry turns into a root, ``batch_id`` is a ledger
+    key Aspen itself minted, and neither lets a conversation name a directory.
+
+    Giving both is an error rather than a precedence rule, for the same reason
+    ``@alias/path`` plus ``owner=`` is: the ambiguity is the model's to resolve,
+    and quietly picking one is how a read ends up somewhere nobody chose.
     """
+    if batch_id:
+        if owner or (rel or "").strip().startswith(roots.PREFIX):
+            return None, {}, ("Error: pass either batch_id (to read a submitted job's "
+                              "results) or an owner/@alias path (to read someone's "
+                              "calculations), not both.")
+        return results.resolve(batch_id, rel, viewer_uid)
     return roots.resolve(rel, owner, viewer_uid)
+
+
+def _display(path: Path, scope: dict) -> str:
+    """A resolved path back in whichever display form its fence uses."""
+    if scope.get("kind") == "results":
+        return results.relative_to_scope(path, scope)
+    return roots.relative_to_scope(path, scope)
 
 
 def _safe_path(rel: str, owner: str = "", viewer_uid: str = "") -> Optional[Path]:
@@ -47,8 +65,9 @@ def _safe_path(rel: str, owner: str = "", viewer_uid: str = "") -> Optional[Path
     return None if error else path
 
 
-def _list_directory(rel: str, owner: str = "", viewer_uid: str = "") -> str:
-    path, scope, error = _scoped(rel, owner, viewer_uid)
+def _list_directory(rel: str, owner: str = "", viewer_uid: str = "",
+                    batch_id: str = "") -> str:
+    path, scope, error = _scoped(rel, owner, viewer_uid, batch_id)
     if error:
         return f"Error: '{rel}' is outside the allowed directory." if "outside" in error else error
     if not path.exists():
@@ -58,16 +77,24 @@ def _list_directory(rel: str, owner: str = "", viewer_uid: str = "") -> str:
     try:
         entries = sorted(path.iterdir(), key=lambda e: (e.is_file(), e.name))
         lines = [f"{'[dir]' if e.is_dir() else '[file]'} {e.name}" for e in entries]
-        header = f"Contents of '{rel}' ({len(entries)} entries):"
-        project = _project_of(rel, path, scope)
-        # Metadata lives outside the tree now, so a listing is the only place a
-        # project's notes can announce themselves — and, when there are none, the
-        # place to offer to write some. The offer rides the project's *top-level*
-        # listing only: from a run directory two levels down, "this project has no
-        # README" is noise about something the user is not looking at.
-        note = metadata.summary_line(project, scope)
-        if not note and project and path.parent == scope.get("path"):
-            note = setup.project_notes_nudge(viewer_uid, project, scope)
+        header = (f"Contents of '{_display(path, scope)}' ({len(entries)} entries):"
+                  if scope.get("kind") == "results" else
+                  f"Contents of '{rel}' ({len(entries)} entries):")
+        # Project notes belong to a project in a calculations root. A batch's
+        # results are neither, and asking metadata about them would be asking a
+        # question with no answer — the directory's first component is a Slack
+        # timestamp, not a project name.
+        note = ""
+        if scope.get("kind") != "results":
+            project = _project_of(rel, path, scope)
+            # Metadata lives outside the tree now, so a listing is the only place a
+            # project's notes can announce themselves — and, when there are none, the
+            # place to offer to write some. The offer rides the project's *top-level*
+            # listing only: from a run directory two levels down, "this project has no
+            # README" is noise about something the user is not looking at.
+            note = metadata.summary_line(project, scope)
+            if not note and project and path.parent == scope.get("path"):
+                note = setup.project_notes_nudge(viewer_uid, project, scope)
         body = header + "\n" + "\n".join(lines) if lines else f"'{rel}' is empty."
         return f"{body}\n{note}" if note else body
     except PermissionError:
@@ -83,8 +110,9 @@ def _project_of(rel: str, path: Path, scope: dict) -> str:
     return parts[0] if parts else ""
 
 
-def _read_file(rel: str, owner: str = "", viewer_uid: str = "") -> str:
-    path, _scope, error = _scoped(rel, owner, viewer_uid)
+def _read_file(rel: str, owner: str = "", viewer_uid: str = "",
+               batch_id: str = "") -> str:
+    path, scope, error = _scoped(rel, owner, viewer_uid, batch_id)
     if error:
         return f"Error: '{rel}' is outside the allowed directory." if "outside" in error else error
     if not path.exists():
@@ -99,7 +127,8 @@ def _read_file(rel: str, owner: str = "", viewer_uid: str = "") -> str:
             f"\n[Truncated: showing first {config.MAX_FILE_BYTES} of {size} bytes]"
             if size > config.MAX_FILE_BYTES else ""
         )
-        return f"--- {rel} ---\n{content}{truncation_note}"
+        label = _display(path, scope) if scope.get("kind") == "results" else rel
+        return f"--- {label} ---\n{content}{truncation_note}"
     except PermissionError:
         return f"Error: permission denied for '{rel}'."
 
@@ -274,13 +303,14 @@ def _search_one(pattern, base: Path, root: Path, file_budget: int,
     return matches, files_scanned, files_capped, hit_match_cap
 
 
-def _attach_file(rel: str, owner: str = "", viewer_uid: str = "") -> tuple[str, list[str]]:
-    """Mark a calculations file for upload alongside the reply.
+def _attach_file(rel: str, owner: str = "", viewer_uid: str = "",
+                 batch_id: str = "") -> tuple[str, list[str]]:
+    """Mark a calculations file — or a submitted job's output — for upload.
 
     Returns (confirmation_or_error, [absolute_path]) — the path is drained into
     the per-turn attachment sink by ``dispatch`` and uploaded by the front-end.
     """
-    path, _scope, error = _scoped(rel, owner, viewer_uid)
+    path, scope, error = _scoped(rel, owner, viewer_uid, batch_id)
     if error:
         return (f"Error: '{rel}' is outside the allowed directory."
                 if "outside" in error else error), []
@@ -288,15 +318,16 @@ def _attach_file(rel: str, owner: str = "", viewer_uid: str = "") -> tuple[str, 
         return f"Error: '{rel}' does not exist.", []
     if not path.is_file():
         return f"Error: '{rel}' is not a regular file.", []
+    label = _display(path, scope) if scope.get("kind") == "results" else rel
     size = path.stat().st_size
     if size > config.MAX_ATTACHMENT_BYTES:
         return (
-            f"Error: '{rel}' is {size / 1e6:.1f} MB, over the "
+            f"Error: '{label}' is {size / 1e6:.1f} MB, over the "
             f"{config.MAX_ATTACHMENT_BYTES / 1e6:.0f} MB attachment limit — "
             "it can't be attached to the reply.",
             [],
         )
-    return f"Attached '{rel}' — it will be uploaded with the reply.", [str(path)]
+    return f"Attached '{label}' — it will be uploaded with the reply.", [str(path)]
 
 
 def _write_metadata(project: str, content: str, owner: str = "",
@@ -440,6 +471,7 @@ def _submit_orca_batch(inp: dict, context: dict) -> tuple[str, list[str]]:
                 "Tell the user these are queued, that you can check them with "
                 "squeue/sacct, and that they can ask you to cancel them."
             )
+            lines.append(_RESULTS_HINT)
             return "\n".join(lines), []
 
         preview = jobs.dry_run(
@@ -529,6 +561,15 @@ def _refusal_lines(refused: list) -> str:
     return "\n".join([head, *body])
 
 
+# Said wherever a batch ID is printed, because the ID is the whole address: a
+# submitted run's output is in Aspen's staging area, and without this the model has
+# no reason to think a finished batch is readable at all.
+_RESULTS_HINT = (
+    "To look at what a run produced, pass its batch ID: list_directory(path=\".\", "
+    "batch_id=\"<id>\"), then read_file / check_orca_run / attach_file the same way."
+)
+
+
 def _list_my_jobs(inp: dict, context: dict) -> tuple[str, list[str]]:
     """What this user has in flight, refreshed before it is read.
 
@@ -554,6 +595,7 @@ def _list_my_jobs(inp: dict, context: dict) -> tuple[str, list[str]]:
                 f"  {b['batch_id']}  {b['project'] or '?'}  {b['template_mode']}  "
                 f"{b['structures']} structure(s)  {b['submitted_at']}"
             )
+        lines.append(_RESULTS_HINT)
         return "\n".join(lines), []
     lines = [f"{len(rows)} active Aspen job(s):"]
     for row in rows[:25]:
@@ -568,6 +610,7 @@ def _list_my_jobs(inp: dict, context: dict) -> tuple[str, list[str]]:
         "These are only the jobs Aspen submitted for this user. Use squeue/sacct to "
         "see the wider queue, including their own hand-submitted jobs."
     )
+    lines.append(_RESULTS_HINT)
     return "\n".join(lines), []
 
 
@@ -673,16 +716,27 @@ def _check_orca_run(inp: dict, context: dict) -> tuple[str, list[str]]:
     the optimisation converged, run TD-DFT on the result" needs a trustworthy answer
     to the first half before anything is submitted.
     """
-    rel = inp.get("path", "")
-    path, scope, error = roots.resolve(rel, inp.get("owner", ""),
-                                       context.get("user_id", ""))
+    rel = inp.get("path", ".")
+    batch_id = (inp.get("batch_id") or "").strip()
+    path, scope, error = _scoped(rel, inp.get("owner", ""),
+                                 context.get("user_id", ""), batch_id)
     if error:
-        return f"Error: {error}", []
+        return (error if error.startswith("Error") else f"Error: {error}"), []
     if not path.exists():
         return f"Error: '{rel}' does not exist.", []
 
-    outs = ([path] if path.is_file()
-            else sorted(p for p in path.iterdir() if p.suffix.lower() in (".out", ".log")))
+    if path.is_file():
+        outs = [path]
+    elif scope.get("kind") == "results":
+        # A batch's results are a tree the pipeline laid out, not a directory the
+        # user arranged, so the outputs are a level or two down and "look in this
+        # directory" would find nothing. Descending is safe here for the reason the
+        # fence is: everything under it resolved inside the batch already.
+        outs = sorted(p for p in path.rglob("*")
+                      if p.is_file() and p.suffix.lower() in (".out", ".log")
+                      and roots._under(p, scope["path"]))
+    else:
+        outs = sorted(p for p in path.iterdir() if p.suffix.lower() in (".out", ".log"))
     if not outs:
         return f"Error: no ORCA .out/.log files under '{rel}'.", []
 
@@ -694,13 +748,28 @@ def _check_orca_run(inp: dict, context: dict) -> tuple[str, list[str]]:
             continue
         state = _orca_state(text)
         geom = _converged_geometry(out)
-        detail = f"  {out.name}: {state}"
+        detail = f"  {_display(out, scope)}: {state}"
         if geom:
-            detail += f"; optimised geometry at {roots.relative_to_scope(geom, scope)}"
+            detail += f"; optimised geometry at {_display(geom, scope)}"
         lines.append(detail)
-    return ("ORCA run status:\n" + "\n".join(lines) +
-            "\n\nIf a run converged and the user wants a follow-on calculation, use "
-            "submit_calculation with the optimised geometry as geometry_path."), []
+
+    # A staged geometry cannot be fed straight back in: submit_calculation resolves
+    # geometry_path through the roots fence, and staging is deliberately not a root.
+    # Say so here rather than letting the model discover it by being refused — the
+    # user's next question is "so how do I run the follow-on", and the answer is a
+    # copy they run themselves.
+    if scope.get("kind") == "results":
+        row = results.batch_row(batch_id) or {}
+        follow_on = (
+            "\n\nThese are staged results, not files in a calculations root, so they "
+            "cannot be passed to submit_calculation as they stand. To follow on from "
+            "one, the user copies the run into their own tree first:\n"
+            f"  {results.copy_command(row, context.get('user_id', ''))}"
+        )
+    else:
+        follow_on = ("\n\nIf a run converged and the user wants a follow-on calculation, "
+                     "use submit_calculation with the optimised geometry as geometry_path.")
+    return "ORCA run status:\n" + "\n".join(lines) + follow_on, []
 
 
 def _orca_state(text: str) -> str:
@@ -942,13 +1011,27 @@ _OWNER_PROPERTY = {
     ),
 }
 
+# The other fence a path can be read through: a submitted batch's own output.
+_BATCH_PROPERTY = {
+    "type": "string",
+    "description": (
+        "Read inside a submitted job's RESULTS instead of a calculations root. "
+        "Jobs write to Aspen's staging area, not into anyone's tree, so this is "
+        "the only way to see what a run produced. The ID comes from list_my_jobs, "
+        "from the reply confirming the submission, or from the message saying the "
+        "batch finished. 'path' is then relative to that batch's directory ('.' "
+        "for the top of it). Do not pass owner as well."
+    ),
+}
+
 TOOL_SPECS = [
     {
         "name": "list_directory",
         "description": (
             "List contents of a directory in someone's calculations. Defaults to "
             "the files of the person you're talking to; pass owner (or an "
-            "'@alias/...' path) to look in someone else's."
+            "'@alias/...' path) to look in someone else's, or batch_id to list "
+            "what a submitted job produced."
         ),
         "input_schema": {
             "type": "object",
@@ -961,11 +1044,13 @@ TOOL_SPECS = [
                     ),
                 },
                 "owner": _OWNER_PROPERTY,
+                "batch_id": _BATCH_PROPERTY,
             },
             "required": ["path"],
         },
         "impl": lambda inp, ctx: (
-            _list_directory(inp["path"], inp.get("owner", ""), ctx.get("user_id", "")), []
+            _list_directory(inp["path"], inp.get("owner", ""), ctx.get("user_id", ""),
+                            inp.get("batch_id", "")), []
         ),
     },
     {
@@ -973,7 +1058,7 @@ TOOL_SPECS = [
         "description": (
             "Read the text contents of a file in someone's calculations. Defaults "
             "to the speaker's own files; pass owner (or an '@alias/...' path) for "
-            "someone else's."
+            "someone else's, or batch_id to read a submitted job's output."
         ),
         "input_schema": {
             "type": "object",
@@ -983,11 +1068,13 @@ TOOL_SPECS = [
                     "description": "Path relative to that person's calculations root.",
                 },
                 "owner": _OWNER_PROPERTY,
+                "batch_id": _BATCH_PROPERTY,
             },
             "required": ["path"],
         },
         "impl": lambda inp, ctx: (
-            _read_file(inp["path"], inp.get("owner", ""), ctx.get("user_id", "")), []
+            _read_file(inp["path"], inp.get("owner", ""), ctx.get("user_id", ""),
+                       inp.get("batch_id", "")), []
         ),
     },
     {
@@ -1049,8 +1136,9 @@ TOOL_SPECS = [
             "as a downloadable file alongside your text. Use this when the user asks "
             "for a file directly, or when handing over a specific output/data/"
             "structure file is more useful than pasting its contents. Any file type "
-            "works. Path and owner work exactly as in read_file. Call once per file; "
-            "your text reply is still sent."
+            "works. Path, owner and batch_id work exactly as in read_file — so a "
+            "finished job's output file can be handed over directly. Call once per "
+            "file; your text reply is still sent."
         ),
         "input_schema": {
             "type": "object",
@@ -1060,11 +1148,13 @@ TOOL_SPECS = [
                     "description": "Path of the file to attach, relative to the owner's calculations root.",
                 },
                 "owner": _OWNER_PROPERTY,
+                "batch_id": _BATCH_PROPERTY,
             },
             "required": ["path"],
         },
         "impl": lambda inp, ctx: _attach_file(
-            inp["path"], inp.get("owner", ""), ctx.get("user_id", "")
+            inp["path"], inp.get("owner", ""), ctx.get("user_id", ""),
+            inp.get("batch_id", "")
         ),
     },
     {
@@ -1562,7 +1652,9 @@ TOOL_SPECS = [
         "description": (
             "Read-only: did an ORCA run converge, and is there an optimised geometry "
             "to reuse? Use this before offering a follow-on calculation, so 'if it "
-            "converged, run TD-DFT' rests on the output rather than on assumption."
+            "converged, run TD-DFT' rests on the output rather than on assumption. "
+            "Pass batch_id (with path='.') to check a job Aspen submitted — that is "
+            "where a submitted run's output actually is."
         ),
         "input_schema": {
             "type": "object",
@@ -1570,6 +1662,7 @@ TOOL_SPECS = [
                 "path": {"type": "string",
                          "description": "An ORCA .out file, or a run directory containing one."},
                 "owner": _OWNER_PROPERTY,
+                "batch_id": _BATCH_PROPERTY,
             },
             "required": ["path"],
         },

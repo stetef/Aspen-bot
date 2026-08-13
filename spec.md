@@ -1241,6 +1241,45 @@ not reachable by generated code; startup refuses staging inside those two, or in
 Python planting a script that Aspen then submits — and it is still closed. The **ledger**
 keeps the strict rule, because it is an authorization input rather than an output.
 
+#### Reading the results back (`aspen/results.py`)
+
+World-readable staging fixed half the problem — a human could `cp` a run out — and left
+the other half in place. Every read tool resolves through `roots.resolve`, staging is not a
+root, and `roots.validate` refuses to let it become one (a root overlapping
+`WORKSPACE_ROOT` would put Aspen's own state inside a readable tree). So Aspen would
+announce a finished batch and then, asked what the output said, have to answer that it
+could not open it.
+
+`results.resolve` is the second fence, deliberately shaped like the first — same
+`(path, scope, error)` return, same "the model names a key, never a path" rule. A
+`batch_id` is looked up in the ledger and the directory comes from the row Aspen wrote at
+submit time, derived from the registry and the Slack event. `read_file`, `list_directory`,
+`attach_file` and `check_orca_run` each take an optional `batch_id`; passing it *and* an
+owner (or an `@alias/` path) is an error rather than a precedence rule. Paths come back as
+`batch:<id>/rest`, a namespace visibly distinct from `@alias/…`.
+
+Three properties make the second fence safe, and all three are ones staging already had:
+
+- **It reads results, not state.** Nothing the agent can *run* can write there — the jail
+  binds only `figures/` and `cache/` read-write — so this is not a way to read content the
+  model could have planted. The reader re-checks that independently (`_refuse_unsafe_base`)
+  rather than trusting the startup guard to have run.
+- **The fence holds after symlinks.** A job runs unjailed on a compute node, so its output
+  directory is not trusted to contain only files: containment is checked on the resolved
+  path, and `check_orca_run`'s descent drops any `.out` whose real path leaves the batch.
+- **It is read-only, and stays that way.** There is no copy-into, and a staged geometry is
+  deliberately *not* accepted as a `geometry_path` — `check_orca_run` says so and hands
+  over the `cp` line instead, so "Aspen writes nothing inside a calculations root" stays
+  literally true rather than nearly true. The same line ends the finished-batch
+  notification, which is the moment someone actually wants it.
+
+Reads are flat, as everywhere else: any registered user may read any batch, because they
+may already do so on the filesystem and a permission model here would only be a wrong copy
+of the real one. A demo visitor may read none of them — job results are real users' work.
+The one narrow rule is that the recorded directory must sit inside the configured staging
+root; relocating that root therefore makes older batches unreadable *through Aspen*, which
+costs a `cp` and buys a fence with no case analysis in it.
+
 ### 19.4 The ledger
 
 One SQLite file, `$ASPEN_STATE_DIR/jobs.sqlite`, written only by the bot:

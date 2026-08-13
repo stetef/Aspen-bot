@@ -121,7 +121,7 @@ Two single-instance processes:
 
 | Tool | Bound by |
 |---|---|
-| `list_directory`, `read_file`, `search_files`, `attach_file` | In-process Python, **path-fenced to the calculations root** (`_safe_path`); cannot read outside it |
+| `list_directory`, `read_file`, `search_files`, `attach_file` | In-process Python, **path-fenced to the calculations root** (`_safe_path`); cannot read outside it. With `batch_id` the fence is `results.resolve` instead — read-only, confined to the *ledger's own* record of that batch's staging directory, refused if that directory is outside `ASPEN_JOBS_STAGING_ROOT` or inside anything the jail can write, and containment re-checked after symlinks |
 | `write_metadata` | One file, in Aspen's own sidecar (`$ASPEN_METADATA_ROOT/<scope>/<project>/metadata.md`) and never in a calculations tree; prior version snapshotted first |
 | `read_workflow` | In-process, path-fenced to the workflows root; another user's file is tagged `trust="reference-only"` (C10) |
 | `write_workflow` | Only the **speaking user's own** file — the destination is the Slack event's `user_id`, and the tool has no owner parameter (C9); `_group` gated on the admin; prior version snapshotted |
