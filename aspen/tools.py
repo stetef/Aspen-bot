@@ -1784,11 +1784,33 @@ def active_specs(allow_jobs: bool = True) -> list[dict]:
     is cheap here and the failure would be expensive.
     """
     if not (allow_jobs and config.JOBS_SUBMIT_ENABLED):
-        return [s for s in TOOL_SPECS if s["name"] not in JOB_TOOLS]
+        return [_without_batch_id(s) for s in TOOL_SPECS if s["name"] not in JOB_TOOLS]
 
     specs = list(TOOL_SPECS)
     _refresh_template_modes(specs)
     return specs
+
+
+def _without_batch_id(spec: dict) -> dict:
+    """The same spec with the results fence taken off its schema.
+
+    Withheld by omission, like the job tools themselves. Where there is no
+    submission there are no batches, so advertising ``batch_id`` would offer a
+    demo visitor a concept that does not exist for them and a jobs-off deployment
+    a parameter that can never resolve. ``results.resolve`` refuses both cases on
+    its own; this just stops the question being asked.
+
+    Copies rather than mutates — TOOL_SPECS is module-level shared state, and one
+    session must not rewrite what another is about to read.
+    """
+    props = spec.get("input_schema", {}).get("properties", {})
+    if "batch_id" not in props:
+        return spec
+    fresh = dict(spec)
+    fresh["input_schema"] = dict(spec["input_schema"])
+    fresh["input_schema"]["properties"] = {k: v for k, v in props.items()
+                                           if k != "batch_id"}
+    return fresh
 
 
 def _refresh_template_modes(specs: list) -> None:

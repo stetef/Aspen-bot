@@ -310,11 +310,12 @@ anyone's calculations directory, as everywhere else in Aspen.
 **Getting the results back.** A run writes into Aspen's staging area, not into your tree —
 that is what "nothing is written inside anyone's calculations directory" costs. So the
 finished-batch message gives you both halves: where the results are, and the `cp -r` line
-that puts them wherever you keep things. Aspen can read them from staging too — ask it what
-the output said, or to attach a file, and it will; every job-related reply carries the batch
-ID, which is the address. It stays read-only there. Copying into your tree is a command you
-run, as yourself, because Aspen writing into a calculations root is the one thing it never
-does.
+that puts them wherever you keep things. Aspen can read them from staging too — ask what the
+output said, or for a file to be attached, and it will; the submission confirmation,
+`list_my_jobs` and the finished-batch message all carry the batch ID, which is the address.
+It stays read-only there: copying into your tree is a command you run, as yourself, because
+Aspen writing into a calculations root is the one thing it never does. Nothing deletes a
+submitted run's staging directory, so the results keep until you move or remove them.
 
 ### Operator commands
 

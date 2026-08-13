@@ -259,6 +259,11 @@ auto-approves exactly the MCP tools below plus a read-only Bash allowlist, and a
 Every path-taking tool takes an **`owner`** — a *name* (alias, Slack ID, or shared-root
 name), never a path. Reading is flat: any root may be read by anyone ([§5.1](#51-calculations-roots-aspenrootspy)).
 
+The read tools take one other name of that kind: a **`batch_id`**, which reads inside a
+submitted job's own output instead of a calculations root. Same rule — a ledger key Aspen
+minted, never a directory the conversation chose — and it is offered only where submission
+exists ([§19.3](#193-staging-the-model-never-authors-a-job)).
+
 **No tool writes inside any calculations root.** That is now absolute, not a narrow
 exception: every write surface lands in Aspen's own storage — including job staging, which
 *copies* structures out of a root and never writes back into one
@@ -409,9 +414,12 @@ properties, each asserted in `tests/test_demo.py` against the real tool surface:
 - **Scope isolation.** The demo root is the only thing a session can read. This is the
   single place in the codebase that restricts reads *by identity* — and it restricts them
   to strictly less than a registered user sees. A visitor is not a group member, so the
-  flat-read rule of §5.1 does not extend to them. Enforced in `roots.resolve` **and**
-  separately in `tools._distinct_scopes`, because the cross-root sweep reads the roster
-  directly and would otherwise walk around the fence every other read goes through.
+  flat-read rule of §5.1 does not extend to them. Enforced in `roots.resolve`, separately
+  in `tools._distinct_scopes` (the cross-root sweep reads the roster directly and would
+  otherwise walk around the fence every other read goes through), and separately again in
+  `results.resolve` — a second fence is a second place the rule has to be stated, which is
+  the cost of having one and the reason both escapes this codebase has had were a code path
+  that resolved its own paths.
 - **Nothing is written.** No registry entry, not even a temporary one: the admission story
   is "no message can widen the allowlist", and a demo that writes to `users.json` would
   crack the property everything else rests on. The workflow and notes a visitor saves live
@@ -431,7 +439,12 @@ the ordinary options), which is one turn of warm-start latency.
 
 The `capabilities` beat then covers what the tour did not reach — asking for a calculations
 root (rendering the second card, with the `aspen-users set-root` command), reading
-colleagues' work by name, Slurm status and *why* it is off here, and attachments.
+colleagues' work by name, Slurm status and *why* it is off here, attachments, and what
+running a calculation looks like: the dry run, the narrow cancel, the frozen script, and
+where a finished run's results land. Described, never demonstrated — a visitor may not
+spend the group's compute, so none of those tools is advertised in a demo session at all
+(`tools.active_specs`, which also drops `batch_id` from the read tools there, since a
+session with no submission has no batches).
 
 Model time is the one real cost, so demo turns are rate-limited like any other and capped
 per session, per day across everyone, and by a session TTL. The walkthrough advances
@@ -864,7 +877,9 @@ ASPEN_JOBS_MAX_ACTIVE_PER_USER=48         # concurrent non-terminal jobs
 ASPEN_JOBS_MAX_ACTIVE_TOTAL=200
 ASPEN_JOBS_MAX_SUBMITS_PER_DAY=10         # per user
 ASPEN_JOBS_NOTIFY=true                    # tell people when their jobs end (§19.8)
-ASPEN_JOBS_NOTIFY_POLL_SECONDS=300
+ASPEN_JOBS_NOTIFY_POLL_SECONDS=300        # watcher interval when nothing is running
+ASPEN_JOBS_NOTIFY_ACTIVE_POLL_SECONDS=60  # ...and while jobs are outstanding
+ASPEN_JOBS_REFRESH_MIN_GAP_SECONDS=15     # floor on talking to Slurm, whoever asks
 ASPEN_JOBS_CONFIRM_TTL_SECONDS=900        # dry-run → confirm token lifetime
 ASPEN_JOBS_SUBMIT_TIMEOUT_SECONDS=3600    # cap on the orchestrator subprocess
 # Extra env names to pass through to the orchestrator subprocess (and thus to
@@ -908,7 +923,7 @@ Paths and identity-specific values are driven entirely from `.env` (no hardcoded
 | Templates & runners | The **input** may be freely edited by Aspen within a closed directive vocabulary; the **job script** is saved once by its owner after Aspen checks it and they confirm, then frozen — so no shell content comes from the model, and none from a file chosen at request time ([§20](#20-templates-runners-and-single-job-submission-beta)) |
 | Job staging | Under `WORKSPACE_ROOT`, world-readable, because it holds the run's **results**. Refused only where the agent could write — the jail's `figures/`/`cache/` binds or a sandbox write path — since that is the route by which a planted script would reach `sbatch` ([§19.3](#193-staging-the-model-never-authors-a-job)) |
 | Slurm cancellation | Enumerated **only** from Aspen's own ledger, filtered to the Slack event's `user_id`, then each ID verified against live Slurm (`WorkDir` inside *that* requester's staging dir) before an explicit-ID `scancel`. No filter flags, ever ([§19.5](#195-verify-before-cancel)) |
-| Read/search tools | Path-fenced in Python to the *resolved* root; can't read `~/.ssh`, `.env`, or hop between roots |
+| Read/search tools | Path-fenced in Python to the *resolved* root; can't read `~/.ssh`, `.env`, or hop between roots. A `batch_id` swaps the fence for the ledger's record of that batch's staging directory — read-only, refused outside `ASPEN_JOBS_STAGING_ROOT` or inside anything the jail can write, containment re-checked after symlinks ([§19.3](#193-staging-the-model-never-authors-a-job)) |
 | Calculations roots | One per user + shared; reads are flat by design, and the tool surface takes a **name**, never a path. Roots may not nest (startup refuses) |
 | Write surface | **Nothing inside any calculations root.** Metadata and workflows land in `$ASPEN_STATE_DIR`; the jail gets `figures/`,`cache/`. Prior versions snapshotted |
 | Granting | Admission and calculations roots are CLI-only. The agent can *request* (DM to the admin) and *decline*, never grant |
@@ -1502,6 +1517,14 @@ the risks visible:
   `WorkDir`, recoverable from `sacct -o Comment` even if the ledger is lost — worth doing,
   since `AccountingStoreFlags = job_comment` is confirmed on s3df. Deliberately **not** a
   generic `--sbatch-extra-args` pass-through, which would be `--wrap` by another name.
+- **Nothing ever removes a submitted batch's results.** `prune_staging` deletes only
+  directories no ledger row points at, which is deliberate — it must never delete a
+  running job's working directory or a result someone has not collected — but it means
+  staging grows for as long as the bot runs. Making results readable
+  ([§19.3](#193-staging-the-model-never-authors-a-job)) removes the *reason* a user had
+  to copy them out promptly without removing the need, so this gets worse rather than
+  better. A retention policy (age plus "the batch is terminal", with the notification as
+  the warning) is the fix; there isn't one yet.
 - **The full reconciler is still manual** (`aspen-users jobs reconcile`), not a cron
   job — though it is no longer the only thing that refreshes state: the notify
   watcher and `list_my_jobs` both call `jobs.refresh_states` ([§19.8](#198-being-told-when-it-ends)),
@@ -1717,6 +1740,15 @@ plus the path to the optimised geometry ORCA leaves beside it. That makes "if it
 converged, run TD-DFT on the result" rest on the output rather than on assumption:
 the converged `.xyz` becomes `geometry_path` for a `submit_calculation` call against
 the user's TD-DFT template.
+
+`check_orca_run` also takes a `batch_id`, which is how a run *Aspen itself submitted*
+gets checked — that output is in staging, not in a root, and it descends the batch
+rather than listing one directory, because the pipeline lays that tree out and the
+`.out` files are a level or two down. The follow-on does not chain automatically from
+there: a staged geometry is not accepted as a `geometry_path`, since accepting one
+would make staging an input surface. The reply says so and gives the user the `cp`
+line, and the follow-on runs from their own tree
+([§19.3](#193-staging-the-model-never-authors-a-job)).
 
 Outstanding, and honest: Arun's tree contains no optimisation runs and no TD-DFT
 inputs today, so the first TD-DFT template has to come from him — or from Aspen

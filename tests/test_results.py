@@ -197,6 +197,32 @@ def test_no_batch_id_still_reads_calculations(sut, batch):
 
 
 # --------------------------------------------------------------------------- #
+# What is advertised
+# --------------------------------------------------------------------------- #
+def test_the_read_tools_offer_the_fence_when_jobs_are_on(sut, monkeypatch):
+    monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", True)
+    specs = {s["name"]: s for s in sut.tools.active_specs(True)}
+    for name in ("read_file", "list_directory", "attach_file", "check_orca_run"):
+        assert "batch_id" in specs[name]["input_schema"]["properties"], name
+
+
+def test_no_jobs_means_no_batch_id_is_offered(sut, monkeypatch):
+    """Withheld by omission, like the job tools themselves: where there is no
+    submission there are no batches, so the question is never put to the model."""
+    monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", False)
+    for spec in sut.tools.active_specs(True):
+        assert "batch_id" not in spec["input_schema"].get("properties", {}), spec["name"]
+
+
+def test_withholding_it_does_not_mutate_shared_state(sut, monkeypatch):
+    """TOOL_SPECS is module-level; a demo session must not narrow another's view."""
+    monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", False)
+    sut.tools.active_specs(False)
+    shared = next(s for s in sut.TOOL_SPECS if s["name"] == "read_file")
+    assert "batch_id" in shared["input_schema"]["properties"]
+
+
+# --------------------------------------------------------------------------- #
 # The copy-out line
 # --------------------------------------------------------------------------- #
 def test_the_copy_command_targets_the_readers_own_root(sut, batch):
