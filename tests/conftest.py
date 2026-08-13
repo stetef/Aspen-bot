@@ -100,6 +100,8 @@ _MODMAP = {
     "demo": "aspen",
     "jobs": "aspen",
     "staging": "aspen",
+    "inputs": "aspen",
+    "ORCA_EXTRA_BLOCKS": "aspen.config",
     "main": "aspen",
     "DEMO_ENABLED": "aspen.config",
     "DEMO_ROOT": "aspen.config",

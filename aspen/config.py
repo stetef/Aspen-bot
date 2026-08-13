@@ -364,6 +364,25 @@ JOBS_ENV_FORBIDDEN    = ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "ANTHROPIC_API_KE
 
 
 # ---------------------------------------------------------------------------
+# Input-file validation (aspen/inputs.py)
+#
+# Aspen may edit a user's quantum-chemistry input freely — functional, basis set,
+# geometry, charge, extra blocks. These bound the narrow set of things that turn an
+# input from data into a way to run another program, plus two resource numbers
+# where a typo becomes a queue-hogging job.
+#
+# The ORCA block vocabulary is closed (see inputs.py for why) with this as the
+# escape hatch: a legitimate block nobody anticipated is a one-line change, not an
+# argument. It cannot re-enable a denied block — that check runs afterwards.
+# ---------------------------------------------------------------------------
+ORCA_EXTRA_BLOCKS     = _csv_env("ASPEN_ORCA_EXTRA_BLOCKS")
+ORCA_MAX_NPROCS       = int(os.getenv("ASPEN_ORCA_MAX_NPROCS", "64"))
+ORCA_MAX_MAXCORE_MB   = int(os.getenv("ASPEN_ORCA_MAX_MAXCORE_MB", "8000"))
+ORCA_MAX_ABS_CHARGE   = int(os.getenv("ASPEN_ORCA_MAX_ABS_CHARGE", "10"))
+ORCA_MAX_MULTIPLICITY = int(os.getenv("ASPEN_ORCA_MAX_MULTIPLICITY", "11"))
+
+
+# ---------------------------------------------------------------------------
 # Turn telemetry — one JSON line per turn, so the tool surface and prompt can be
 # tuned for the tasks people actually bring. See telemetry.py.
 #
