@@ -173,6 +173,11 @@ def _normalize(raw: dict) -> dict:
                 # Their Unix account on the cluster. A Slack ID does not name
                 # one, and job submission on someone's behalf needs it.
                 "unix_user": str(entry.get("unix_user") or ""),
+                # Which registered runner submits their jobs (see runners.py).
+                # Empty = they cannot submit. CLI-only, like calc_root: a tool
+                # that wrote this would choose what executes, which is exactly
+                # the surface the design keeps out of the model's reach.
+                "job_runner": str(entry.get("job_runner") or ""),
                 # Setup offers this person has turned down: {item: YYYY-MM-DD}.
                 # Written by the agent (setup.decline) because it can only ever
                 # make Aspen quieter — it grants nothing. See setup.py.

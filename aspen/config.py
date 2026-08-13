@@ -364,6 +364,28 @@ JOBS_ENV_FORBIDDEN    = ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "ANTHROPIC_API_KE
 
 
 # ---------------------------------------------------------------------------
+# Runner profiles (aspen/runners.py)
+#
+# What actually executes, registered once by a human from a file they have read,
+# then frozen in Aspen's own storage. Per-user assignment lives on the registry
+# record (`job_runner`) beside `calc_root`, and is CLI-only for the same reason:
+# a tool that wrote it would reinstate the surface that taking paths out of the
+# model's hands removes.
+# ---------------------------------------------------------------------------
+RUNNERS_FILE          = Path(
+    os.getenv("ASPEN_RUNNERS_FILE", str(STATE_DIR / "runners.json"))
+).resolve()
+RUNNERS_DIR           = Path(
+    os.getenv("ASPEN_RUNNERS_DIR", str(STATE_DIR / "runners"))
+).resolve()
+# Ceilings on what a rendered job script may ask for. A typo in a resource field
+# is the "runaway compute" the threat model names.
+RUNNER_MAX_NTASKS     = int(os.getenv("ASPEN_RUNNER_MAX_NTASKS", "64"))
+RUNNER_MAX_MEM_GB     = int(os.getenv("ASPEN_RUNNER_MAX_MEM_GB", "512"))
+RUNNER_MAX_HOURS      = int(os.getenv("ASPEN_RUNNER_MAX_HOURS", "168"))
+
+
+# ---------------------------------------------------------------------------
 # Per-user input templates (aspen/templates.py)
 #
 # "The way Arun runs a TD-DFT", saved as a reusable artifact. Beside the workflows
