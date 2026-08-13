@@ -686,6 +686,19 @@ def cmd_jobs_cancel(args) -> int:
     return 0
 
 
+def cmd_jobs_backfill(args) -> int:
+    from . import jobs
+
+    result = jobs.backfill_jobs(args.batch_id or "")
+    for batch, n in result["repaired"]:
+        print(f"  {batch}: recorded {n} job(s)")
+    for batch, why in result["still_empty"]:
+        print(f"  {batch}: still empty — {why}")
+    if not result["repaired"] and not result["still_empty"]:
+        print("Every batch already has its jobs recorded.")
+    return 0
+
+
 def cmd_jobs_prune(args) -> int:
     from . import jobs
 
@@ -1320,6 +1333,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="'all' (default), a job ID, a batch ID, or a project name")
     j.add_argument("-f", "--force", action="store_true", help="skip the confirmation prompt")
     j.set_defaults(func=cmd_jobs_cancel)
+
+    j = jsub.add_parser(
+        "backfill",
+        help="recover job IDs for batches that recorded none",
+        description="Re-reads batch-jobs.log for batches with no jobs in the ledger. "
+                    "A batch in that state is uncancellable through Aspen even though "
+                    "its jobs are running, so recovery must not need a database edit. "
+                    "Safe to re-run: only empty batches are touched.",
+    )
+    j.add_argument("batch_id", nargs="?", default="",
+                   help="one batch, or omit for every empty one")
+    j.set_defaults(func=cmd_jobs_backfill)
 
     j = jsub.add_parser(
         "prune",

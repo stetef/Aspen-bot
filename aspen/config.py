@@ -299,9 +299,23 @@ JOBS_SUBMIT_ENABLED   = _flag_early("ASPEN_JOBS_SUBMIT_ENABLED", "false")
 JOBS_LEDGER           = Path(
     os.getenv("ASPEN_JOBS_LEDGER", str(STATE_DIR / "jobs.sqlite"))
 ).resolve()
+# Job staging: the inputs a job runs from and the outputs it leaves behind.
+#
+# Under WORKSPACE_ROOT rather than STATE_DIR, and world-readable, because these are
+# RESULTS. A run's ORCA output and optimised geometry are the point of submitting
+# it, and the first real submission left them somewhere only the bot's account could
+# read — so neither the user nor Aspen could get them back.
+#
+# Safe there, unlike the ledger: the analysis jail bind-mounts only figures/ and
+# cache/ read-write, so nothing the agent can run reaches this directory. The
+# startup guard still refuses it inside ASPEN_SANDBOX_WRITE_PATHS or the jail's own
+# writable binds, which are the paths that would make a planted job script possible.
 JOBS_STAGING_ROOT     = Path(
-    os.getenv("ASPEN_JOBS_STAGING_ROOT", str(STATE_DIR / "jobs-staging"))
+    os.getenv("ASPEN_JOBS_STAGING_ROOT", str(WORKSPACE_ROOT / "jobs"))
 ).resolve()
+# Mode for staging directories. 0755 so colleagues can read and copy results out;
+# 0700 if a deployment wants them private to the bot's account.
+JOBS_STAGING_MODE     = int(os.getenv("ASPEN_JOBS_STAGING_MODE", "755"), 8)
 # The pipeline entry point. A NAME resolved on PATH (or an absolute path), never
 # a shell string — the argv is built as a list, so there is no shell to inject
 # into. See jobs.build_submit_argv.
@@ -325,7 +339,10 @@ JOBS_MAX_SUBMITS_PER_DAY = int(os.getenv("ASPEN_JOBS_MAX_SUBMITS_PER_DAY", "10")
 JOBS_CONFIRM_TTL      = int(os.getenv("ASPEN_JOBS_CONFIRM_TTL_SECONDS", "900"))
 # Wall-clock cap on the orchestrator subprocess itself (it only *submits*; it
 # does not wait for jobs to run, so this is generous).
-JOBS_SUBMIT_TIMEOUT   = int(os.getenv("ASPEN_JOBS_SUBMIT_TIMEOUT_SECONDS", "600"))
+# Measured: the pipeline took ~13 minutes to submit ONE structure (it generates
+# ORCA inputs and runs prepare stages before sbatch), which blew straight through
+# the original 600s and reported a successful batch as a timeout.
+JOBS_SUBMIT_TIMEOUT   = int(os.getenv("ASPEN_JOBS_SUBMIT_TIMEOUT_SECONDS", "3600"))
 # Timeout for a single read-only Slurm client call (scontrol/sacct/squeue).
 JOBS_SLURM_TIMEOUT    = int(os.getenv("ASPEN_JOBS_SLURM_TIMEOUT_SECONDS", "30"))
 

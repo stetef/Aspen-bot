@@ -234,7 +234,11 @@ def stage(*, requester_uid: str, thread_ts: str, structures: list, scope: dict,
             n += 1
         dest = sib
     dest.mkdir(parents=True, exist_ok=False)
-    dest.chmod(0o700)
+    for directory in (dest, dest.parent):
+        try:
+            directory.chmod(config.JOBS_STAGING_MODE)
+        except OSError:
+            pass
 
     provenance = {
         "requested_by": requester_uid,
@@ -250,7 +254,7 @@ def stage(*, requester_uid: str, thread_ts: str, structures: list, scope: dict,
         # copy, never symlink: a symlink here would let anything that can write
         # in staging reach back into the calculations root through it.
         shutil.copyfile(src, target)
-        target.chmod(0o600)
+        target.chmod(0o644)
         provenance["structures"].append({
             "name": src.name,
             "source": str(src),
@@ -278,43 +282,82 @@ def new_run_dir(requester_uid: str, thread_ts: str):
             n += 1
         dest = sib
     dest.mkdir(parents=True, exist_ok=False)
-    dest.chmod(0o700)
+    for directory in (dest, dest.parent):
+        try:
+            directory.chmod(config.JOBS_STAGING_MODE)
+        except OSError:
+            pass
     return dest
 
 
 def parse_submitted_jobs(stdout: str, staging_dir: Path) -> list:
-    """Recover the job IDs the pipeline reported, for the ledger.
+    """Recover the job IDs a batch produced, for the ledger.
 
-    The pipeline prints its own submission lines and also writes ``batch-jobs.log``
-    in the output root; the log is the authoritative record, so it is preferred and
-    stdout is the fallback. Anything we cannot attribute is still recorded with the
-    kind left blank rather than dropped — an unattributed row is still cancellable,
-    which is the property that matters.
+    Written against the real ``batch-jobs.log`` after the first live submission
+    recorded **zero** jobs while three were plainly in ``squeue``. Two mistakes, both
+    from guessing at the format instead of reading one:
+
+    1. the ID is written ``job_id=34828248``, and the first version looked for a
+       bare run of digits — so nothing matched, and a submitted batch became
+       uncancellable through Aspen, which is the exact failure the ledger exists to
+       prevent;
+    2. the log holds rows from the ``--no-submit`` pass too, marked ``SKIPPED``.
+       Only ``SUBMITTED`` rows name a real job.
+
+    The format is tab-delimited with ``#`` comments, a header row, and outcome
+    sections appended later by the postprocess stage::
+
+        job_name                             status      job_id
+        prepare-orca                         SUCCEEDED
+        orca-7ymo_cluster1_Zn-interp         SKIPPED
+        orca-7ymo_cluster1_Zn-interp         SUBMITTED   job_id=34828248
+
+    stdout is kept as a fallback for a scheduler wrapper that prints
+    ``Submitted batch job N`` and writes no log.
     """
     found: dict = {}
 
     log_path = staging_dir / "batch-jobs.log"
     if log_path.is_file():
         try:
-            for line in log_path.read_text(errors="replace").splitlines():
-                parts = [p.strip() for p in line.split("\t")]
-                ids = [p for p in parts if p.isdigit()]
-                if not ids:
+            for raw in log_path.read_text(errors="replace").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
                     continue
-                name = next((p for p in parts if p and not p.isdigit()), "")
-                found[ids[0]] = {"job_id": ids[0], "kind": _kind_of(name),
+                parts = [c.strip() for c in raw.split("\t")]
+                if len(parts) < 3:
+                    continue
+                name, status, third = parts[0], parts[1].upper(), parts[2]
+                if status != "SUBMITTED":
+                    continue                      # SKIPPED = the dry-run pass
+                job_id = _job_id_from(third)
+                if not job_id:
+                    continue
+                found[job_id] = {"job_id": job_id, "kind": _kind_of(name),
                                  "job_name": name, "work_dir": str(staging_dir)}
         except OSError:
             log.warning("jobs: could not read %s", log_path, exc_info=True)
 
     for line in (stdout or "").splitlines():
-        # "Submitted batch job 12345"
         parts = line.split()
         if "Submitted" in parts and parts[-1].isdigit():
-            jid = parts[-1]
-            found.setdefault(jid, {"job_id": jid, "kind": _kind_of(line),
-                                   "job_name": "", "work_dir": str(staging_dir)})
+            found.setdefault(parts[-1], {"job_id": parts[-1], "kind": _kind_of(line),
+                                         "job_name": "", "work_dir": str(staging_dir)})
+
+    if not found:
+        # Loud, because the consequence is a job nobody can cancel through Aspen.
+        log.warning("jobs: no job IDs recovered from %s — the batch is not trackable",
+                    log_path)
     return list(found.values())
+
+
+def _job_id_from(field: str) -> str:
+    """``job_id=34828248`` or ``34828248`` -> ``34828248``; anything else -> ''."""
+    candidate = (field or "").strip()
+    if "=" in candidate:
+        candidate = candidate.split("=", 1)[1].strip()
+    candidate = candidate.split(";")[0].strip()      # sbatch --parsable cluster suffix
+    return candidate if re.fullmatch(r"\d+(_\d+)?", candidate) else ""
 
 
 def _kind_of(text: str) -> str:

@@ -222,6 +222,14 @@ def jobs_for_batch(batch_id: str) -> list:
             (batch_id,))]
 
 
+def _backfill_quietly() -> None:
+    """Best-effort recovery on any ledger read. Never raises into a caller."""
+    try:
+        backfill()
+    except Exception:
+        log.debug("jobs: backfill pass failed", exc_info=True)
+
+
 def active_rows(slack_user_id: str = "") -> list:
     """Ledger rows not known to be terminal, joined to their batch.
 
@@ -229,6 +237,7 @@ def active_rows(slack_user_id: str = "") -> list:
     treating unknown as finished would let the caps be walked past by never
     reconciling.
     """
+    _backfill_quietly()
     sql = (
         "SELECT j.*, b.slack_user_id, b.alias, b.project, b.thread_ts, "
         "       b.staging_dir, b.template_mode "
@@ -560,7 +569,14 @@ def resolve_cancellable(requester_uid: str, selector: str = "") -> tuple[list, l
         if not work_dir:
             refused.append((jid, "Slurm reports no WorkDir, so ownership can't be verified"))
             continue
-        if not _within(Path(work_dir), fence):
+        # Against the staging directory recorded for THIS batch as well as the
+        # user's current one. The recorded path is Aspen-derived and was created
+        # under that user's root at submit time, so containment in it is the same
+        # guarantee — and it means relocating the staging root does not orphan jobs
+        # that are already running from the old one.
+        recorded = str(row.get("staging_dir") or "")
+        allowed = [fence] + ([Path(recorded)] if recorded else [])
+        if not any(_within(Path(work_dir), area) for area in allowed):
             # The important refusal: everything else is bookkeeping, this is the
             # one that stops a cancel crossing a person.
             refused.append((jid, "its working directory is outside your own staging area"))
@@ -911,6 +927,18 @@ def commit(*, requester_uid: str, thread_ts: str, token: str) -> dict:
     structures = payload["structures"]
     check_caps(requester_uid, len(structures))     # re-check: time passed
 
+    # The dry run wrote its own batch-jobs.log into this same directory, with
+    # SKIPPED rows and no job IDs. Leaving it means the log describes two runs and
+    # the parse has to guess which rows are live — which is exactly how the first
+    # real submission ended up reporting "0 jobs recorded" for three jobs that had
+    # actually landed. Move it aside so the log describes this run and no other.
+    stale = staging_dir / "batch-jobs.log"
+    if stale.is_file():
+        try:
+            stale.rename(staging_dir / "batch-jobs.dry-run.log")
+        except OSError:
+            log.warning("jobs: could not set aside the dry run's log", exc_info=True)
+
     user = registry.by_id(requester_uid) or {}
     argv = build_submit_argv(staging_dir=staging_dir, out_dir=staging_dir,
                              template_mode=payload["template_mode"], dry_run=False)
@@ -925,9 +953,16 @@ def commit(*, requester_uid: str, thread_ts: str, token: str) -> dict:
     try:
         proc = _run_pipeline(argv, staging_dir)
     except subprocess.TimeoutExpired:
+        # The pipeline may well have submitted before it hung. Recover whatever it
+        # wrote, so the batch is cancellable rather than orphaned.
+        recovered = backfill(batch_id).get("jobs_recovered", 0)
         raise JobsError(
-            f"Submission timed out. Batch {batch_id} may have submitted some jobs — "
-            "check with 'what are my jobs'."
+            f"Submission timed out after {config.JOBS_SUBMIT_TIMEOUT}s "
+            f"(batch {batch_id}). "
+            + (f"{recovered} job(s) had already been submitted and are now tracked — "
+               "you can list or cancel them."
+               if recovered else
+               "No job IDs were found, so nothing appears to have been submitted.")
         ) from None
     except OSError as exc:
         raise JobsError(f"Could not run the pipeline: {exc}") from exc
@@ -960,6 +995,45 @@ def _discard_staging(staging_dir: Path) -> None:
             shutil.rmtree(staging_dir, ignore_errors=True)
     except Exception:
         log.warning("jobs: could not clean up %s", staging_dir, exc_info=True)
+
+
+def backfill_jobs(batch_id: str = "") -> dict:
+    """Re-read staging for batches that recorded no jobs, and record what is there.
+
+    Exists because the first live submission produced three real Slurm jobs and zero
+    ledger rows: the log parser was wrong about the format. A batch in that state is
+    uncancellable through Aspen even though the jobs are running, which is the one
+    outcome the ledger is supposed to make impossible — so recovery has to be
+    possible without hand-editing a database.
+
+    Safe to re-run: rows are inserted with ``INSERT OR IGNORE``, and only batches
+    with **no** jobs are touched, so it can never contradict what is already recorded.
+    """
+    from . import staging
+
+    with connect() as conn:
+        if batch_id:
+            rows = conn.execute("SELECT * FROM batches WHERE batch_id = ?",
+                                (batch_id,)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM batches b WHERE NOT EXISTS "
+                "(SELECT 1 FROM jobs j WHERE j.batch_id = b.batch_id)").fetchall()
+
+    repaired, still_empty = [], []
+    for row in (dict(r) for r in rows):
+        staging_dir = Path(row["staging_dir"])
+        if not staging_dir.is_dir():
+            still_empty.append((row["batch_id"], "staging directory is gone"))
+            continue
+        entries = staging.parse_submitted_jobs("", staging_dir)
+        if not entries:
+            still_empty.append((row["batch_id"], "no job IDs in batch-jobs.log"))
+            continue
+        n = record_jobs(row["batch_id"], entries)
+        repaired.append((row["batch_id"], n))
+        log.info("jobs: backfilled %d job(s) for batch %s", n, row["batch_id"])
+    return {"repaired": repaired, "still_empty": still_empty}
 
 
 def prune_staging(max_age_hours: float = 48.0) -> dict:
@@ -1007,6 +1081,43 @@ def prune_staging(max_age_hours: float = 48.0) -> dict:
     if removed:
         log.info("jobs: pruned %d abandoned staging dir(s), %.1f MB", removed, freed / 1e6)
     return {"removed": removed, "kept": kept, "bytes": freed}
+
+
+def backfill(batch_id: str = "") -> dict:
+    """Recover job IDs the submission step failed to capture.
+
+    The pipeline writes ``batch-jobs.log`` as it submits, so the IDs exist on disk
+    even when Aspen never read them — because the subprocess timed out, or the parse
+    ran against a half-written file, or the process died between sbatch and the
+    ledger write. Without this, that batch is permanently invisible: not listed, not
+    cancellable, not attributable, while its jobs burn real compute.
+
+    Self-healing rather than a repair tool: called automatically wherever the ledger
+    is read, so the gap closes on its own instead of waiting for someone to notice.
+    """
+    from . import staging as staging_mod
+
+    with connect() as conn:
+        sql = ("SELECT b.batch_id, b.staging_dir FROM batches b "
+               "LEFT JOIN jobs j ON j.batch_id = b.batch_id "
+               "WHERE j.job_id IS NULL")
+        params = []
+        if batch_id:
+            sql += " AND b.batch_id = ?"
+            params.append(batch_id)
+        empty = [dict(r) for r in conn.execute(sql, params)]
+
+    found = 0
+    for row in empty:
+        staging_dir = Path(row["staging_dir"])
+        if not staging_dir.is_dir():
+            continue
+        entries = staging_mod.parse_submitted_jobs("", staging_dir)
+        if entries:
+            found += record_jobs(row["batch_id"], entries)
+            log.info("jobs: backfilled %d job id(s) for batch %s from %s",
+                     len(entries), row["batch_id"], staging_dir / "batch-jobs.log")
+    return {"batches_checked": len(empty), "jobs_recovered": found}
 
 
 def _project_of(rel: str) -> str:

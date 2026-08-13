@@ -48,7 +48,6 @@ def _check_state_locations() -> None:
                           ("telemetry log", config.TELEMETRY_DIR),
                           ("telemetry switch", config.TELEMETRY_STATE_FILE),
                           ("job ledger", config.JOBS_LEDGER),
-                          ("job staging root", config.JOBS_STAGING_ROOT),
                           ("template library", config.TEMPLATES_ROOT),
                           ("template history", config.TEMPLATES_HISTORY_ROOT),
                           ("runner library", config.RUNNERS_ROOT),
@@ -64,6 +63,22 @@ def _check_state_locations() -> None:
                     "path outside WORKSPACE_ROOT and ASPEN_SANDBOX_WRITE_PATHS."
                 )
 
+    # Job staging is deliberately NOT held to the blanket "outside WORKSPACE_ROOT"
+    # rule above. It holds results, which are worthless if nobody can read them, and
+    # the workspace is the natural home for what Aspen produces. What must still be
+    # true is that no agent-writable surface reaches it — otherwise generated code
+    # could plant a job script — so it is checked against the sandbox's writable
+    # paths and the jail's own read-write binds instead.
+    jail_writable = [config.WORKSPACE_ROOT / "figures", config.WORKSPACE_ROOT / "cache"]
+    for area in [Path(p).expanduser() for p in config.SANDBOX_WRITE_PATHS] + jail_writable:
+        if _under(config.JOBS_STAGING_ROOT, area) or _under(area, config.JOBS_STAGING_ROOT):
+            raise SystemExit(
+                f"FATAL: job staging ({config.JOBS_STAGING_ROOT}) overlaps a path the "
+                f"agent can write ({area}). Generated analysis code could plant a job "
+                "script there and Aspen would submit it. Set ASPEN_JOBS_STAGING_ROOT "
+                "elsewhere under WORKSPACE_ROOT."
+            )
+
     # 0700 against other users on the shared login node. The CLI does the same at
     # its own creation points, since it usually runs before the bot ever starts.
     registry.ensure_private_dir(config.STATE_DIR)
@@ -71,7 +86,8 @@ def _check_state_locations() -> None:
     if config.TELEMETRY_ENABLED:
         registry.ensure_private_dir(config.TELEMETRY_DIR)
     if config.JOBS_SUBMIT_ENABLED:
-        registry.ensure_private_dir(config.JOBS_STAGING_ROOT)
+        config.JOBS_STAGING_ROOT.mkdir(parents=True, exist_ok=True)
+        config.JOBS_STAGING_ROOT.chmod(config.JOBS_STAGING_MODE)
 
     _check_calculations_roots()
     _check_jobs_staging()

@@ -47,10 +47,10 @@ def test_a_sane_layout_starts(sut, boot):
 @pytest.mark.parametrize("name", [
     "USERS_FILE", "WORKFLOWS_ROOT", "METADATA_ROOT", "METADATA_HISTORY_ROOT",
     "REQUESTS_FILE", "TELEMETRY_DIR", "TELEMETRY_STATE_FILE",
-    # The job ledger decides who may cancel what, and the staging tree holds the
-    # files a job actually executes. Sandbox-writable, they are a forgeable cancel
-    # and a plantable job body respectively.
-    "JOBS_LEDGER", "JOBS_STAGING_ROOT",
+    # The job ledger decides who may cancel what, so a sandbox-writable one is a
+    # forgeable cancel. Staging is deliberately NOT here — it holds results and is
+    # meant to be readable; its narrower rule is tested below.
+    "JOBS_LEDGER",
 ])
 def test_state_inside_the_workspace_is_fatal(sut, boot, monkeypatch, name):
     """Every one of these is writable by generated analysis code if misplaced."""
@@ -190,8 +190,40 @@ def test_the_staging_guard_runs_as_part_of_the_startup_check(sut, boot, monkeypa
         sut._check_state_locations()
 
 
-def test_the_staging_directory_is_made_private(sut, boot, monkeypatch):
-    """0700: staged inputs and generated job scripts are not other accounts' business."""
+def test_staging_is_readable_so_results_can_be_collected(sut, boot, monkeypatch):
+    """Deliberately NOT private, unlike everything else this guard covers.
+
+    Staging holds a run's outputs — the ORCA .out, the optimised geometry — which
+    are the point of submitting it. The first real submission left them where only
+    the bot's account could read, so neither the user nor Aspen could get them back.
+    It lives under WORKSPACE_ROOT and is world-readable for that reason.
+    """
     monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", True)
-    sut._check_state_locations()
-    assert (sut.JOBS_STAGING_ROOT.stat().st_mode & 0o777) == 0o700
+    monkeypatch.setattr(sut, "JOBS_STAGING_ROOT", sut.WORKSPACE_ROOT / "jobs")
+    sut._check_state_locations()          # must NOT raise, though it is in the workspace
+    assert sut.JOBS_STAGING_ROOT.stat().st_mode & 0o005
+
+
+@pytest.mark.parametrize("area", ["figures", "cache"])
+def test_staging_inside_the_jails_writable_binds_is_fatal(sut, boot, monkeypatch, area):
+    """The narrower rule that replaced "staging must be outside the workspace".
+
+    What matters is that no agent-writable surface reaches staging — otherwise
+    generated analysis code plants a script and Aspen submits it. The jail
+    bind-mounts only figures/ and cache/ read-write, so those are what to refuse.
+    """
+    monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", True)
+    monkeypatch.setattr(sut, "JOBS_STAGING_ROOT", sut.WORKSPACE_ROOT / area / "jobs")
+    with pytest.raises(SystemExit) as exit_info:
+        sut._check_state_locations()
+    assert "the agent can write" in str(exit_info.value)
+
+
+def test_staging_inside_a_sandbox_write_path_is_fatal(sut, boot, monkeypatch):
+    monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", True)
+    scratch = boot.tmp / "sandbox-scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(sut, "SANDBOX_WRITE_PATHS", [str(scratch)], raising=False)
+    monkeypatch.setattr(sut, "JOBS_STAGING_ROOT", scratch / "jobs")
+    with pytest.raises(SystemExit):
+        sut._check_state_locations()

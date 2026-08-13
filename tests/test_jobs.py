@@ -609,3 +609,217 @@ def test_no_pipeline_bin_dir_leaves_path_alone(sut, monkeypatch):
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     monkeypatch.setattr(sut, "JOBS_PIPELINE_PATH_DIR", "", raising=False)
     assert sut.jobs.submit_env()["PATH"] == "/usr/bin:/bin"
+
+
+# --------------------------------------------------------------------------- #
+# Recovering job IDs from the pipeline's log
+#
+# Written from the REAL batch-jobs.log after the first live submission recorded
+# zero jobs while three sat in squeue. Both mistakes came from guessing the
+# format instead of reading one, and the consequence was the exact failure the
+# ledger exists to prevent: a running batch nobody could cancel through Aspen.
+# --------------------------------------------------------------------------- #
+REAL_BATCH_LOG = """\
+# Helpful Slurm debug commands (replace <JOB_ID>)
+# queue status:
+#   squeue -j <JOB_ID>
+#
+# The 'status' column is the SUBMISSION result (SUBMITTED = the scheduler
+# accepted the job), NOT the computational outcome.
+
+job_name\tstatus\tjob_id
+prepare-orca\tSUCCEEDED
+orca-7ymo_cluster1_Zn-interp\tSKIPPED
+corvus-xas-7ymo_cluster1_Zn-interp\tSKIPPED
+postprocess-1786640140.843819\tSKIPPED
+prepare-orca\tSUCCEEDED
+orca-7ymo_cluster1_Zn-interp\tSUBMITTED\tjob_id=34828248
+corvus-xas-7ymo_cluster1_Zn-interp\tSUBMITTED\tjob_id=34828249
+postprocess-1786640140.843819\tSUBMITTED\tjob_id=34828250
+# --- ORCA outcomes (appended by postprocess) ---
+7ymo_cluster1_Zn\tCONVERGED\t-
+"""
+
+
+def test_job_ids_are_recovered_from_the_real_log_format(sut, tmp_path):
+    """The IDs are written `job_id=34828248`, not as a bare number."""
+    (tmp_path / "batch-jobs.log").write_text(REAL_BATCH_LOG)
+    got = sut.staging.parse_submitted_jobs("", tmp_path)
+    by_id = {g["job_id"]: g for g in got}
+    assert set(by_id) == {"34828248", "34828249", "34828250"}
+    assert by_id["34828248"]["kind"] == "orca"
+    assert by_id["34828249"]["kind"] == "corvus"
+    assert by_id["34828250"]["kind"] == "postprocess"
+
+
+def test_the_dry_run_pass_is_not_mistaken_for_a_submission(sut, tmp_path):
+    """The same log holds SKIPPED rows from --no-submit. Only SUBMITTED counts."""
+    (tmp_path / "batch-jobs.log").write_text(REAL_BATCH_LOG)
+    got = sut.staging.parse_submitted_jobs("", tmp_path)
+    assert len(got) == 3, "SKIPPED and SUCCEEDED rows must not become jobs"
+
+
+def test_the_header_and_outcome_rows_are_not_jobs(sut, tmp_path):
+    (tmp_path / "batch-jobs.log").write_text(REAL_BATCH_LOG)
+    got = sut.staging.parse_submitted_jobs("", tmp_path)
+    assert all(g["job_id"].isdigit() for g in got)
+    assert not any(g["job_name"] == "job_name" for g in got)
+
+
+@pytest.mark.parametrize("field,expected", [
+    ("job_id=34828248", "34828248"),
+    ("34828248", "34828248"),
+    ("34828248;cluster", "34828248"),
+    ("job_id=12345_7", "12345_7"),
+    ("job_id=", ""), ("none", ""), ("", ""), ("job_id=abc", ""),
+])
+def test_job_id_extraction(sut, field, expected):
+    assert sut.staging._job_id_from(field) == expected
+
+
+def test_stdout_is_still_a_fallback(sut, tmp_path):
+    """For a wrapper that prints and writes no log."""
+    got = sut.staging.parse_submitted_jobs("Submitted batch job 999111\n", tmp_path)
+    assert [g["job_id"] for g in got] == ["999111"]
+
+
+def test_backfill_recovers_a_batch_that_recorded_nothing(sut, jobs_env, tmp_path):
+    """Recovery must not require hand-editing the ledger.
+
+    A batch with jobs running and no rows is uncancellable through Aspen, which is
+    precisely what the ledger is for — so there has to be a way back.
+    """
+    staging_dir = sut.jobs.staging_dir_for("U0SAM", "1723480000.9")
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    (staging_dir / "batch-jobs.log").write_text(REAL_BATCH_LOG)
+    batch = sut.jobs.record_batch(
+        slack_user_id="U0SAM", alias="sam", thread_ts="1723480000.9", project="p",
+        owner_scope="sam", template_mode="interp", staging_dir=staging_dir,
+        structures=1, argv=["xas-run-batch"])
+    assert sut.jobs.jobs_for_batch(batch) == []
+
+    result = sut.jobs.backfill_jobs()
+    assert (batch, 3) in result["repaired"]
+    assert len(sut.jobs.jobs_for_batch(batch)) == 3
+
+    # Idempotent, and it never contradicts what is already recorded.
+    again = sut.jobs.backfill_jobs()
+    assert not any(b == batch for b, _ in again["repaired"])
+
+
+def test_backfill_reports_what_it_could_not_fix(sut, jobs_env):
+    staging_dir = sut.jobs.staging_dir_for("U0SAM", "1723480000.8")
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    batch = sut.jobs.record_batch(
+        slack_user_id="U0SAM", alias="sam", thread_ts="1723480000.8", project="p",
+        owner_scope="sam", template_mode="interp", staging_dir=staging_dir,
+        structures=1, argv=["x"])
+    result = sut.jobs.backfill_jobs()
+    assert any(b == batch and "no job IDs" in why for b, why in result["still_empty"])
+
+
+# --------------------------------------------------------------------------- #
+# Recovering job IDs the submission step missed
+#
+# From the first real submission: three jobs landed, the commit reported "0
+# recorded", and the batch was left invisible — not listable, not cancellable —
+# while its jobs burned real compute. The pipeline had written the IDs to
+# batch-jobs.log; Aspen just never read them back.
+# --------------------------------------------------------------------------- #
+REAL_LOG = """\
+# Helpful Slurm debug commands (replace <JOB_ID>)
+
+job_name\tstatus\tjob_id
+prepare-orca\tSUCCEEDED
+orca-7ymo_cluster1_Zn-interp\tSKIPPED
+corvus-xas-7ymo_cluster1_Zn-interp\tSKIPPED
+postprocess-1786640140.843819\tSKIPPED
+prepare-orca\tSUCCEEDED
+orca-7ymo_cluster1_Zn-interp\tSUBMITTED\tjob_id=34828248
+corvus-xas-7ymo_cluster1_Zn-interp\tSUBMITTED\tjob_id=34828249
+postprocess-1786640140.843819\tSUBMITTED\tjob_id=34828250
+orca-7ymo_cluster1_Zn-interp\tOK
+"""
+
+
+def test_the_parser_ignores_dry_run_rows_and_reads_the_real_ones(sut, jobs_env):
+    """Verbatim from the first real submission's batch-jobs.log.
+
+    The dry run and the commit shared a staging directory, so the log held both:
+    SKIPPED rows with no ID, then SUBMITTED rows with one. Only the latter are jobs.
+    """
+    staging = sut.JOBS_STAGING_ROOT / "probe"
+    staging.mkdir(parents=True)
+    (staging / "batch-jobs.log").write_text(REAL_LOG)
+    entries = sut.staging.parse_submitted_jobs("", staging)
+    assert sorted(e["job_id"] for e in entries) == ["34828248", "34828249", "34828250"]
+    assert {e["kind"] for e in entries} == {"orca", "corvus", "postprocess"}
+
+
+def test_backfill_recovers_a_batch_whose_ids_were_never_captured(sut, jobs_env):
+    staging = sut.jobs.staging_dir_for("U0SAM", "1723480000.1")
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "batch-jobs.log").write_text(REAL_LOG)
+    batch = sut.jobs.record_batch(
+        slack_user_id="U0SAM", alias="sam", thread_ts="1723480000.1", project="p",
+        owner_scope="sam", template_mode="interp", staging_dir=staging,
+        structures=1, argv=["xas-run-batch"])
+    assert sut.jobs.jobs_for_batch(batch) == [], "the failure being reproduced"
+
+    result = sut.jobs.backfill()
+    assert result["jobs_recovered"] == 3
+    assert len(sut.jobs.jobs_for_batch(batch)) == 3
+
+
+def test_reading_the_ledger_backfills_on_its_own(sut, jobs_env):
+    """Self-healing, so the gap closes without anyone noticing it first."""
+    staging = sut.jobs.staging_dir_for("U0SAM", "1723480000.9")
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "batch-jobs.log").write_text(REAL_LOG)
+    sut.jobs.record_batch(
+        slack_user_id="U0SAM", alias="sam", thread_ts="1723480000.9", project="p",
+        owner_scope="sam", template_mode="interp", staging_dir=staging,
+        structures=1, argv=["x"])
+    assert len(sut.jobs.active_rows("U0SAM")) == 3
+
+
+def test_a_batch_with_no_log_is_left_alone(sut, jobs_env):
+    """Nothing to recover is not an error, and must not invent rows."""
+    staging = sut.jobs.staging_dir_for("U0SAM", "1723480001.1")
+    staging.mkdir(parents=True, exist_ok=True)
+    sut.jobs.record_batch(
+        slack_user_id="U0SAM", alias="sam", thread_ts="1723480001.1", project="p",
+        owner_scope="sam", template_mode="interp", staging_dir=staging,
+        structures=1, argv=["x"])
+    assert sut.jobs.backfill()["jobs_recovered"] == 0
+
+
+def test_staging_is_readable_so_results_can_be_collected(sut, jobs_env):
+    """The outputs are the point of the run; nobody could read them before."""
+    files, scope = sut.staging.collect_structures("thermolysin/structures", "", "U0SAM")
+    dest = sut.staging.stage(
+        requester_uid="U0SAM", thread_ts="1723480002.1", structures=files,
+        scope=scope, template_mode="ca-fixed", source_rel="thermolysin/structures")
+    assert dest.stat().st_mode & 0o005, "a colleague must be able to enter it"
+    assert (dest / "a.xyz").stat().st_mode & 0o004, "and read what is in it"
+
+
+def test_a_running_jobs_fence_survives_moving_the_staging_root(sut, jobs_env, monkeypatch):
+    """Relocating staging must not orphan jobs already running from the old path."""
+    old_root = sut.JOBS_STAGING_ROOT / "old-location"
+    staging = old_root / "sam__U0SAM" / "1723480003.1"
+    staging.mkdir(parents=True)
+    batch = sut.jobs.record_batch(
+        slack_user_id="U0SAM", alias="sam", thread_ts="1723480003.1", project="p",
+        owner_scope="sam", template_mode="interp", staging_dir=staging,
+        structures=1, argv=["x"])
+    sut.jobs.record_jobs(batch, [{"job_id": "5150", "kind": "orca",
+                                  "work_dir": str(staging)}])
+
+    monkeypatch.setattr(sut.jobs, "whoami", lambda: "botuser")
+    monkeypatch.setattr(sut.jobs, "scontrol_job", lambda jid: {
+        "UserId": "botuser(1)", "WorkDir": str(staging), "JobState": "RUNNING"})
+    approved, refused = sut.jobs.resolve_cancellable("U0SAM", "5150")
+    assert [r["job_id"] for r in approved] == ["5150"], (
+        "the batch's own recorded staging dir is as good a fence as the current root"
+    )
