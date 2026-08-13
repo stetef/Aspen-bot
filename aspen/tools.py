@@ -1214,6 +1214,9 @@ TOOL_SPECS = [
                 "owner": _OWNER_PROPERTY,
                 "template_mode": {
                     "type": "string",
+                    # Filled in by active_specs() from what the pipeline currently
+                    # offers — see below. This literal is only the import-time
+                    # fallback for a deployment whose pipeline cannot be reached.
                     "enum": sorted(staging.TEMPLATE_MODES),
                     "description": (
                         "Which ORCA template to use. 'ca-fixed' is the default. Ask the "
@@ -1455,9 +1458,49 @@ def active_specs(allow_jobs: bool = True) -> list[dict]:
     withholding conditions are session state and one is config — belt and braces
     is cheap here and the failure would be expensive.
     """
-    if allow_jobs and config.JOBS_SUBMIT_ENABLED:
-        return list(TOOL_SPECS)
-    return [s for s in TOOL_SPECS if s["name"] not in JOB_TOOLS]
+    if not (allow_jobs and config.JOBS_SUBMIT_ENABLED):
+        return [s for s in TOOL_SPECS if s["name"] not in JOB_TOOLS]
+
+    specs = list(TOOL_SPECS)
+    _refresh_template_modes(specs)
+    return specs
+
+
+def _refresh_template_modes(specs: list) -> None:
+    """Advertise the template modes the pipeline actually has, not a frozen copy.
+
+    Done here — at session build — rather than at import, for two reasons: it needs a
+    subprocess (``xas-run-batch --help``) which has no business running when the
+    package is merely imported, and doing it per session means a mode added upstream
+    appears on the next new thread instead of needing a bot restart.
+
+    This matters because the failure it fixes was silent and pointed the wrong way:
+    the pipeline gained ``--interp``, Aspen kept validating against its own copy, and
+    told the user the mode they had just written did not exist.
+    """
+    try:
+        modes = sorted(staging.available_modes())
+    except Exception:
+        log.warning("tools: could not read the pipeline's template modes", exc_info=True)
+        return
+    if not modes:
+        return
+    for i, spec in enumerate(specs):
+        if spec["name"] != "submit_orca_batch":
+            continue
+        props = spec["input_schema"]["properties"]
+        if props.get("template_mode", {}).get("enum") == modes:
+            return
+        # Copy rather than mutate: TOOL_SPECS is module-level shared state, and a
+        # session must not rewrite what another session is about to read.
+        fresh = dict(spec)
+        fresh["input_schema"] = dict(spec["input_schema"])
+        fresh["input_schema"]["properties"] = dict(props)
+        fresh["input_schema"]["properties"]["template_mode"] = {
+            **props.get("template_mode", {}), "enum": modes,
+        }
+        specs[i] = fresh
+        return
 
 
 def dispatch(name: str, tool_input: dict, context: dict) -> str:

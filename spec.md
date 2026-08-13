@@ -1173,11 +1173,22 @@ execution as the bot's Unix user on a compute node, outside every jail — and
 
 ### 19.3 Staging: the model never authors a job
 
-`submit_orca_batch` takes a `template_mode` from a **fixed enum** (`ca-fixed`, `h-only`,
-`single-point`, `free`, `backbone`, `xtb-free`, `xtb-constrained`, `quick`,
-`quick-ca-fixed` — mirroring the pipeline's mutually-exclusive mode flags), a structure
-path resolved through `roots.resolve` like every other path-taking tool, and nothing else
-that reaches a command line.
+`submit_orca_batch` takes a `template_mode` from a **closed set**, a structure path
+resolved through `roots.resolve` like every other path-taking tool, and nothing else that
+reaches a command line.
+
+Closed, but **not a frozen copy**. The first version hardcoded the pipeline's
+mutually-exclusive mode flags; the pipeline then gained `--interp` and Aspen went on
+validating against its own list, telling the user that a mode they had just written did
+not exist. That is the two-sources-of-truth desync this design rejects everywhere else
+(§7 declines an index file for exactly this reason), and it failed in the worst
+direction — silently, and against the user who was right. So `staging.available_modes()`
+asks the pipeline (`xas-run-batch --help`, whose mode flags are the ones described as
+"…ORCA template…"), caches it briefly, and falls back to a curated list only when the
+pipeline cannot be reached. The tool schema is refreshed per session from the same
+source, so a mode added upstream is offered on the next new thread rather than after a
+restart. The set stays closed because the *flag* still comes from the discovered map,
+never from the string the model passed.
 
 It takes **no script path and no script content.** This is the load-bearing difference from
 the §18.2 sketch, which said only that a script path must resolve inside a staging

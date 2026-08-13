@@ -97,8 +97,8 @@ def test_template_mode_is_a_closed_enum(sut, jobs_env):
             sut.staging.mode_flag(bad)
         assert "Unknown template mode" in str(exc.value)
 
-    # Every advertised mode maps to a flag the pipeline actually has.
-    for mode in sut.staging.TEMPLATE_MODES:
+    # Every advertised mode maps to a flag, and only the default maps to none.
+    for mode in sut.staging.available_modes():
         flag = sut.staging.mode_flag(mode)
         assert flag == "" or flag.startswith("--")
 
@@ -115,11 +115,59 @@ def test_submit_argv_contains_only_derived_values(sut, jobs_env, tmp_path):
     assert not any("wrap" in a for a in argv)
 
 
-def test_the_enum_matches_the_tool_schema(sut):
-    """The schema's enum and the implementation's map cannot drift apart."""
-    spec = next(s for s in sut.TOOL_SPECS if s["name"] == "submit_orca_batch")
-    assert (set(spec["input_schema"]["properties"]["template_mode"]["enum"])
-            == set(sut.staging.TEMPLATE_MODES))
+def test_the_advertised_modes_come_from_the_pipeline_not_a_copy(sut, monkeypatch):
+    """The bug this replaces: Aspen refused a mode the user had just added.
+
+    The mode table was a frozen copy of the pipeline's flags. The pipeline gained
+    ``--interp`` and Aspen went on validating against its own list, reporting a real
+    mode as nonexistent — silently, and against the user who was right. So the
+    pipeline is now asked, and the tool schema is refreshed per session from that.
+    """
+    monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", True)
+    sut.staging.invalidate_modes()
+    monkeypatch.setattr(sut.staging, "discover_modes",
+                        lambda: {"ca-fixed": "", "brand-new": "--brand-new"})
+
+    assert sut.staging.mode_flag("brand-new") == "--brand-new"
+    spec = next(s for s in sut.tools.active_specs(True)
+                if s["name"] == "submit_orca_batch")
+    assert "brand-new" in spec["input_schema"]["properties"]["template_mode"]["enum"]
+    sut.staging.invalidate_modes()
+
+
+def test_a_mode_the_pipeline_does_not_have_is_still_refused(sut, monkeypatch):
+    """Closed against the pipeline's real flags, rather than against a copy."""
+    sut.staging.invalidate_modes()
+    monkeypatch.setattr(sut.staging, "discover_modes",
+                        lambda: {"ca-fixed": "", "quick": "--quick"})
+    with pytest.raises(sut.jobs.JobsError) as exc:
+        sut.staging.mode_flag("h-only")
+    assert "currently offers" in str(exc.value)
+    sut.staging.invalidate_modes()
+
+
+def test_falling_back_to_the_curated_list_when_the_pipeline_is_unreachable(sut, monkeypatch):
+    """Tests and an offline deployment still work; the list may just be stale."""
+    sut.staging.invalidate_modes()
+    monkeypatch.setattr(sut.staging, "discover_modes", lambda: None)
+    modes = sut.staging.available_modes()
+    assert set(modes) == set(sut.staging.TEMPLATE_MODES)
+    assert modes["ca-fixed"] == ""
+    sut.staging.invalidate_modes()
+
+
+def test_refreshing_the_schema_does_not_mutate_shared_state(sut, monkeypatch):
+    """TOOL_SPECS is module-level; one session must not rewrite another's view."""
+    monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", True)
+    sut.staging.invalidate_modes()
+    monkeypatch.setattr(sut.staging, "discover_modes",
+                        lambda: {"ca-fixed": "", "zzz-new": "--zzz-new"})
+    before = next(s for s in sut.TOOL_SPECS if s["name"] == "submit_orca_batch")
+    before_enum = list(before["input_schema"]["properties"]["template_mode"]["enum"])
+    sut.tools.active_specs(True)
+    after = next(s for s in sut.TOOL_SPECS if s["name"] == "submit_orca_batch")
+    assert after["input_schema"]["properties"]["template_mode"]["enum"] == before_enum
+    sut.staging.invalidate_modes()
 
 
 # --------------------------------------------------------------------------- #
@@ -261,15 +309,21 @@ def test_dry_run_submits_nothing_and_issues_a_single_use_token(sut, jobs_env, mo
 
     def fake_run(argv, **kw):
         calls.append(argv)
+        # `--help` is the mode-discovery probe (staging.discover_modes), not a
+        # submission. Answer it so discovery succeeds, and count it separately.
+        if "--help" in argv:
+            return FakeProc(stdout="  --quick    Use quick ORCA template\n")
         return FakeProc(stdout="would submit 2\n")
 
     monkeypatch.setattr(sut.jobs.subprocess, "run", fake_run)
+    sut.staging.invalidate_modes()
     result = sut.jobs.dry_run(
         requester_uid="U0SAM", thread_ts="1723480000.1",
         rel="thermolysin/structures", owner="", template_mode="ca-fixed",
     )
 
-    assert len(calls) == 1 and "--no-submit" in calls[0]
+    submissions = [c for c in calls if "--help" not in c]
+    assert len(submissions) == 1 and "--no-submit" in submissions[0]
     assert result["token"]
     # Nothing recorded: a dry run is not a submission.
     assert sut.jobs.batches_for("U0SAM") == []

@@ -23,31 +23,130 @@ absolute invariant that Aspen writes nothing inside any calculations root.
 import hashlib
 import json
 import logging
+import re
 import shutil
+import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from . import config, jobs, roots
 
 log = logging.getLogger("aspen")
 
-# The pipeline's mutually-exclusive ORCA template flags, as a closed map.
+# The pipeline's ORCA template modes.
 #
-# A dict rather than a passthrough because the *only* thing the model contributes
-# to the argv is a key of this mapping — an unknown key is refused rather than
-# forwarded, so no wording in a conversation can reach the command line. The empty
-# string is the pipeline's default (CA-fixed, no flag).
-TEMPLATE_MODES = {
-    "ca-fixed":        "",
-    "h-only":          "--H",
-    "single-point":    "--single",
-    "free":            "--free",
-    "backbone":        "--backbone",
-    "xtb-free":        "--xtb-free",
-    "xtb-constrained": "--xtb-constrained",
-    "quick":           "--quick",
-    "quick-ca-fixed":  "--quick-ca-fixed",
+# A closed map, because the *only* thing the model contributes to the argv is a key
+# of it — an unknown key is refused rather than forwarded, so no wording in a
+# conversation can reach the command line.
+#
+# But it must not be a FROZEN COPY of the pipeline's flags, which is what it was
+# first written as. The pipeline gained `--interp` and Aspen went on refusing it,
+# reporting a mode the user had just added as one that did not exist. That is the
+# two-sources-of-truth desync the design avoids everywhere else (spec §7 rejects an
+# index file for exactly this reason), and it fails in the worst direction: silently,
+# and against the user who is right.
+#
+# So this table now supplies only the *names* — which are friendlier than the raw
+# flags (`h-only` for `--H`) and are what the tool schema advertises — while the set
+# of modes that actually exist is read from the pipeline itself. A flag the pipeline
+# stops advertising drops out; one it adds appears under a name derived from the flag.
+_CURATED_NAMES = {
+    "":                 "ca-fixed",       # the pipeline's default: no flag at all
+    "--H":              "h-only",
+    "--single":         "single-point",
+    "--free":           "free",
+    "--backbone":       "backbone",
+    "--xtb-free":       "xtb-free",
+    "--xtb-constrained": "xtb-constrained",
+    "--quick":          "quick",
+    "--quick-ca-fixed": "quick-ca-fixed",
+    "--interp":         "interp",
 }
+
+# Every mode flag in the pipeline's help is described as "…ORCA template…", which is
+# how they are told apart from --scheduler, --out-dir, --skip-* and the rest.
+_MODE_HELP_MARKER = "orca template"
+_MODE_FLAG_RE = re.compile(r"^\s+(--[A-Za-z][A-Za-z0-9-]*)\s\s+(.*)$")
+
+# Cached for the life of the process, with a TTL so a pipeline update is picked up
+# without restarting the bot.
+_MODE_CACHE: dict = {"at": 0.0, "modes": None}
+_MODE_TTL_SECONDS = 300
+
+
+def discover_modes() -> Optional[dict]:
+    """Ask the pipeline which template modes it has. ``None`` if it cannot be asked.
+
+    Parses ``--help`` rather than importing the package, because the pipeline lives
+    in its own virtualenv — the bot cannot import it, and shelling out to the entry
+    point is exactly how it will be invoked anyway.
+    """
+    from . import jobs
+
+    bin_name = config.JOBS_PIPELINE_BIN
+    try:
+        proc = subprocess.run([bin_name, "--help"], capture_output=True, text=True,
+                              timeout=30, check=False, env=jobs.submit_env())
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.debug("staging: could not ask %s for its modes (%s)", bin_name, exc)
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+
+    found = {}
+    for line in proc.stdout.splitlines():
+        match = _MODE_FLAG_RE.match(line)
+        if not match:
+            continue
+        flag, description = match.group(1), match.group(2).lower()
+        if _MODE_HELP_MARKER in description:
+            name = _CURATED_NAMES.get(flag) or flag.lstrip("-").lower()
+            found[name] = flag
+    if not found:
+        return None
+    # The default (no flag) always exists; the pipeline cannot advertise it.
+    found[_CURATED_NAMES[""]] = ""
+    return found
+
+
+def available_modes() -> dict:
+    """``{name: flag}`` for the modes that exist right now.
+
+    Falls back to the curated names when the pipeline cannot be reached, so tests
+    and an offline deployment still work — with the caveat that a fallback list can
+    be stale, which is why the drift is logged when it is visible.
+    """
+    now = time.monotonic()
+    cached = _MODE_CACHE.get("modes")
+    if cached is not None and now - _MODE_CACHE["at"] < _MODE_TTL_SECONDS:
+        return cached
+
+    discovered = discover_modes()
+    if discovered is None:
+        modes = {name: flag for flag, name in _CURATED_NAMES.items()}
+    else:
+        modes = discovered
+        curated = {name for flag, name in _CURATED_NAMES.items()}
+        added, gone = set(modes) - curated, curated - set(modes)
+        if added:
+            log.info("staging: pipeline offers new template mode(s): %s",
+                     ", ".join(sorted(added)))
+        if gone:
+            log.info("staging: pipeline no longer offers: %s", ", ".join(sorted(gone)))
+
+    _MODE_CACHE.update(at=now, modes=modes)
+    return modes
+
+
+def invalidate_modes() -> None:
+    """Drop the cache — used by tests, and after a pipeline upgrade."""
+    _MODE_CACHE.update(at=0.0, modes=None)
+
+
+# Kept as a name for the curated fallback, since callers and tests refer to it.
+TEMPLATE_MODES = {name: flag for flag, name in _CURATED_NAMES.items()}
 
 MAX_XYZ_BYTES = 5 * 1024 * 1024     # a structure file is kilobytes; this is slack
 
@@ -59,17 +158,21 @@ class StagingError(jobs.JobsError):
 def mode_flag(template_mode: str) -> str:
     """Map a mode name to its pipeline flag, or refuse.
 
-    The refusal names the alternatives, because the model picking a plausible-but-
-    wrong mode name is a likely and harmless mistake, while silently defaulting
-    would run a different calculation than the user asked for.
+    Validated against what the pipeline currently offers, not against a copy — so a
+    mode added upstream works immediately, and the refusal below never again tells a
+    user that something they just built does not exist.
+
+    Still closed: the returned flag comes from the discovered map, never from the
+    string the model passed, so nothing in a conversation can reach the argv.
     """
+    modes = available_modes()
     key = (template_mode or "ca-fixed").strip().lower()
-    if key not in TEMPLATE_MODES:
+    if key not in modes:
         raise StagingError(
-            f"Unknown template mode {template_mode!r}. Choose one of: "
-            + ", ".join(sorted(TEMPLATE_MODES))
+            f"Unknown template mode {template_mode!r}. The pipeline currently offers: "
+            + ", ".join(sorted(modes))
         )
-    return TEMPLATE_MODES[key]
+    return modes[key]
 
 
 def _sha256(path: Path) -> str:
