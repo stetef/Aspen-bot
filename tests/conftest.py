@@ -47,6 +47,7 @@ _MODMAP = {
     "JOBS_LEDGER": "aspen.config",
     "JOBS_STAGING_ROOT": "aspen.config",
     "JOBS_PIPELINE_BIN": "aspen.config",
+    "JOBS_PIPELINE_PATH_DIR": "aspen.config",
     "JOBS_SCHEDULER": "aspen.config",
     "JOBS_MAX_STRUCTURES": "aspen.config",
     "JOBS_MAX_ACTIVE_PER_USER": "aspen.config",

@@ -369,6 +369,14 @@ def submit_env() -> dict:
         if re.search(r"(TOKEN|SECRET|PASSWORD|APIKEY|API_KEY|CREDENTIAL)", key, re.I):
             env.pop(key, None)
 
+    # Put the pipeline on the PATH the job will actually run with. subprocess
+    # resolves an unqualified program name against the PATH in the env it is
+    # handed (verified, not assumed), so this both finds the orchestrator and
+    # gives the compute-node script the PATH its auto-rerun triage needs.
+    bin_dir = config.JOBS_PIPELINE_PATH_DIR
+    if bin_dir:
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+
     # Defense in depth beside the scrub: name the exported set explicitly, so a
     # future sbatch default change cannot widen it.
     env["SBATCH_EXPORT"] = config.JOBS_SBATCH_EXPORT or ",".join(sorted(env))

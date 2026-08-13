@@ -306,6 +306,14 @@ JOBS_STAGING_ROOT     = Path(
 # a shell string — the argv is built as a list, so there is no shell to inject
 # into. See jobs.build_submit_argv.
 JOBS_PIPELINE_BIN     = os.getenv("ASPEN_JOBS_PIPELINE_BIN", "xas-run-batch")
+# Directory holding that entry point, prepended to the PATH the orchestrator (and
+# therefore every submitted job) runs with. Set this rather than only pinning an
+# absolute path above: the pipeline's ORCA script finds `xas-rerun-orca` via
+# `command -v`, so pinning just the entry point gives a working submission whose
+# failure triage silently never fires. Handled here rather than in start.sh so it
+# holds however the bot was launched — including under systemd, where there is no
+# start.sh at all.
+JOBS_PIPELINE_PATH_DIR = os.getenv("ASPEN_PIPELINE_BIN_DIR", "").strip()
 JOBS_SCHEDULER        = os.getenv("ASPEN_JOBS_SCHEDULER", "slurm")
 # Caps. The primary threat actor here is the careless allowlisted member and the
 # asset is shared compute, so these are Python-enforced, not prompt advice.

@@ -531,3 +531,27 @@ def test_prune_keeps_a_recent_preview_awaiting_confirmation(sut, jobs_env):
         scope=scope, template_mode="ca-fixed", source_rel="thermolysin/structures")
     assert sut.jobs.prune_staging(max_age_hours=48)["removed"] == 0
     assert fresh.exists()
+
+
+def test_the_pipeline_bin_dir_lands_on_the_jobs_path(sut, monkeypatch):
+    """The orchestrator must be findable, and the job must inherit that PATH.
+
+    Both halves matter and they are the same line. subprocess resolves an
+    unqualified program name against the PATH in the env it is handed, so this is
+    what finds ``xas-run-batch``; and because sbatch copies this environment to the
+    compute node, it is also what lets the ORCA script's ``command -v
+    xas-rerun-orca`` succeed. Pinning only ASPEN_JOBS_PIPELINE_BIN as an absolute
+    path would satisfy the first and silently fail the second.
+    """
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setattr(sut, "JOBS_PIPELINE_PATH_DIR", "/opt/pipeline/bin", raising=False)
+    env = sut.jobs.submit_env()
+    assert env["PATH"].startswith("/opt/pipeline/bin:")
+    assert "/usr/bin" in env["PATH"], "the existing PATH must survive, not be replaced"
+    assert "PATH" in env["SBATCH_EXPORT"], "and it must be in the exported set"
+
+
+def test_no_pipeline_bin_dir_leaves_path_alone(sut, monkeypatch):
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setattr(sut, "JOBS_PIPELINE_PATH_DIR", "", raising=False)
+    assert sut.jobs.submit_env()["PATH"] == "/usr/bin:/bin"
