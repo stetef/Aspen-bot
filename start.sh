@@ -58,6 +58,26 @@ if grep -qiE '^[[:space:]]*ASPEN_SANDBOX_ENABLED[[:space:]]*=[[:space:]]*(1|true
 fi
 
 # ---------------------------------------------------------------------------
+# Slurm job submission (spec §19): put the calculation pipeline on PATH.
+#
+# This has to be PATH and not just an absolute path in ASPEN_JOBS_PIPELINE_BIN,
+# because the PATH the bot runs with is the PATH submitted jobs inherit (jobs.py
+# passes it through the scrubbed environment, and sbatch copies it to the compute
+# node). The pipeline's ORCA script triages its own failures by calling
+# xas-rerun-orca, found via `command -v` — so with only the entry point pinned,
+# the orchestrator would run fine and auto-rerun would silently never fire.
+# ---------------------------------------------------------------------------
+if [[ -n "${ASPEN_PIPELINE_BIN_DIR:-}" ]]; then
+    if [[ -d "$ASPEN_PIPELINE_BIN_DIR" ]]; then
+        export PATH="$ASPEN_PIPELINE_BIN_DIR:$PATH"
+        echo "Pipeline on PATH: $ASPEN_PIPELINE_BIN_DIR"
+    else
+        echo "WARNING: ASPEN_PIPELINE_BIN_DIR=$ASPEN_PIPELINE_BIN_DIR does not exist;" \
+             "job submission will fail to find the pipeline." >&2
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Analysis venv: the Python environment run_python_analysis executes inside the
 # bwrap sandbox (replaces the old aspen.sif Apptainer image). Built once into
 # $ANALYSIS_VENV — default $WORKSPACE_ROOT/analysis-venv, overridable via .env.
