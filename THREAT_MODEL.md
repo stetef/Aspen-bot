@@ -3,7 +3,7 @@
 _Last updated: 2026-08-12. Scope: the system **as built** after the
 `security/interim-hardening` pass, the group-DM participant gate (C7), the user
 registry + per-user workflows (C8–C11), and **Slurm job submission in beta**
-(C12–C14, spec §19), plus the security work still owed (notably the move to a
+(C12–C16, spec §19–§20), plus the security work still owed (notably the move to a
 dedicated service account). Companion to [`spec.md`](spec.md) (design)
 and [`probe_isolation.sh`](probe_isolation.sh) (host-fact verification)._
 
@@ -128,7 +128,9 @@ Two single-instance processes:
 | `run_python_analysis` | The **bwrap jail + seccomp** (no network, read-only project mount, only `figures/`+`cache/` writable, `prlimit` caps) |
 | `Bash` | A **Slurm read-only allowlist** + `can_use_tool` deny; everything else refused. `sbatch`/`scancel` are **not** on it and never will be — a prefix rule cannot express "only this user's own jobs", and `Bash(sbatch:*)` grants `--wrap` |
 | `submit_orca_batch` | A fixed `template_mode` enum + a root-resolved structure path — **no script path or body** (C13); inputs copied into staging outside every writable area; env scrubbed (C14); per-user/global caps; dry-run + single-use confirm token |
-| `cancel_orca_batch` | Ledger enumeration filtered to the Slack event's `user_id`, then per-ID `WorkDir` verification against live Slurm, then explicit-ID `scancel` (C12) |
+| `cancel_orca_batch` | Ledger enumeration filtered to the Slack event's `user_id`, then per-ID `WorkDir` verification against live Slurm, then explicit-ID `scancel` (C12). Direct-path jobs additionally carry an `aspen/v1/<slack-id>/<thread>` `--comment` that must match the ledger exactly |
+| `submit_calculation` | A **registered, frozen** job script (C15) + an input validated against a closed directive vocabulary (C16); resources bounded; diff shown to the user; two calls with a single-use token |
+| `save_input_template` | The speaker's own library only — no owner parameter (C9); validated before it is stored; prior version snapshotted |
 
 **The "two sandboxes" distinction** (a common confusion):
 
@@ -155,6 +157,8 @@ Two single-instance processes:
 | C11 | **State-location guard at startup** | C8/C9 hold only if the registry and workflow tree aren't reachable through a writable path. Startup refuses if either resolves inside `WORKSPACE_ROOT` or `ASPEN_SANDBOX_WRITE_PATHS`, where sandboxed analysis code could edit them directly; the state dir is `chmod 0700` against other users on the shared node. Now also covers the **job ledger and the staging tree** (C12/C13) — a writable ledger is a forgeable cancel, and writable staging is a job body the model can plant. | `main.py`, `config.py` |
 | C12 | **Cancel scoped by ledger, then verified against live Slurm** | The Slurm surface (spec §19) is the one capability that spends a shared resource, and under the beta account model Unix ownership protects nothing — the bot *is* the developer, so every hand-submitted research job is in `scancel` range. Three checks replace it: the ID must be a row in Aspen's own ledger; the row's `slack_user_id` must equal the Slack event's `user_id` (the tool has no `owner` parameter, as C9); and `scontrol show job` must report a `WorkDir` inside *that requester's* staging directory. Fail-closed at every step. `scancel` filter flags (`-u`/`-n`/`-A`/`-p`/`-q`/`-t`/`--me`) are never built — they delegate enumeration to Slurm, which is precisely what makes per-job verification impossible. | `jobs.py`, `tools.py` |
 | C13 | **The model never authors a job body** | A submitted job runs unjailed on a compute node as the bot's Unix user, so *what* runs there is the whole security question. `submit_orca_batch` takes a `template_mode` from a fixed enum and a root-resolved structure path — no script path, no script content. The pipeline renders its own job scripts from its own packaged templates. What reaches a node is pipeline code plus the user's `.xyz` data. Inputs are copied, never symlinked, so nothing writes back into a calculations root. | `jobs.py`, `staging.py` |
+| C15 | **The job script is registered by a human, never chosen at request time** | Spec §20. Two designs were rejected: reading the command from `WORKFLOW.md` (user-authored, explicitly non-authoritative text that is also cross-readable — it would become code execution as the bot's account for anyone who can write a workflow), and submitting whatever `.sh` sits in a user's tree (the parent of the group's user trees is `drwxrwsr-x` with **no sticky bit**, so any `sdf-ssrl-xas` member — a larger set than the beta — can substitute a whole user directory). Instead the bytes are read by an operator once, copied into Aspen's storage and frozen, and re-checked on every use. The destructive-command list (`rm`, `find -delete`, `rsync --delete`, recursive `chmod`, `curl\|sh`, `sudo`, absolute redirects, `$HOME` writes) is a **guardrail against the careless member, not a boundary** — shell has unlimited spellings — and `--force` records exactly what an operator overrode. | `runners.py`, `users_cli.py` |
+| C16 | **Input files: flexible edits, closed directive vocabulary** | The operator asked for genuinely flexible editing — functional, basis, geometry, charge, added blocks — so the validator must not obstruct chemistry. What it refuses is the narrow set that stops an input being data: `%compound`, `%base`, `ProgExt`/`ProgXTB`, `Script=`, `ExtOpt`, traversing or absolute file references, shell characters. Blocks are **allowlisted** rather than denylisted because the group's real inputs use only eight, so closing the vocabulary costs almost nothing and covers the directive nobody thought to denylist. Templates are validated on write **and** on use, since the denied list can grow after a file was saved. Owed: a line-by-line pass against the ORCA 5.0.4 and 6.0.1 manuals. | `inputs.py`, `templates.py` |
 | C14 | **Orchestrator environment scrubbed to an allowlist** | `load_dotenv` puts `SLACK_BOT_TOKEN` and `AGENT_INTERNAL_SECRET` in the bot's `os.environ`, and `sbatch` defaults to `--export=ALL` — so a naive submission copies Aspen's Slack tokens onto every compute node. The subprocess gets an explicit allowlist instead; a denylist of secret *names* would silently miss the next secret added to `.env`. Deliberately **not** `--export=NONE`: the pipeline's ORCA script finds `xas-rerun-orca` on an inherited `PATH` behind a `command -v` guard, so `NONE` turns auto-rerun triage into a silent no-op — a security change whose cost would have been invisible. | `jobs.py` |
 
 All controls are covered by the hermetic test suite (`pytest -q`), including
@@ -299,6 +303,14 @@ the Bash route this section anticipated:
   network/munge), so it would confine nothing. Submission is a structured tool, not a
   Bash command, so it adds no Bash surface. Enable it (fail-closed) if Bash ever
   gains a write/exec surface — §7.
+
+- **A user can get code of their choosing to run as the shared account, by asking
+  an operator to register it.** That is the intended workflow, and the operator has
+  accepted it for the beta group: registration is a human reading a script once.
+  What it means precisely is that the trust boundary for job *content* is "whoever
+  the operator will register a script for", not "whoever can write a file
+  somewhere" — which is the version C15 exists to prevent. The input-file surface is
+  narrower still (C16), and an ORCA input cannot delete anything.
 
 - **Compute is spent on a shared allocation with per-user accounting kept only by
   Aspen.** Jobs charge the developer's Slurm association (`ssrl:SMBXAS`), so "who used

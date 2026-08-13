@@ -10,7 +10,9 @@ This document describes the system **as built**. Work that is designed but not y
 implemented (chiefly the production service account / systemd) is collected in
 [§18 Roadmap](#18-roadmap--not-yet-implemented). Slurm job submission is built but runs
 **under the developer's own account for a beta group**, which changes what several of its
-controls are load-bearing *for* — [§19](#19-slurm-job-submission-beta). Magic numbers in
+controls are load-bearing *for* — [§19](#19-slurm-job-submission-beta) for pipeline
+batches, [§20](#20-templates-runners-and-single-job-submission-beta) for each person's
+own way of running a calculation. Magic numbers in
 this doc are defaults; the authority is `.env` (see [§15](#15-environment-variables-env)).
 
 ---
@@ -243,6 +245,12 @@ auto-approves exactly the MCP tools below plus a read-only Bash allowlist, and a
 | `submit_orca_batch` | **submit** | Stage structures and run the ORCA → CORVUS pipeline for the speaker — [§19](#19-slurm-job-submission-beta) |
 | `cancel_orca_batch` | **cancel** | Cancel the speaker's *own* Aspen-submitted jobs, after per-ID verification — [§19.5](#195-verify-before-cancel) |
 | `list_my_jobs` | read-only | The speaker's ledger rows, with live Slurm state |
+| `list_input_templates` | read-only | Saved calculation setups — the speaker's and colleagues' — [§20.3](#203-templates--the-reusable-input) |
+| `read_input_template` | read-only | One template in full; a colleague's is `reference-only` |
+| `save_input_template` | **write** | Save a reusable input as the **speaker's own** template |
+| `delete_input_template` | **write** | Delete one of the speaker's own templates (snapshotted) |
+| `submit_calculation` | **submit** | One job from a template via the speaker's registered runner — [§20.5](#205-submission-and-the-tag-that-comes-back) |
+| `check_orca_run` | read-only | Did a run converge, and where is the optimised geometry — [§20.6](#206-the-follow-on) |
 
 Every path-taking tool takes an **`owner`** — a *name* (alias, Slack ID, or shared-root
 name), never a path. Reading is flat: any root may be read by anyone ([§5.1](#51-calculations-roots-aspenrootspy)).
@@ -887,6 +895,7 @@ Paths and identity-specific values are driven entirely from `.env` (no hardcoded
 | Slack connection | Socket Mode — outbound WebSocket only, no open ports |
 | Tool surface | Locked-down allowlist + `can_use_tool` deny; host settings ignored; Bash = Slurm read-only (`sbatch`/`scancel` are structured tools, never Bash rules) |
 | Slurm submission | Off by default. Model supplies a `template_mode` from a fixed enum, never a script; inputs copied into a staging tree outside every writable area; orchestrator env scrubbed to an allowlist so no token reaches a compute node; per-user and global job caps; dry run + single-use confirmation token ([§19](#19-slurm-job-submission-beta)) |
+| Templates & runners | The **input** may be freely edited by Aspen within a closed directive vocabulary; the **job script** is registered once by a human and frozen, so no shell content ever comes from the model or from a file chosen at request time ([§20](#20-templates-runners-and-single-job-submission-beta)) |
 | Slurm cancellation | Enumerated **only** from Aspen's own ledger, filtered to the Slack event's `user_id`, then each ID verified against live Slurm (`WorkDir` inside *that* requester's staging dir) before an explicit-ID `scancel`. No filter flags, ever ([§19.5](#195-verify-before-cancel)) |
 | Read/search tools | Path-fenced in Python to the *resolved* root; can't read `~/.ssh`, `.env`, or hop between roots |
 | Calculations roots | One per user + shared; reads are flat by design, and the tool surface takes a **name**, never a path. Roots may not nest (startup refuses) |
@@ -909,7 +918,8 @@ DM that contains any non-allowlisted human (participant gate, fail-closed); writ
 file inside *any* calculations root; grant itself or anyone else access or a calculations
 root; write another user's workflow or metadata; **cancel a Slurm job it did not submit, or
 one submitted for a different Slack user** ([§19.5](#195-verify-before-cancel));
-**author the body of a job it submits** ([§19.3](#193-staging-the-model-never-authors-a-job));
+**author or choose the shell script a job runs** ([§20.1](#201-why-the-job-script-is-not-user-supplied));
+write into another user's template library;
 run `sbatch`/`scancel` through Bash; reach files outside the configured roots / workspace /
 state dir / staging tree; make network calls from inside the analysis jail.
 
@@ -1346,3 +1356,160 @@ the risks visible:
   and that is the point: the ledger can be corrupted or deleted and Slurm's copy survives
   it; slurmdbd purges on a site-set schedule and the ledger survives that. Neither alone is
   a durable record of who used the allocation.
+
+---
+
+## 20. Templates, Runners, and Single-Job Submission (beta)
+
+[§19](#19-slurm-job-submission-beta) submits *batches* through one hard-wired
+pipeline. This section is the other half: **each person's own way of running a
+calculation**, which for most of the group is not the ORCA→CORVUS pipeline at all.
+
+The motivating case is concrete. Arun keeps ORCA inputs and a job script in
+`/sdf/data/ssrl/smb/xas/users/aasundi/`. He wants Aspen to start from an input that
+already works, change the charge or the geometry or the functional, submit it, and
+later — once an optimisation has converged — run TD-DFT on the result following his
+own protocol. None of that is expressible as `template_mode` from a fixed enum.
+
+Three pieces, and the split between them is the whole design:
+
+| Piece | Who authors it | Where it lives |
+|---|---|---|
+| **Runner** — the job script | an **operator**, reviewed once | `$ASPEN_STATE_DIR/runners/` |
+| **Template** — the input file | Aspen, with the user, saved on request | `$ASPEN_STATE_DIR/templates/<alias>__<id>/` |
+| **Per-job values** — charge, geometry, resources | the conversation, as typed fields | nowhere; passed per call |
+
+### 20.1 Why the job script is not user-supplied
+
+Two tempting designs were rejected, and the reasons are the load-bearing part of
+this section.
+
+**"Read the command from the user's `WORKFLOW.md`."** A workflow is user-authored
+text that [§6](#6-per-user-workflows) and C10 deliberately make *non-authoritative*
+— it cannot grant tools, relax the sandbox, or change file access. A workflow that
+named the command to run would turn a user-writable text file into code execution as
+the account Aspen runs under, and workflows are **cross-readable**, so it would not
+even be confined to its author. The workflow still shapes the job — which template,
+which functional, what conventions — it just cannot select the executable.
+
+**"Submit whatever `.sh` is in the user's tree at request time."** Ruled out by the
+threat that matters here: people are used to owning their compute account and are now
+sharing one, so the realistic accident is a habitual *"delete everything in my
+scratch"* line running as somebody else. Worse, `/sdf/data/ssrl/smb/xas/users/` is
+`drwxrwsr-x` with **no sticky bit**, so any member of `sdf-ssrl-xas` — a larger set
+than the beta group — can rename a whole user directory aside and substitute their
+own. Submitting the tree's current contents would inherit that trust boundary.
+
+**What the evidence showed.** Arun's real `Submission.sh` is thirty-five lines of
+`module load` and `export PATH`, plus a single `orca input.inp > input.out`. Only
+the job name, the resources and the input filename vary per job. So registering the
+script *once*, from a file a human has read, costs almost nothing and removes the
+whole class of problem: **no shell content ever comes from the model, or from a file
+chosen at request time.**
+
+Registration copies the reviewed bytes into Aspen's storage and freezes them, because
+review has to bind to content rather than to a path whose contents can change
+afterwards. Assignment is a registry field (`job_runner`) set by
+`aspen-users set-runner`, CLI-only for the reason [§5.0](#50-getting-set-up-and-asking-for-things-aspensetuppy-aspenpendingpy)
+gives for calculations roots.
+
+### 20.2 What the script may contain
+
+`runners.script_problems` surfaces `rm`, `find -delete`, `shred`, `rsync --delete`,
+recursive `chmod`/`chown`, `curl | sh`, `sudo`, scheduler job control, absolute
+redirects, and moves into `$HOME`. It also requires the `[INPUT]` placeholder and
+refuses unknown placeholders or absolute `#SBATCH --output/--error/--chdir` paths.
+
+**This is a guardrail, not a boundary**, and the distinction is deliberate. Shell has
+unlimited ways to spell any command, so a determined author walks straight through
+it. It is aimed at the actor [THREAT_MODEL](THREAT_MODEL.md) §4 actually names — the
+careless member — at the moment a human is present to read the explanation.
+Deleting a job's *own* scratch directory is legitimate and common, so `--force`
+exists and records exactly which checks were overridden.
+
+Building this found a bug worth recording: the first version of the job-control
+pattern matched `#SBATCH` case-insensitively, so it rejected **every** real job
+script in the group. It was caught by running the validator against Arun's actual
+file rather than a fixture, and the fix (match at command position only) has a test
+named after the mistake.
+
+### 20.3 Templates — the reusable input
+
+`aspen/templates.py` is a near-copy of [`workflows.py`](#6-per-user-workflows),
+because the ownership question is identical: no write path takes an `owner`, the
+destination is `context["user_id"]`, a colleague's template comes back
+`reference-only`, and every overwrite is snapshotted.
+
+One difference drives everything else: **a workflow is prose, a template is
+executable input.** So a template is validated by
+[§20.4](#204-editing-inputs-flexibly) on the way *in* and again wherever it is read
+for *use*. Both, because the denied-directive list can grow after a file was saved —
+a template that was acceptable last month must not stay acceptable purely because it
+is already on disk.
+
+This is how "Aspen proposes a TD-DFT input and Arun keeps it" works. Aspen drafts,
+shows it in the thread, and on request saves it to *the speaker's own* library. There
+is no way to write into anyone else's.
+
+### 20.4 Editing inputs flexibly
+
+Aspen may change **anything chemical**: functional, basis set, added blocks,
+geometry, charge, multiplicity, resources. The operator asked for that explicitly,
+and a validator that blocked a legitimate edit would be one people route around.
+
+What is refused is the narrow set of directives that stop an input being *data* and
+make it a way to run a program or write outside the run directory —
+`%compound`, `%base`, `ProgExt`/`ProgXTB`, `Script=`, `ExtOpt`, `%moinp` with a
+traversing or absolute path, shell characters in any filename.
+
+**The block vocabulary is closed rather than denylisted**, and that came from the
+data: a scan of the group's real inputs turns up exactly eight `%` blocks in use
+(`maxcore`, `pal`, `basis`, `geom`, `output`, `method`, `qmmm`, `pointcharges`). At
+that size, refusing what nobody has ever needed costs almost nothing and covers the
+directive nobody thought to denylist — the one failure a denylist cannot fix. The
+contents of allowed blocks and the whole `!` keyword line stay open, which is where
+essentially every real edit lives. `ASPEN_ORCA_EXTRA_BLOCKS` is the one-line escape
+hatch, and it cannot re-enable a denied block.
+
+Two limits, stated rather than implied. The denied list still owes a line-by-line
+pass against the ORCA **5.0.4 and 6.0.1** manuals both installed on this cluster.
+And since a job runs unjailed, this stops the careless member and an injected model,
+not a determined author — anything dangerous inherited from a user's own example is
+the risk the operator explicitly accepted.
+
+Alongside free editing, `inputs.replace_geometry` does the common edits by
+*substitution*, so changing a charge copies the rest of a working input byte for byte
+instead of re-emitting it.
+
+### 20.5 Submission, and the tag that comes back
+
+`submit_calculation` is two calls like everything else that spends compute, and its
+preview is a **unified diff against the template**, not a summary. The human review
+is doing real work here that no validator can: these users spot a wrong functional or
+a dropped constraint at a glance.
+
+Because Aspen calls `sbatch` itself on this path rather than delegating to an
+orchestrator, it **can** set `--comment` — the per-user tag
+[§19.1](#191-why-the-ledger-and-the-workdir-tag-are-load-bearing) wanted and could
+not have. So a direct job carries two independent fences: `WorkDir` inside the
+requester's staging tree, *and* `aspen/v1/<slack-id>/<thread-ts>`. A ledger row that
+records a tag must match Slurm **exactly** — a tagged row whose live comment is
+missing or different is a recycled ID or something stranger, and either way not ours
+to cancel. `--parsable` makes `sbatch` print only the job ID, so parsing is not the
+weak link it is on the pipeline path.
+
+The argv is `sbatch --parsable --job-name=… --comment=… --chdir=<staging> script.sh`
+and nothing else. `--wrap` is asserted absent rather than merely omitted.
+
+### 20.6 The follow-on
+
+`check_orca_run` reads an ORCA `.out` and reports whether the optimisation converged,
+plus the path to the optimised geometry ORCA leaves beside it. That makes "if it
+converged, run TD-DFT on the result" rest on the output rather than on assumption:
+the converged `.xyz` becomes `geometry_path` for a `submit_calculation` call against
+the user's TD-DFT template.
+
+Outstanding, and honest: Arun's tree contains no optimisation runs and no TD-DFT
+inputs today, so the first TD-DFT template has to come from him — or from Aspen
+drafting one that he saves, which is the [§20.3](#203-templates--the-reusable-input)
+flow.

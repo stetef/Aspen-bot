@@ -47,8 +47,9 @@ thread.
   data, without being added as a user ([below](#try-it-without-being-a-user-demo)).
 - **Investigate jobs** — read-only Slurm queries (`squeue`/`sacct`/…) across the whole
   queue, whoever it belongs to.
-- **Run calculations** *(beta, off by default)* — submit an ORCA → CORVUS batch and cancel
-  it again. Always a dry run first, then an explicit confirmation. It can only cancel jobs
+- **Run calculations** *(beta, off by default)* — submit an ORCA → CORVUS batch, or a
+  single job from one of your own saved input templates ([below](#your-own-way-of-running-calculations-beta)), and cancel
+  either again. Always a dry run first, then an explicit confirmation. It can only cancel jobs
   **it submitted for you** — never your own hand-submitted jobs, never a colleague's
   ([below](#running-calculations-beta)).
 
@@ -319,6 +320,55 @@ anyone's calculations directory, as everywhere else in Aspen.
 `reconcile` is worth running periodically: the ledger knows *who submitted what*, but
 elapsed time, CPU-hours and exit state only exist once a job has finished, so
 "who used the compute" is unanswerable until you join against `sacct`.
+
+## Your own way of running calculations (beta)
+
+The pipeline path above is one workflow. Most people have their own, and Aspen can
+work from those instead.
+
+**Aspen keeps your protocols as templates.** Draft an input with it — starting from
+one you already have, or from scratch — and once you're happy, ask it to save that as
+a named template. Later jobs start from there:
+
+```
+you    @Aspen start from my P2M2CO input but make it TD-DFT, 20 roots
+Aspen  <shows the input>  …want me to save this as a template?
+you    yes, call it tddft-standard
+Aspen  Saved your `tddft-standard` ORCA template.
+
+you    @Aspen run tddft-standard on the optimised structure from BPCO_NBO
+Aspen  DRY RUN — here's what changes from the template:
+         -* xyz 0 1
+         +* xyz -1 2
+         + <new coordinates>
+       …go ahead?
+```
+
+Aspen may change anything chemical — functional, basis set, geometry, charge, extra
+blocks. What it refuses is the small set of ORCA directives that run other programs
+or write outside the run directory. The preview is a **diff**, not a summary, because
+you'll spot a wrong functional faster than any validator will.
+
+**Aspen never writes the shell script.** That's registered once by an admin, from a
+file they've read, and frozen — so nothing the model produces, and no file picked
+mid-conversation, ends up as shell running on a compute node. Your existing job
+script is the starting point; it needs `[INPUT]` where the input filename goes.
+
+```bash
+./aspen-users runner add orca-nbo --script ~/my-job.sh --ntasks 32 --mem-gb 256
+./aspen-users set-runner arun-asundi orca-nbo
+./aspen-users runner list
+```
+
+Registration will complain about `rm`, `rsync --delete`, `sudo`, absolute redirects
+and similar. That's aimed at habit, not malice: these jobs run under one shared
+account now, so a cleanup line that was safe in your own account can delete someone
+else's work. If it's flagging a legitimate scratch cleanup, `--force` accepts it and
+records what you accepted.
+
+**Follow-ons.** `check_orca_run` reads an output and says whether the optimisation
+converged and where the optimised geometry is, so "if it converged, run TD-DFT on the
+result" rests on the output rather than on assumption.
 
 ## What Aspen records (`aspen-users telemetry`)
 
