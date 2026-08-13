@@ -716,65 +716,97 @@ def cmd_jobs_reconcile(args) -> int:
 # same discipline as admission and calculations roots.
 # --------------------------------------------------------------------------- #
 def cmd_runner_add(args) -> int:
+    """Save a runner into a user's own library, from the terminal.
+
+    Users normally do this through Aspen, which checks the script and asks them to
+    confirm. This is the same operation for an operator with a file in hand — and it
+    applies the same checks, so ``--force`` here is the terminal equivalent of a user
+    saying "yes, that rm only clears the job's scratch dir".
+    """
     from . import runners
 
+    user = registry.resolve(args.who)
+    if not user:
+        return _err(f"no such user: {args.who}")
     try:
-        profile = runners.register(
-            args.name, Path(args.script), kind=args.kind, code=args.code,
-            description=args.description, ntasks=args.ntasks, mem_gb=args.mem_gb,
-            time_limit=args.time, actor=_actor(args), force=args.force,
+        body = Path(args.script).expanduser().read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return _err(f"could not read {args.script}: {exc}")
+
+    problems = runners.script_problems(body)
+    if problems:
+        print(f"{len(problems)} thing(s) to look at in {args.script}:")
+        for problem in problems:
+            print(f"  • {problem}")
+        if not args.force:
+            return _err("fix them, or pass --force if you have read the script and "
+                        "accept them")
+        print("Accepting them because --force was given; this is recorded on the runner.\n")
+
+    try:
+        meta = runners.save(
+            user["slack_user_id"], args.name, body, description=args.description,
+            ntasks=args.ntasks, mem_gb=args.mem_gb, time_limit=args.time,
+            accept_problems=problems if args.force else [],
         )
     except runners.RunnerError as exc:
         return _err(str(exc))
 
-    print(f"Registered runner '{profile['name']}' ({profile['kind']}/{profile['code']}).")
-    print(f"  script frozen at {profile['script']}")
-    print(f"  copied from      {profile['source']}")
-    d = profile["defaults"]
+    print(f"Saved '{meta['name']}' as @{user['alias']}'s runner.")
+    print(f"  script frozen at {meta['script']}")
+    d = meta["defaults"]
     print(f"  defaults         {d['ntasks']} tasks, {d['mem_gb']} GB, {d['time']}")
-    if profile["problems_accepted"]:
-        print(f"  NOTE: {len(profile['problems_accepted'])} check(s) accepted with --force:")
-        for problem in profile["problems_accepted"]:
-            print(f"    • {problem}")
-    print(f"\nAssign it with:  aspen-users set-runner <who> {profile['name']}")
+    if meta["problems_accepted"]:
+        print(f"  accepted         {len(meta['problems_accepted'])} warning(s)")
+    print(f"\nMake it their default with:  aspen-users set-runner {user['alias']} {meta['name']}")
     return 0
 
 
 def cmd_runner_list(args) -> int:
     from . import runners
 
-    profiles = runners.load()
-    if not profiles:
-        print(f"No runners registered. Registry: {config.RUNNERS_FILE}")
-        print("Add one with:  aspen-users runner add <name> --script <file>")
+    entries = runners.index()
+    if not entries:
+        print(f"No runners saved. Library: {config.RUNNERS_ROOT}")
+        print("Users can save their own by showing Aspen the job script they submit,")
+        print("or:  aspen-users runner add <who> <name> --script <file>")
         return 0
 
-    assigned = {}
+    defaults = {}
     for user in registry.users():
         name = (user.get("job_runner") or "").strip().lower()
         if name:
-            assigned.setdefault(name, []).append(user["alias"])
+            defaults.setdefault(name, []).append(user["alias"])
 
-    print(f"{'NAME':<18} {'KIND':<10} {'CODE':<8} USERS")
-    for name, profile in sorted(profiles.items()):
-        who = ", ".join(sorted(assigned.get(name, []))) or "-"
-        print(f"{name:<18} {profile['kind']:<10} {profile['code']:<8} {who}")
-    print(f"\n{len(profiles)} runner(s). Registry: {config.RUNNERS_FILE}")
+    print(f"{'OWNER':<20} {'NAME':<20} {'TASKS':>6} {'MEM':>6}  FLAGS")
+    for e in entries:
+        d = e.get("defaults", {})
+        flags = []
+        if e["name"] in defaults.get(e["name"], []) or e["owner_alias"] in defaults.get(e["name"], []):
+            flags.append("default")
+        if e.get("problems_accepted"):
+            flags.append(f"{len(e['problems_accepted'])} accepted warning(s)")
+        print(f"@{e['owner_alias']:<19} {e['name']:<20} {d.get('ntasks','?'):>6} "
+              f"{d.get('mem_gb','?'):>6}  {', '.join(flags) or '-'}")
+    print(f"\n{len(entries)} runner(s). Library: {config.RUNNERS_ROOT}")
     return 0
 
 
 def cmd_runner_show(args) -> int:
     from . import runners
 
-    profile = runners.get(args.name)
-    if profile is None:
-        return _err(f"no runner called {args.name!r}")
-    print(json.dumps({k: v for k, v in profile.items()}, indent=2))
-    print("\n--- frozen script ---")
+    user = registry.resolve(args.who)
+    if not user:
+        return _err(f"no such user: {args.who}")
     try:
-        print(runners.script_for(profile))
+        meta = runners.resolve(args.name, user["slack_user_id"],
+                               owner=user["alias"])
+        body = runners.script_for(meta)
     except runners.RunnerError as exc:
         return _err(str(exc))
+    print(json.dumps(meta, indent=2))
+    print("\n--- frozen script ---")
+    print(body)
     return 0
 
 
@@ -789,9 +821,12 @@ def cmd_set_runner(args) -> int:
         name = ""
     else:
         name = args.runner.strip().lower()
-        if runners.get(name) is None:
-            available = ", ".join(sorted(runners.load())) or "(none registered)"
-            return _err(f"no runner called {name!r}. Available: {available}")
+        try:
+            runners.resolve(name, user["slack_user_id"], owner=user["alias"])
+        except runners.RunnerError:
+            theirs = [e["name"] for e in runners.index(user["slack_user_id"]) if e["mine"]]
+            return _err(f"@{user['alias']} has no runner called {name!r}. "
+                        f"Theirs: {', '.join(theirs) or '(none)'}")
 
     users = [dict(u, job_runner=name) if u["slack_user_id"] == user["slack_user_id"] else u
              for u in registry.users(include_removed=True)]
@@ -1209,23 +1244,22 @@ def build_parser() -> argparse.ArgumentParser:
     # --- runners ------------------------------------------------------------ #
     s = sub.add_parser(
         "runner",
-        help="register and inspect job-script runners",
-        description="A runner is the job script Aspen fills in and submits. "
-                    "Registering one is where a human reads the script; the bytes "
-                    "are copied into Aspen's storage and frozen, so review binds to "
-                    "the content rather than to a path whose contents can change.",
+        help="inspect and save job-script runners",
+        description="A runner is the job script Aspen fills in and submits. Users "
+                    "normally save their own through Aspen, which checks the script "
+                    "and asks them to confirm; these commands are the same operation "
+                    "from a terminal. The bytes are frozen on save, so review binds "
+                    "to content rather than to a path that can change afterwards.",
     )
     rsub = s.add_subparsers(dest="runner_command", required=True)
 
-    r = rsub.add_parser("add", help="register a job script as a runner")
+    r = rsub.add_parser("add", help="save a job script as a user's runner")
+    r.add_argument("who", help="whose library to save it in (alias or Slack ID)")
     r.add_argument("name", help="short name, e.g. 'orca-nbo'")
     r.add_argument("--script", required=True,
                    help="path to the job script to freeze (use [INPUT] where the "
                         "input filename goes; also [JOB_NAME] [OUTPUT] [NTASKS] "
                         "[MEM_GB] [TIME])")
-    r.add_argument("--kind", default="direct", choices=("direct", "pipeline"),
-                   help="'direct' = Aspen builds the sbatch argv; 'pipeline' = an "
-                        "orchestrator submits its own jobs")
     r.add_argument("--code", default="orca", help="input format (only 'orca' so far)")
     r.add_argument("--description", default="", help="one line, shown to the agent")
     r.add_argument("--ntasks", type=int, default=16, help="default cores")
@@ -1239,15 +1273,16 @@ def build_parser() -> argparse.ArgumentParser:
     r.set_defaults(func=cmd_runner_list)
 
     r = rsub.add_parser("show", help="one runner in full, including its frozen script")
+    r.add_argument("who", help="whose runner (alias or Slack ID)")
     r.add_argument("name")
     r.set_defaults(func=cmd_runner_show)
 
     s = sub.add_parser(
         "set-runner",
-        help="assign a runner to a user (CLI-only, like set-root)",
-        description="Which runner someone's jobs use. Not agent-settable: a tool "
-                    "that wrote this would reinstate the surface that taking paths "
-                    "out of the model's hands removes.",
+        help="set a user's DEFAULT runner (CLI-only, like set-root)",
+        description="Which runner is used when none is named. Users may save and "
+                    "pick their own runners through Aspen; the default stays here so "
+                    "an operator's choice cannot be redirected by a conversation.",
     )
     s.add_argument("who", help="alias or Slack ID")
     s.add_argument("runner", nargs="?", default="", help="registered runner name")

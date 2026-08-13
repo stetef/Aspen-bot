@@ -1139,7 +1139,7 @@ def _parse_job_id(stdout: str) -> str:
 
 
 def prepare_direct(*, requester_uid: str, thread_ts: str, template: str,
-                   owner: str = "", charge: Optional[int] = None,
+                   owner: str = "", runner: str = "", charge: Optional[int] = None,
                    multiplicity: Optional[int] = None, geometry_path: str = "",
                    geometry_owner: str = "", ntasks: Optional[int] = None,
                    mem_gb: Optional[int] = None, time_limit: str = "",
@@ -1156,16 +1156,15 @@ def prepare_direct(*, requester_uid: str, thread_ts: str, template: str,
     if not config.JOBS_SUBMIT_ENABLED:
         raise JobsError("Job submission is switched off on this deployment.")
 
-    profile = runners.for_user(requester_uid)
+    profile = runners.for_user(requester_uid, runner)
     if profile is None:
+        saved = [e["name"] for e in runners.index(requester_uid) if e["mine"]]
         raise JobsError(
-            "You have no job runner assigned, so Aspen can't submit for you. An "
-            "admin sets one up with `aspen-users runner add` and `set-runner`."
-        )
-    if profile.get("kind") != "direct":
-        raise JobsError(
-            f"Your runner ({profile['name']}) drives the batch pipeline, not single "
-            "jobs — use submit_orca_batch instead."
+            "I don't know which job script to use. "
+            + (f"You have several saved ({', '.join(saved)}) — name one."
+               if saved else
+               "You have none saved yet. Show me the job script you normally use and "
+               "I'll check it over and save it as a runner.")
         )
     code = profile.get("code", "orca")
 

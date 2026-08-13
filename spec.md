@@ -1386,7 +1386,7 @@ Three pieces, and the split between them is the whole design:
 
 | Piece | Who authors it | Where it lives |
 |---|---|---|
-| **Runner** — the job script | an **operator**, reviewed once | `$ASPEN_STATE_DIR/runners/` |
+| **Runner** — the job script | its **owner**, checked by Aspen and confirmed by them | `$ASPEN_STATE_DIR/runners/<alias>__<id>/` |
 | **Template** — the input file | Aspen, with the user, saved on request | `$ASPEN_STATE_DIR/templates/<alias>__<id>/` |
 | **Per-job values** — charge, geometry, resources | the conversation, as typed fields | nowhere; passed per call |
 
@@ -1412,17 +1412,34 @@ than the beta group — can rename a whole user directory aside and substitute t
 own. Submitting the tree's current contents would inherit that trust boundary.
 
 **What the evidence showed.** Arun's real `Submission.sh` is thirty-five lines of
-`module load` and `export PATH`, plus a single `orca input.inp > input.out`. Only
-the job name, the resources and the input filename vary per job. So registering the
-script *once*, from a file a human has read, costs almost nothing and removes the
-whole class of problem: **no shell content ever comes from the model, or from a file
-chosen at request time.**
+`module load` and `export PATH`, plus a single `orca input.inp > input.out`. Only the
+job name, the resources and the input filename vary per job. So **saving** the script
+once costs almost nothing and removes the whole class of problem: no shell content
+comes from the model, and none from a file chosen at request time.
 
-Registration copies the reviewed bytes into Aspen's storage and freezes them, because
-review has to bind to content rather than to a path whose contents can change
-afterwards. Assignment is a registry field (`job_runner`) set by
-`aspen-users set-runner`, CLI-only for the reason [§5.0](#50-getting-set-up-and-asking-for-things-aspensetuppy-aspenpendingpy)
-gives for calculations roots.
+**Users save their own runners** (revised 2026-08-13). The first build required an
+operator to register every script; that put an admin on the main path for no gain,
+given a beta group the operator would trust with this account anyway. So
+`save_job_runner` writes into the *speaker's own* library, exactly as
+`save_input_template` does, and what moves is **who reads the script before it runs**
+— the author, prompted by Aspen, instead of an admin.
+
+That makes the checks matter more, not less. Saving is two calls with a confirmation
+token: the first returns [§20.2](#202-what-the-script-may-contain)'s findings and the
+model is instructed to show them verbatim; only a call carrying the token saves. An
+override must **name the exact problems that were shown**, so "accept everything"
+cannot be spelled as a gesture and a check added later cannot arrive pre-accepted by
+an older confirmation. What was accepted is recorded on the runner.
+
+The bytes are frozen at save time and re-checked on every use, so review binds to
+content rather than to a path whose contents can change — which also means a runner
+cannot be swapped between saving and submitting. A colleague's runner is readable as
+`reference-only`, so protocols can be borrowed and adapted into your own.
+
+One thing stays out of the model's reach: the **default** runner (`job_runner` on the
+registry record, set by `aspen-users set-runner`) remains CLI-only, so an operator's
+assignment cannot be redirected by a conversation. Naming one of your saved runners
+per submission is an ordinary read.
 
 ### 20.2 What the script may contain
 

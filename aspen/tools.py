@@ -21,8 +21,8 @@ from typing import Optional
 
 import httpx
 
-from . import (config, demo, inputs, jobs, metadata, roots, setup, staging,
-               templates, workflows)
+from . import (config, demo, inputs, jobs, metadata, roots, runners, setup,
+               staging, templates, workflows)
 
 log = logging.getLogger("aspen")
 
@@ -628,6 +628,7 @@ def _submit_calculation(inp: dict, context: dict) -> tuple[str, list[str]]:
         preview = jobs.prepare_direct(
             requester_uid=uid, thread_ts=thread,
             template=inp.get("template", ""), owner=inp.get("owner", ""),
+            runner=inp.get("runner", ""),
             charge=_int("charge"), multiplicity=_int("multiplicity"),
             geometry_path=inp.get("geometry_path", ""),
             geometry_owner=inp.get("geometry_owner", ""),
@@ -701,6 +702,98 @@ def _converged_geometry(out_path):
     """ORCA writes the final geometry beside the output as ``<basename>.xyz``."""
     candidate = out_path.with_suffix(".xyz")
     return candidate if candidate.is_file() else None
+
+
+def _save_job_runner(inp: dict, context: dict) -> tuple[str, list[str]]:
+    """Check a job script, then save it as the SPEAKING USER'S own runner.
+
+    Two calls, like every other action with consequences. The first checks the
+    script and hands back the problems plus a token; only a call carrying that token
+    saves. The user is the one reading the warnings, so the warnings have to be worth
+    reading — they name the line and say why it matters when an account is shared.
+    """
+    uid = context.get("user_id", "")
+    thread = context.get("thread_ts", "")
+    token = (inp.get("confirm_token") or "").strip()
+    try:
+        if token:
+            payload = jobs.redeem_token(token, "save_runner", uid, thread)
+            meta = runners.save(
+                uid, payload["name"], payload["script"],
+                description=payload.get("description", ""),
+                ntasks=payload.get("ntasks") or 16,
+                mem_gb=payload.get("mem_gb") or 64,
+                time_limit=payload.get("time_limit") or "48:00:00",
+                accept_problems=payload.get("problems", []),
+                derived_from=payload.get("derived_from", ""),
+            )
+            note = f"Saved your `{meta['name']}` runner."
+            if meta["problems_accepted"]:
+                note += (f" {len(meta['problems_accepted'])} warning(s) recorded as "
+                         "accepted by you.")
+            return note + " Jobs can now be submitted with it.", []
+
+        script = inp.get("script", "")
+        if not script.strip():
+            return "Error: no script content to check.", []
+        problems = runners.script_problems(script)
+        payload = {
+            "name": inp.get("name", ""), "script": script,
+            "description": inp.get("description", ""),
+            "ntasks": inp.get("ntasks"), "mem_gb": inp.get("mem_gb"),
+            "time_limit": inp.get("time_limit", ""),
+            "derived_from": inp.get("derived_from", ""),
+            "problems": problems,
+        }
+        tok = jobs.issue_token("save_runner", uid, thread, payload)
+        if not problems:
+            return (f"Checked `{inp.get('name', '')}` — no problems found. NOT saved "
+                    "yet. Show the user the script, confirm this is what they run, "
+                    f"then call save_job_runner again with confirm_token={tok}.", [])
+        return (
+            f"Checked `{inp.get('name', '')}` — {len(problems)} thing(s) to look at. "
+            "NOT saved yet:\n"
+            + "\n".join(f"  • {p}" for p in problems)
+            + "\n\nSHOW THESE TO THE USER VERBATIM and ask about each one. Aspen "
+              "submits jobs under one shared account, so a cleanup step that was safe "
+              "in their own account can delete a colleague's work. If they confirm "
+              "each item is intentional and safe, call save_job_runner again with "
+              f"confirm_token={tok} — the acceptance is recorded against the runner. "
+              "If any of it was not intentional, fix the script and check it again.", [])
+    except (jobs.JobsError, runners.RunnerError) as exc:
+        return f"Error: {exc}", []
+
+
+def _list_job_runners(inp: dict, context: dict) -> tuple[str, list[str]]:
+    uid = context.get("user_id", "")
+    entries = runners.index(uid)
+    if not entries:
+        return ("No job runners saved yet. Ask the user for the job script they "
+                "normally submit; save_job_runner will check it over."), []
+    lines = [f"{len(entries)} saved runner(s):"]
+    for e in entries:
+        who = "yours" if e["mine"] else f"@{e['owner_alias']}"
+        d = e.get("defaults", {})
+        desc = f" — {e['description']}" if e.get("description") else ""
+        warn = "  [has accepted warnings]" if e.get("problems_accepted") else ""
+        lines.append(f"  {e['name']} ({who}, {d.get('ntasks', '?')} tasks, "
+                     f"{d.get('mem_gb', '?')} GB, {d.get('time', '?')}){desc}{warn}")
+    return "\n".join(lines), []
+
+
+def _read_job_runner(inp: dict, context: dict) -> tuple[str, list[str]]:
+    try:
+        return runners.read(inp.get("name", ""), context.get("user_id", ""),
+                            inp.get("owner", "")), []
+    except runners.RunnerError as exc:
+        return f"Error: {exc}", []
+
+
+def _delete_job_runner(inp: dict, context: dict) -> tuple[str, list[str]]:
+    try:
+        return runners.delete(context.get("user_id", ""), inp.get("name", "")), []
+    except runners.RunnerError as exc:
+        return f"Error: {exc}", []
 
 
 def _tool_server_post(path: str, payload: dict, timeout: int) -> httpx.Response:
@@ -1383,6 +1476,11 @@ TOOL_SPECS = [
                              "description": "Which saved input template to start from."},
                 "owner": {"type": "string",
                           "description": "Whose template, if not the speaker's own."},
+                "runner": {
+                    "type": "string",
+                    "description": ("Which saved job runner to submit with. Omit if "
+                                    "they have only one, or a default is set."),
+                },
                 "charge": {"type": "integer", "description": "Override the charge."},
                 "multiplicity": {"type": "integer",
                                  "description": "Override the multiplicity (2S+1)."},
@@ -1427,6 +1525,72 @@ TOOL_SPECS = [
         },
         "impl": _check_orca_run,
     },
+    {
+        "name": "list_job_runners",
+        "description": (
+            "List saved job runners — the shell scripts that actually submit a "
+            "calculation. Yours and colleagues'. Check here before asking the user "
+            "for a script they may already have saved."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "impl": _list_job_runners,
+    },
+    {
+        "name": "read_job_runner",
+        "description": ("Read a saved job runner's script. A colleague's is tagged "
+                        "reference-only: adapt it with the user and save the result as "
+                        "THEIR OWN runner, never over the original."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "owner": {"type": "string", "description": "Whose, if not the speaker's."},
+            },
+            "required": ["name"],
+        },
+        "impl": _read_job_runner,
+    },
+    {
+        "name": "save_job_runner",
+        "description": (
+            "Check a job script and save it as the SPEAKING USER'S own runner, so "
+            "their calculations can be submitted with it. Two calls: once with the "
+            "script to get it checked, then again with the confirm_token after the "
+            "user has seen any warnings and agreed. Use [INPUT] where the input "
+            "filename goes; also [OUTPUT] [JOB_NAME] [NTASKS] [MEM_GB] [TIME]. "
+            "Ask the user for the script they normally submit rather than inventing "
+            "one — theirs encodes module loads and paths you cannot guess."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string",
+                         "description": "Short lowercase-hyphenated name, e.g. 'orca-single'."},
+                "script": {"type": "string",
+                           "description": "The complete job script, with [INPUT] in it."},
+                "description": {"type": "string", "description": "One line: when to use it."},
+                "ntasks": {"type": "integer", "description": "Default cores."},
+                "mem_gb": {"type": "integer", "description": "Default memory in GB."},
+                "time_limit": {"type": "string", "description": "Default walltime HH:MM:SS."},
+                "derived_from": {"type": "string",
+                                 "description": "Alias, if adapted from a colleague's."},
+                "confirm_token": {
+                    "type": "string",
+                    "description": ("The token from your check call. Only after the user "
+                                    "has seen the warnings and agreed. Never invent one."),
+                },
+            },
+            "required": [],
+        },
+        "impl": _save_job_runner,
+    },
+    {
+        "name": "delete_job_runner",
+        "description": "Delete one of the SPEAKING USER'S own runners. Snapshotted first.",
+        "input_schema": {"type": "object", "properties": {"name": {"type": "string"}},
+                         "required": ["name"]},
+        "impl": _delete_job_runner,
+    },
 ]
 
 # name → impl(input, context) -> (text, attachments)
@@ -1440,6 +1604,7 @@ JOB_TOOLS = frozenset({
     # and a demo visitor has no library and nothing to run.
     "list_input_templates", "read_input_template", "save_input_template",
     "delete_input_template",
+    "list_job_runners", "read_job_runner", "save_job_runner", "delete_job_runner",
 })
 
 

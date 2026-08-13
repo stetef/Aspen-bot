@@ -366,17 +366,16 @@ JOBS_ENV_FORBIDDEN    = ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "ANTHROPIC_API_KE
 # ---------------------------------------------------------------------------
 # Runner profiles (aspen/runners.py)
 #
-# What actually executes, registered once by a human from a file they have read,
-# then frozen in Aspen's own storage. Per-user assignment lives on the registry
-# record (`job_runner`) beside `calc_root`, and is CLI-only for the same reason:
-# a tool that wrote it would reinstate the surface that taking paths out of the
-# model's hands removes.
+# The job scripts a submission runs. Users own their own, exactly like templates:
+# Aspen saves one for the person it is talking to after checking it and getting an
+# explicit confirmation. The *default* runner (`job_runner` on the registry record)
+# stays CLI-only, so an operator's assignment cannot be redirected by a conversation.
 # ---------------------------------------------------------------------------
-RUNNERS_FILE          = Path(
-    os.getenv("ASPEN_RUNNERS_FILE", str(STATE_DIR / "runners.json"))
+RUNNERS_ROOT          = Path(
+    os.getenv("ASPEN_RUNNERS_ROOT", str(STATE_DIR / "runners"))
 ).resolve()
-RUNNERS_DIR           = Path(
-    os.getenv("ASPEN_RUNNERS_DIR", str(STATE_DIR / "runners"))
+RUNNERS_HISTORY_ROOT  = Path(
+    os.getenv("ASPEN_RUNNERS_HISTORY_ROOT", str(STATE_DIR / "runners_history"))
 ).resolve()
 # Ceilings on what a rendered job script may ask for. A typo in a resource field
 # is the "runaway compute" the threat model names.

@@ -45,11 +45,10 @@ def registered(sut, env, tmp_path):
         {"slack_user_id": "U0SAM", "alias": "sam", "display_name": "Sam", "role": "admin"},
         {"slack_user_id": "U01ARUN", "alias": "arun", "display_name": "Arun N."},
     )
-    script = tmp_path / "orca.sh"
-    script.write_text(SCRIPT)
-    profile = sut.runners.register("orca-nbo", script, description="single point + NBO",
-                                   ntasks=32, mem_gb=256, time_limit="48:00:00")
-    return {"env": env, "script": script, "profile": profile}
+    profile = sut.runners.save("U01ARUN", "orca-nbo", SCRIPT,
+                               description="single point + NBO",
+                               ntasks=32, mem_gb=256, time_limit="48:00:00")
+    return {"env": env, "profile": profile}
 
 
 # --------------------------------------------------------------------------- #
@@ -95,68 +94,75 @@ def test_destructive_lines_are_surfaced(sut, line, label):
     assert "shared account" in problems[0] or "absolute path" in problems[0]
 
 
-def test_a_script_without_the_input_placeholder_is_refused(sut, tmp_path):
+def test_a_script_without_the_input_placeholder_is_refused(sut, env):
     """Otherwise Aspen has no way to tell the job which input to run."""
-    script = tmp_path / "s.sh"
-    script.write_text(SCRIPT.replace("[INPUT]", "hardcoded.inp"))
+    env.default_group()
     with pytest.raises(sut.runners.RunnerError) as exc:
-        sut.runners.register("no-input", script)
+        sut.runners.save("U0SAM", "no-input", SCRIPT.replace("[INPUT]", "hardcoded.inp"))
     assert "[INPUT]" in str(exc.value)
 
 
-def test_an_unknown_placeholder_is_refused(sut, tmp_path):
-    script = tmp_path / "s.sh"
-    script.write_text(SCRIPT + "\necho [MADE_UP]\n")
+def test_an_unknown_placeholder_is_refused(sut, env):
+    env.default_group()
     with pytest.raises(sut.runners.RunnerError) as exc:
-        sut.runners.register("bogus", script)
+        sut.runners.save("U0SAM", "bogus", SCRIPT + "\necho [MADE_UP]\n")
     assert "MADE_UP" in str(exc.value)
 
 
-def test_an_absolute_sbatch_output_path_is_refused(sut, tmp_path):
-    script = tmp_path / "s.sh"
-    script.write_text(SCRIPT.replace("#SBATCH --chdir=./",
-                                     "#SBATCH --output=/sdf/home/someone/out.log"))
-    with pytest.raises(sut.runners.RunnerError):
-        sut.runners.register("abs", script)
-
-
-def test_force_records_what_was_accepted(sut, env, tmp_path):
-    """A legitimate scratch cleanup is common; the acceptance must be auditable."""
+def test_an_absolute_sbatch_output_path_is_refused(sut, env):
     env.default_group()
-    script = tmp_path / "s.sh"
-    script.write_text(SCRIPT + '\nrm -rf "$tdir"\n')
     with pytest.raises(sut.runners.RunnerError):
-        sut.runners.register("scratchy", script)
-    profile = sut.runners.register("scratchy", script, force=True)
-    assert profile["problems_accepted"], "the override must be recorded, not silent"
-    assert any("rm" in p for p in profile["problems_accepted"])
+        sut.runners.save("U0SAM", "abs", SCRIPT.replace(
+            "#SBATCH --chdir=./", "#SBATCH --output=/sdf/home/someone/out.log"))
+
+
+def test_an_override_must_name_the_exact_problems_shown(sut, env):
+    """"Accept everything" cannot be spelled as a gesture.
+
+    The user is the one reading the warnings now, so an acceptance has to be of the
+    specific things they were shown — otherwise a check added later would arrive
+    pre-accepted by an older confirmation.
+    """
+    env.default_group()
+    body = SCRIPT + '\nrm -rf "$tdir"\n'
+    problems = sut.runners.script_problems(body)
+    assert problems
+
+    with pytest.raises(sut.runners.RunnerError):
+        sut.runners.save("U0SAM", "scratchy", body)
+    with pytest.raises(sut.runners.RunnerError):
+        sut.runners.save("U0SAM", "scratchy", body, accept_problems=["something else"])
+
+    profile = sut.runners.save("U0SAM", "scratchy", body, accept_problems=problems)
+    assert profile["problems_accepted"] == problems, (
+        "the acceptance must be recorded, not silent"
+    )
 
 
 # --------------------------------------------------------------------------- #
 # Registration freezes the reviewed bytes
 # --------------------------------------------------------------------------- #
-def test_registration_copies_the_script_into_aspens_storage(sut, registered):
+def test_saving_freezes_the_script_in_the_owners_library(sut, registered):
     profile = registered["profile"]
     stored = sut.runners.Path(profile["script"])
     assert stored.is_file()
-    assert stored.parent == sut.RUNNERS_DIR
+    assert stored.parent.name == "arun__U01ARUN"
     assert stored.read_text() == SCRIPT
 
 
-def test_editing_the_source_afterwards_changes_nothing(sut, registered):
-    """The review binds to bytes, not to a path whose contents can change."""
-    registered["script"].write_text(SCRIPT + "\nrm -rf /\n")
-    body = sut.runners.script_for(registered["profile"])
-    assert "rm -rf /" not in body
+def test_an_overwrite_is_snapshotted(sut, registered):
+    sut.runners.save("U01ARUN", "orca-nbo", SCRIPT.replace("orca504", "orca601"))
+    history = list((sut.RUNNERS_HISTORY_ROOT / "U01ARUN").glob("orca-nbo-*.sh"))
+    assert len(history) == 1 and "orca504" in history[0].read_text()
 
 
 def test_the_frozen_script_is_rechecked_on_use(sut, registered):
-    """It lives on disk, where an operator could edit it outside the CLI."""
+    """It lives on disk, where it could be edited outside Aspen."""
     stored = sut.runners.Path(registered["profile"]["script"])
     stored.write_text(SCRIPT + "\nsudo rm -rf /sdf/data\n")
     with pytest.raises(sut.runners.RunnerError) as exc:
         sut.runners.script_for(registered["profile"])
-    assert "re-register" in str(exc.value)
+    assert "save it again" in str(exc.value)
 
 
 def test_a_missing_script_is_an_error_not_an_empty_render(sut, registered):
@@ -209,7 +215,7 @@ def test_defaults_apply_when_nothing_is_supplied(sut, registered):
 # --------------------------------------------------------------------------- #
 # Assignment
 # --------------------------------------------------------------------------- #
-def test_assignment_comes_from_the_registry(sut, registered):
+def test_the_default_runner_comes_from_the_registry(sut, registered):
     env = registered["env"]
     env.register(
         {"slack_user_id": "U0SAM", "alias": "sam", "display_name": "Sam", "role": "admin"},
@@ -218,6 +224,8 @@ def test_assignment_comes_from_the_registry(sut, registered):
     )
     assert sut.runners.for_user("U01ARUN")["name"] == "orca-nbo"
     assert sut.runners.for_user("U0SAM") is None, "no runner means no submission"
+    # ...and naming one explicitly is an ordinary read, so the model may do it.
+    assert sut.runners.for_user("U0SAM", "orca-nbo")["name"] == "orca-nbo"
 
 
 def test_an_assignment_to_an_unregistered_runner_resolves_to_nothing(sut, registered):
@@ -233,48 +241,53 @@ def test_nothing_in_the_agents_reach_assigns_a_runner(sut):
     """Which script executes is chosen by an operator, never by a conversation."""
     for spec in sut.TOOL_SPECS:
         props = set(spec["input_schema"].get("properties", {}))
-        for forbidden in ("runner", "job_runner", "script", "script_path"):
-            assert forbidden not in props, (
-                f"{spec['name']} must not accept {forbidden!r} — that would let the "
-                "model choose what executes"
-            )
+        # `runner` NAMES a saved runner, which is an ordinary read; `script` on
+        # save_job_runner is the content the user is being shown and asked about.
+        # What must stay absent everywhere is a PATH, which would let a conversation
+        # point at a file nobody reviewed.
+        for forbidden in ("script_path", "job_script_path", "runner_path"):
+            assert forbidden not in props, f"{spec['name']} must not accept {forbidden!r}"
 
 
 # --------------------------------------------------------------------------- #
 # Registry hygiene
 # --------------------------------------------------------------------------- #
-def test_bad_runner_names_are_refused(sut, env, tmp_path):
+def test_bad_runner_names_are_refused(sut, env):
     env.default_group()
-    script = tmp_path / "s.sh"
-    script.write_text(SCRIPT)
     for bad in ("Has Space", "UPPER-ok?", "../x", "", "dots.here"):
         with pytest.raises(sut.runners.RunnerError):
-            sut.runners.register(bad, script)
+            sut.runners.save("U0SAM", bad, SCRIPT)
 
 
-def test_an_unsupported_code_is_refused(sut, env, tmp_path):
+def test_an_unsupported_code_is_refused(sut, env):
     env.default_group()
-    script = tmp_path / "s.sh"
-    script.write_text(SCRIPT)
     with pytest.raises(sut.runners.RunnerError) as exc:
-        sut.runners.register("g16", script, code="gaussian")
+        sut.runners.save("U0SAM", "g16", SCRIPT, code="gaussian")
     assert "validator" in str(exc.value)
 
 
-def test_a_corrupt_runner_registry_reads_as_empty_not_as_a_crash(sut, env):
-    env.default_group()
-    sut.RUNNERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    sut.RUNNERS_FILE.write_text("{not json")
-    assert sut.runners.load() == {}
+def test_a_corrupt_metadata_file_is_skipped_not_crashed_on(sut, registered):
+    directory = sut.runners.dir_for("U01ARUN")
+    (directory / "broken.json").write_text("{not json")
+    (directory / "broken.sh").write_text(SCRIPT)
+    names = [e["name"] for e in sut.runners.index("U01ARUN")]
+    assert "orca-nbo" in names and "broken" not in names
 
 
-def test_replacing_a_runner_needs_force(sut, registered, tmp_path):
-    other = tmp_path / "other.sh"
-    other.write_text(SCRIPT)
-    with pytest.raises(sut.runners.RunnerError) as exc:
-        sut.runners.register("orca-nbo", other)
-    assert "already exists" in str(exc.value)
-    assert sut.runners.register("orca-nbo", other, force=True)
+def test_a_colleagues_runner_is_reference_only(sut, registered):
+    body = sut.runners.read("orca-nbo", "U0SAM", owner="arun")
+    assert 'trust="reference-only"' in body
+    assert "save the result as THEIR OWN runner" in body
+
+
+def test_saving_cannot_reach_another_users_library(sut, registered):
+    """C9 for runners: the destination is the Slack event's user."""
+    import inspect
+    sig = inspect.signature(sut.runners.save)
+    assert "owner" not in sig.parameters and list(sig.parameters)[0] == "uid"
+    sut.runners.save("U0SAM", "orca-nbo", SCRIPT.replace("orca504", "mine"))
+    arun = sut.runners.script_for(sut.runners.resolve("orca-nbo", "U01ARUN", owner="arun"))
+    assert "orca504" in arun, "Sam's save must not have touched Arun's runner"
 
 
 # --------------------------------------------------------------------------- #
@@ -300,9 +313,7 @@ def ready(sut, env, tmp_path, monkeypatch):
         {"slack_user_id": "U01ARUN", "alias": "arun", "display_name": "Arun N.",
          "calc_root": str(root), "unix_user": "aasundi", "job_runner": "orca-nbo"},
     )
-    script = tmp_path / "orca.sh"
-    script.write_text(SCRIPT)
-    sut.runners.register("orca-nbo", script, ntasks=32, mem_gb=256)
+    sut.runners.save("U01ARUN", "orca-nbo", SCRIPT, ntasks=32, mem_gb=256)
     sut.templates.write("U01ARUN", "nbo-standard", TEMPLATE, description="single point")
     (root / "structures").mkdir()
     (root / "structures" / "new.xyz").write_text(
@@ -357,23 +368,16 @@ def test_commit_submits_with_a_tag_and_records_the_ledger(sut, ready, monkeypatc
     assert row["comment"] == "aspen/v1/U01ARUN/1723480000.1"
 
 
-def test_a_user_with_no_runner_cannot_submit(sut, ready):
+def test_a_user_with_no_runner_is_told_how_to_get_one(sut, ready):
+    """Not an admin request any more — the user can supply their own script."""
     with pytest.raises(sut.jobs.JobsError) as exc:
         sut.jobs.prepare_direct(requester_uid="U0SAM", thread_ts="1",
                                 template="nbo-standard", owner="arun")
-    assert "no job runner" in str(exc.value)
-
-
-def test_a_pipeline_runner_is_directed_to_the_batch_tool(sut, ready, env, tmp_path):
-    script = tmp_path / "p.sh"
-    script.write_text(SCRIPT)
-    sut.runners.register("batch", script, kind="pipeline")
-    env.register({"slack_user_id": "U01ARUN", "alias": "arun", "display_name": "Arun N.",
-                  "calc_root": str(ready["root"]), "job_runner": "batch"})
-    with pytest.raises(sut.jobs.JobsError) as exc:
-        sut.jobs.prepare_direct(requester_uid="U01ARUN", thread_ts="1",
-                                template="nbo-standard")
-    assert "submit_orca_batch" in str(exc.value)
+    message = str(exc.value)
+    assert "none saved yet" in message
+    assert "job script you normally use" in message, (
+        "the refusal should ask for the thing that unblocks it"
+    )
 
 
 def test_a_geometry_outside_the_root_is_refused(sut, ready):

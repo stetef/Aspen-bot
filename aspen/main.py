@@ -51,8 +51,8 @@ def _check_state_locations() -> None:
                           ("job staging root", config.JOBS_STAGING_ROOT),
                           ("template library", config.TEMPLATES_ROOT),
                           ("template history", config.TEMPLATES_HISTORY_ROOT),
-                          ("runner registry", config.RUNNERS_FILE),
-                          ("runner scripts", config.RUNNERS_DIR)):
+                          ("runner library", config.RUNNERS_ROOT),
+                          ("runner history", config.RUNNERS_HISTORY_ROOT)):
         for area in danger:
             if _under(target, area):
                 raise SystemExit(

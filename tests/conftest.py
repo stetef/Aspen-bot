@@ -103,8 +103,8 @@ _MODMAP = {
     "inputs": "aspen",
     "templates": "aspen",
     "runners": "aspen",
-    "RUNNERS_FILE": "aspen.config",
-    "RUNNERS_DIR": "aspen.config",
+    "RUNNERS_ROOT": "aspen.config",
+    "RUNNERS_HISTORY_ROOT": "aspen.config",
     "RUNNER_MAX_NTASKS": "aspen.config",
     "RUNNER_MAX_MEM_GB": "aspen.config",
     "RUNNER_MAX_HOURS": "aspen.config",
@@ -323,8 +323,8 @@ class AspenEnv:
         monkeypatch.setattr(sut, "JOBS_LEDGER", self.state / "jobs.sqlite")
         monkeypatch.setattr(sut, "JOBS_STAGING_ROOT", self.state / "jobs-staging")
         monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", True)
-        monkeypatch.setattr(sut, "RUNNERS_FILE", self.state / "runners.json")
-        monkeypatch.setattr(sut, "RUNNERS_DIR", self.state / "runners")
+        monkeypatch.setattr(sut, "RUNNERS_ROOT", self.state / "runners")
+        monkeypatch.setattr(sut, "RUNNERS_HISTORY_ROOT", self.state / "runners_history")
         monkeypatch.setattr(sut, "TEMPLATES_ROOT", self.state / "templates")
         monkeypatch.setattr(sut, "TEMPLATES_HISTORY_ROOT", self.state / "templates_history")
         (self.state / "workflows").mkdir(exist_ok=True)

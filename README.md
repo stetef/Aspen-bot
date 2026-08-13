@@ -349,22 +349,28 @@ blocks. What it refuses is the small set of ORCA directives that run other progr
 or write outside the run directory. The preview is a **diff**, not a summary, because
 you'll spot a wrong functional faster than any validator will.
 
-**Aspen never writes the shell script.** That's registered once by an admin, from a
-file they've read, and frozen — so nothing the model produces, and no file picked
-mid-conversation, ends up as shell running on a compute node. Your existing job
-script is the starting point; it needs `[INPUT]` where the input filename goes.
+**Aspen never writes the shell script — you do, once.** Show it the job script you
+normally submit; it checks the script over, shows you anything worth a second look,
+and saves it as your *runner* once you confirm. Put `[INPUT]` where the input filename
+goes (also `[OUTPUT]`, `[JOB_NAME]`, `[NTASKS]`, `[MEM_GB]`, `[TIME]`). After that it's
+reusable, like a template.
 
-```bash
-./aspen-users runner add orca-nbo --script ~/my-job.sh --ntasks 32 --mem-gb 256
-./aspen-users set-runner arun-asundi orca-nbo
-./aspen-users runner list
+```
+you    @Aspen here's my ORCA job script <pastes it>  — save it as orca-single
+Aspen  Checked it — one thing to look at:
+         line 41: rm — deleting files as the shared account…
+       These jobs run under one shared account now, so a cleanup line that was safe
+       in your own account can delete a colleague's work. Is that intentional?
+you    yes, that only clears the job's own scratch dir
+Aspen  Saved your `orca-single` runner. 1 warning recorded as accepted by you.
 ```
 
-Registration will complain about `rm`, `rsync --delete`, `sudo`, absolute redirects
-and similar. That's aimed at habit, not malice: these jobs run under one shared
-account now, so a cleanup line that was safe in your own account can delete someone
-else's work. If it's flagging a legitimate scratch cleanup, `--force` accepts it and
-records what you accepted.
+It flags `rm`, `rsync --delete`, `sudo`, absolute redirects and similar — aimed at
+habit rather than malice. An acceptance has to name the specific warning you were
+shown, and it's recorded on the runner, so "who accepted this and what" is answerable
+later. From a terminal: `aspen-users runner add <who> <name> --script <file>`,
+`runner list`, `runner show <who> <name>`, and `set-runner <who> <name>` to set a
+default when someone has several.
 
 **Follow-ons.** `check_orca_run` reads an output and says whether the optimisation
 converged and where the optimised geometry is, so "if it converged, run TD-DFT on the
