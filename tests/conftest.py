@@ -101,6 +101,10 @@ _MODMAP = {
     "jobs": "aspen",
     "staging": "aspen",
     "inputs": "aspen",
+    "templates": "aspen",
+    "TEMPLATES_ROOT": "aspen.config",
+    "TEMPLATES_HISTORY_ROOT": "aspen.config",
+    "MAX_TEMPLATE_BYTES": "aspen.config",
     "ORCA_EXTRA_BLOCKS": "aspen.config",
     "main": "aspen",
     "DEMO_ENABLED": "aspen.config",
@@ -313,6 +317,8 @@ class AspenEnv:
         monkeypatch.setattr(sut, "JOBS_LEDGER", self.state / "jobs.sqlite")
         monkeypatch.setattr(sut, "JOBS_STAGING_ROOT", self.state / "jobs-staging")
         monkeypatch.setattr(sut, "JOBS_SUBMIT_ENABLED", True)
+        monkeypatch.setattr(sut, "TEMPLATES_ROOT", self.state / "templates")
+        monkeypatch.setattr(sut, "TEMPLATES_HISTORY_ROOT", self.state / "templates_history")
         (self.state / "workflows").mkdir(exist_ok=True)
         sut.registry.invalidate()
 

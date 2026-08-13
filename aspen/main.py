@@ -48,7 +48,9 @@ def _check_state_locations() -> None:
                           ("telemetry log", config.TELEMETRY_DIR),
                           ("telemetry switch", config.TELEMETRY_STATE_FILE),
                           ("job ledger", config.JOBS_LEDGER),
-                          ("job staging root", config.JOBS_STAGING_ROOT)):
+                          ("job staging root", config.JOBS_STAGING_ROOT),
+                          ("template library", config.TEMPLATES_ROOT),
+                          ("template history", config.TEMPLATES_HISTORY_ROOT)):
         for area in danger:
             if _under(target, area):
                 raise SystemExit(

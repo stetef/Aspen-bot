@@ -364,6 +364,25 @@ JOBS_ENV_FORBIDDEN    = ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "ANTHROPIC_API_KE
 
 
 # ---------------------------------------------------------------------------
+# Per-user input templates (aspen/templates.py)
+#
+# "The way Arun runs a TD-DFT", saved as a reusable artifact. Beside the workflows
+# tree and for the same reasons: these are read back later to BUILD A JOB, so a
+# sandbox-writable template is the slow-loop injection path §7 describes for
+# metadata, with a compute node on the end of it. Startup refuses if either path
+# lands somewhere writable.
+# ---------------------------------------------------------------------------
+TEMPLATES_ROOT         = Path(
+    os.getenv("ASPEN_TEMPLATES_ROOT", str(STATE_DIR / "templates"))
+).resolve()
+TEMPLATES_HISTORY_ROOT = Path(
+    os.getenv("ASPEN_TEMPLATES_HISTORY_ROOT", str(STATE_DIR / "templates_history"))
+).resolve()
+# An input file is data, not prose — but still small.
+MAX_TEMPLATE_BYTES     = int(os.getenv("ASPEN_MAX_TEMPLATE_BYTES", "200000"))
+
+
+# ---------------------------------------------------------------------------
 # Input-file validation (aspen/inputs.py)
 #
 # Aspen may edit a user's quantum-chemistry input freely — functional, basis set,
