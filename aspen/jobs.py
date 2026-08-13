@@ -116,6 +116,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     exit_code     TEXT,
     reconciled_at TEXT,
     cancelled_at  TEXT,
+    -- The --comment tag, when Aspen submitted this job itself (direct runners).
+    -- Empty for pipeline runners, which call sbatch on their own and give Aspen no
+    -- way to set one. A row that HAS a tag must match it at cancel time.
+    comment       TEXT,
     PRIMARY KEY (job_id, batch_id)
 );
 CREATE INDEX IF NOT EXISTS idx_batches_user ON batches(slack_user_id);
@@ -139,8 +143,24 @@ def connect() -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(_SCHEMA)
+    _migrate(conn)
     conn.commit()
     return conn
+
+
+def _migrate(conn) -> None:
+    """Add columns a previous version did not have.
+
+    ``CREATE TABLE IF NOT EXISTS`` silently does nothing to an existing table, so a
+    ledger written before a column existed keeps working but loses the new field —
+    which for ``comment`` would mean a tagged job reading as untagged, i.e. one
+    fewer check at cancel time. Cheap to do, expensive to discover.
+    """
+    have = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    for column, decl in (("comment", "TEXT"),):
+        if column not in have:
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {decl}")
+            log.info("jobs: added ledger column %s", column)
 
 
 def _utc_now() -> str:
@@ -174,7 +194,7 @@ def record_jobs(batch_id: str, entries: Iterable[dict]) -> int:
     """Record the scheduler jobs a batch produced. Immutable once written."""
     rows = [
         (str(e["job_id"]), batch_id, e.get("kind", ""), e.get("job_name", ""),
-         str(e["work_dir"]), _utc_now())
+         str(e["work_dir"]), _utc_now(), e.get("comment", ""))
         for e in entries
     ]
     if not rows:
@@ -182,7 +202,7 @@ def record_jobs(batch_id: str, entries: Iterable[dict]) -> int:
     with connect() as conn:
         conn.executemany(
             "INSERT OR IGNORE INTO jobs (job_id, batch_id, kind, job_name, "
-            "work_dir, submitted_at) VALUES (?,?,?,?,?,?)",
+            "work_dir, submitted_at, comment) VALUES (?,?,?,?,?,?,?)",
             rows,
         )
     return len(rows)
@@ -550,15 +570,31 @@ def resolve_cancellable(requester_uid: str, selector: str = "") -> tuple[list, l
             )
             continue
 
+        # The tag, where there is one. Direct runners get it because Aspen calls
+        # sbatch itself; the pipeline path cannot set it (no SBATCH_COMMENT), so its
+        # jobs are fenced by WorkDir alone.
         comment = info.get("Comment", "")
-        if comment and comment.startswith("aspen/v1/"):
-            # Not yet set by the pipeline (spec §19.9). When it is, it becomes a
-            # second independent check rather than replacing WorkDir.
-            expected = f"aspen/v1/{requester_uid}/"
+        expected = f"{COMMENT_PREFIX}/{requester_uid}/"
+        recorded = (row.get("comment") or "").strip()
+
+        if recorded:
+            # The ledger says WE tagged this job. Slurm must agree, exactly. A
+            # tagged row whose live comment is missing or different is either a
+            # recycled ID or something stranger — either way, not ours to cancel.
+            if comment != recorded:
+                refused.append((jid, "its Aspen tag no longer matches our record"))
+                log.warning("jobs: tag mismatch on %s: recorded %r, live %r",
+                            jid, recorded, comment)
+                continue
             if not comment.startswith(expected):
                 refused.append((jid, "its Aspen tag names a different user"))
-                log.warning("jobs: comment mismatch on %s: %r", jid, comment)
+                log.warning("jobs: comment/user mismatch on %s: %r", jid, comment)
                 continue
+        elif comment.startswith(COMMENT_PREFIX + "/") and not comment.startswith(expected):
+            # Untagged in the ledger but tagged in Slurm, for someone else.
+            refused.append((jid, "its Aspen tag names a different user"))
+            log.warning("jobs: comment mismatch on %s: %r", jid, comment)
+            continue
 
         row = dict(row)
         row["live_state"] = info.get("JobState", "")
@@ -1018,3 +1054,245 @@ def reconcile(days: int = 30) -> dict:
 def _all_job_ids() -> list:
     with connect() as conn:
         return [dict(r) for r in conn.execute("SELECT job_id FROM jobs")]
+
+
+# --------------------------------------------------------------------------- #
+# Direct submission — Aspen builds the sbatch argv itself
+#
+# This is the path for a `direct` runner (spec §20): one job, one input file, from
+# a registered job script. It differs from the pipeline path in a way that matters
+# for the cancel boundary — because Aspen calls `sbatch` here rather than delegating
+# to an orchestrator, it CAN set `--comment`, which the pipeline path cannot. So
+# these jobs carry the per-user tag the original design (§18.2) wanted, on top of
+# the WorkDir fence.
+# --------------------------------------------------------------------------- #
+COMMENT_PREFIX = "aspen/v1"
+_COMMENT_RE = re.compile(r"^aspen/v1/[A-Z0-9]+/[0-9.]+$")
+
+
+def build_comment(requester_uid: str, thread_ts: str) -> str:
+    """The durable machine tag: ``aspen/v1/<slack-id>/<thread-ts>``.
+
+    Composed only from the Slack event's own fields — never from conversation text
+    — which is the property that makes it un-forgeable (C9). The ID rather than the
+    alias, because aliases are renameable and a tag baked into a months-old job
+    record must still resolve.
+    """
+    if not _SLACK_ID_RE.match(requester_uid or ""):
+        raise JobsError("Internal error: cannot tag a job without a Slack user ID.")
+    thread = re.sub(r"[^0-9.]", "", str(thread_ts)) or "0"
+    comment = f"{COMMENT_PREFIX}/{requester_uid}/{thread}"
+    if not _COMMENT_RE.match(comment):
+        raise JobsError("Internal error: refusing to build a malformed job tag.")
+    return comment
+
+
+def build_job_name(alias: str, label: str) -> str:
+    """``aspen-<alias>-<label>`` — what the group sees in ``squeue``.
+
+    Human-facing only. Never an authorization key: aliases are renameable, names
+    are not unique, and a human can type one by hand.
+    """
+    safe = re.sub(r"[^A-Za-z0-9]+", "-", f"{alias}-{label}").strip("-")[:48]
+    return f"aspen-{safe}" if safe else "aspen-job"
+
+
+def build_sbatch_argv(*, script_name: str, job_name: str, comment: str,
+                      chdir: Path) -> list:
+    """``sbatch --parsable --job-name=… --comment=… --chdir=… script``.
+
+    A list, built here, with no user-supplied flags anywhere — which is the whole
+    reason ``sbatch`` is a structured tool instead of a Bash allowlist entry. Every
+    argument is either a literal, a value this module derived, or a name validated
+    to ``[A-Za-z0-9._-]``. ``--parsable`` makes stdout just the job ID, so parsing
+    cannot be the weak link it was on the pipeline path.
+
+    ``--wrap`` is the flag this design exists to avoid, so it is asserted absent
+    rather than merely left out.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", script_name or ""):
+        raise JobsError(f"{script_name!r} is not a usable script filename")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", job_name or ""):
+        raise JobsError(f"{job_name!r} is not a usable job name")
+    if not _COMMENT_RE.match(comment or ""):
+        raise JobsError("refusing to submit without a well-formed Aspen tag")
+
+    argv = [
+        "sbatch", "--parsable",
+        f"--job-name={job_name}",
+        f"--comment={comment}",
+        f"--chdir={chdir}",
+        script_name,
+    ]
+    if any("--wrap" in a for a in argv):        # pragma: no cover — belt and braces
+        raise JobsError("refusing to build an sbatch with --wrap")
+    return argv
+
+
+def _parse_job_id(stdout: str) -> str:
+    """The job ID from ``sbatch --parsable`` output (``12345`` or ``12345;cluster``)."""
+    first = (stdout or "").strip().splitlines()[0] if (stdout or "").strip() else ""
+    candidate = first.split(";")[0].strip()
+    if not _JOB_ID_RE.match(candidate):
+        raise JobsError(f"could not read a job ID from sbatch output: {stdout[:200]!r}")
+    return candidate
+
+
+def prepare_direct(*, requester_uid: str, thread_ts: str, template: str,
+                   owner: str = "", charge: Optional[int] = None,
+                   multiplicity: Optional[int] = None, geometry_path: str = "",
+                   geometry_owner: str = "", ntasks: Optional[int] = None,
+                   mem_gb: Optional[int] = None, time_limit: str = "",
+                   label: str = "") -> dict:
+    """Build everything a direct submission needs, stage it, and return a preview.
+
+    Nothing is submitted. Returns the rendered input, the diff against the template
+    it came from, and a single-use token — so the user sees exactly what changed
+    before agreeing to spend compute on it.
+    """
+    from . import inputs, runners, staging as staging_mod, templates
+
+    require_registered(requester_uid)
+    if not config.JOBS_SUBMIT_ENABLED:
+        raise JobsError("Job submission is switched off on this deployment.")
+
+    profile = runners.for_user(requester_uid)
+    if profile is None:
+        raise JobsError(
+            "You have no job runner assigned, so Aspen can't submit for you. An "
+            "admin sets one up with `aspen-users runner add` and `set-runner`."
+        )
+    if profile.get("kind") != "direct":
+        raise JobsError(
+            f"Your runner ({profile['name']}) drives the batch pipeline, not single "
+            "jobs — use submit_orca_batch instead."
+        )
+    code = profile.get("code", "orca")
+
+    # The starting point: one of the requester's templates, or a colleague's by
+    # name. A read, fenced like every other read.
+    original, meta = templates.resolve(template, requester_uid, owner)
+    inputs.check(original, code)            # stored file, current rules
+
+    text = original
+    coordinates = None
+    if geometry_path:
+        path, scope, error = roots_resolve(geometry_path, geometry_owner, requester_uid)
+        if error:
+            raise JobsError(error)
+        if path.suffix.lower() != ".xyz":
+            raise JobsError(f"'{geometry_path}' is not an .xyz structure file.")
+        coordinates = inputs.coordinates_from_xyz(
+            path.read_text(encoding="utf-8", errors="replace")
+        )
+
+    if any(v is not None for v in (charge, multiplicity)) or coordinates:
+        text = inputs.replace_geometry(
+            text, charge=charge, multiplicity=multiplicity, coordinates=coordinates
+        )
+    inputs.check(text, code)                # and again after editing
+
+    # Stage: the input and the rendered script, in the requester's own area.
+    staging_dir = staging_mod.new_run_dir(requester_uid, thread_ts)
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", (label or meta.get("name") or "job")).strip("-")[:40]
+    stem = stem or "job"
+    input_name, output_name = f"{stem}.inp", f"{stem}.out"
+    script_name = "aspen-job.sh"
+
+    (staging_dir / input_name).write_text(text, encoding="utf-8")
+    script = runners.render(
+        profile, job_name=build_job_name(
+            (registry.by_id(requester_uid) or {}).get("alias", "user"), stem),
+        input_name=input_name, output_name=output_name,
+        ntasks=ntasks, mem_gb=mem_gb, time_limit=time_limit,
+    )
+    (staging_dir / script_name).write_text(script, encoding="utf-8")
+    (staging_dir / script_name).chmod(0o700)
+
+    payload = {
+        "runner": profile["name"], "code": code, "template": meta.get("name", template),
+        "template_owner": meta.get("owner_alias", ""),
+        "staging_dir": str(staging_dir), "input_name": input_name,
+        "output_name": output_name, "script_name": script_name,
+        "label": stem, "geometry_path": geometry_path,
+    }
+    token = issue_token("submit_direct", requester_uid, thread_ts, payload)
+    return {**payload, "token": token, "input_text": text,
+            "diff": _unified_diff(original, text, meta.get("name", template), input_name)}
+
+
+def roots_resolve(rel: str, owner: str, viewer_uid: str):
+    """Indirection so the geometry lookup goes through the one fenced seam."""
+    from . import roots
+    return roots.resolve(rel, owner, viewer_uid)
+
+
+def _unified_diff(before: str, after: str, before_name: str, after_name: str,
+                  limit: int = 120) -> str:
+    """What changed, for the user to read before agreeing.
+
+    The human review step is doing real work here: the people using this are domain
+    experts who will spot a wrong functional or a missing constraint immediately,
+    which no validator can do.
+    """
+    import difflib
+    lines = list(difflib.unified_diff(
+        before.splitlines(), after.splitlines(),
+        fromfile=before_name, tofile=after_name, lineterm="", n=2,
+    ))
+    if not lines:
+        return "(no change from the template)"
+    if len(lines) > limit:
+        lines = lines[:limit] + [f"… ({len(lines) - limit} more diff lines)"]
+    return "\n".join(lines)
+
+
+def commit_direct(*, requester_uid: str, thread_ts: str, token: str) -> dict:
+    """Redeem a prepared submission and run ``sbatch``. Ledger first, always."""
+    require_registered(requester_uid)
+    if not config.JOBS_SUBMIT_ENABLED:
+        raise JobsError("Job submission is switched off on this deployment.")
+
+    payload = redeem_token(token, "submit_direct", requester_uid, thread_ts)
+    staging_dir = Path(payload["staging_dir"])
+    if not _within(staging_dir, user_staging_root(requester_uid)):
+        raise JobsError("Internal error: that staging directory is not yours.")
+    if not (staging_dir / payload["script_name"]).is_file():
+        raise JobsError("The staged job has gone — prepare it again.")
+
+    check_caps(requester_uid, 1)
+    user = registry.by_id(requester_uid) or {}
+    comment = build_comment(requester_uid, thread_ts)
+    job_name = build_job_name(user.get("alias", "user"), payload["label"])
+    argv = build_sbatch_argv(script_name=payload["script_name"], job_name=job_name,
+                            comment=comment, chdir=staging_dir)
+
+    batch_id = record_batch(
+        slack_user_id=requester_uid, alias=user.get("alias", "unknown"),
+        thread_ts=thread_ts, project=payload.get("template", ""),
+        owner_scope=payload.get("template_owner", ""),
+        template_mode=f"{payload['runner']}:{payload['template']}",
+        staging_dir=staging_dir, structures=1, argv=argv,
+    )
+
+    try:
+        proc = _run_pipeline(argv, staging_dir)
+    except subprocess.TimeoutExpired:
+        raise JobsError(f"sbatch timed out (batch {batch_id}).") from None
+    except OSError as exc:
+        raise JobsError(f"Could not run sbatch: {exc}") from exc
+
+    if proc.returncode != 0:
+        raise JobsError(
+            f"sbatch refused the job (batch {batch_id}):\n" + _pipeline_error_text(proc)
+        )
+
+    job_id = _parse_job_id(proc.stdout)
+    record_jobs(batch_id, [{
+        "job_id": job_id, "kind": payload["code"], "job_name": job_name,
+        "work_dir": str(staging_dir), "comment": comment,
+    }])
+    log.info("jobs: batch %s submitted direct job %s for %s", batch_id, job_id, requester_uid)
+    return {"batch_id": batch_id, "job_id": job_id, "job_name": job_name,
+            "staging_dir": str(staging_dir), "input_name": payload["input_name"],
+            "runner": payload["runner"]}

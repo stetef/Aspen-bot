@@ -161,6 +161,24 @@ def stage(*, requester_uid: str, thread_ts: str, structures: list, scope: dict,
     return dest
 
 
+def new_run_dir(requester_uid: str, thread_ts: str):
+    """A fresh staging directory for one run, in the requester's own area.
+
+    Shared by the batch path (which copies structures into it) and the direct path
+    (which writes one input and one script). Derived from the registry and the
+    Slack event, never from tool input.
+    """
+    dest = jobs.staging_dir_for(requester_uid, thread_ts)
+    if dest.exists():
+        n = 2
+        while (sib := dest.parent / f"{dest.name}-{n}").exists():
+            n += 1
+        dest = sib
+    dest.mkdir(parents=True, exist_ok=False)
+    dest.chmod(0o700)
+    return dest
+
+
 def parse_submitted_jobs(stdout: str, staging_dir: Path) -> list:
     """Recover the job IDs the pipeline reported, for the ledger.
 

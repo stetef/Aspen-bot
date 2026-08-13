@@ -275,3 +275,116 @@ def test_replacing_a_runner_needs_force(sut, registered, tmp_path):
         sut.runners.register("orca-nbo", other)
     assert "already exists" in str(exc.value)
     assert sut.runners.register("orca-nbo", other, force=True)
+
+
+# --------------------------------------------------------------------------- #
+# End to end: template -> input -> rendered script -> sbatch
+# --------------------------------------------------------------------------- #
+TEMPLATE = """\
+!UKS B3LYP RIJCOSX Def2-TZVP tightscf
+%pal nprocs 4 end
+%maxcore 2000
+* xyz 0 1
+Fe 0.0 0.0 0.0
+O  1.5 0.0 0.0
+*
+"""
+
+
+@pytest.fixture
+def ready(sut, env, tmp_path, monkeypatch):
+    """Arun with a runner, a template, a root, and a structure to point at."""
+    root = env.root("arun-calcs")
+    env.register(
+        {"slack_user_id": "U0SAM", "alias": "sam", "display_name": "Sam", "role": "admin"},
+        {"slack_user_id": "U01ARUN", "alias": "arun", "display_name": "Arun N.",
+         "calc_root": str(root), "unix_user": "aasundi", "job_runner": "orca-nbo"},
+    )
+    script = tmp_path / "orca.sh"
+    script.write_text(SCRIPT)
+    sut.runners.register("orca-nbo", script, ntasks=32, mem_gb=256)
+    sut.templates.write("U01ARUN", "nbo-standard", TEMPLATE, description="single point")
+    (root / "structures").mkdir()
+    (root / "structures" / "new.xyz").write_text(
+        "2\ncomment\nFe 1.0 2.0 3.0\nO 4.0 5.0 6.0\n")
+    return {"env": env, "root": root}
+
+
+def test_a_dry_run_shows_the_diff_and_submits_nothing(sut, ready, monkeypatch):
+    calls = []
+    monkeypatch.setattr(sut.jobs, "_run_pipeline",
+                        lambda argv, cwd: calls.append(argv))
+    preview = sut.jobs.prepare_direct(
+        requester_uid="U01ARUN", thread_ts="1723480000.1", template="nbo-standard",
+        charge=-2, geometry_path="structures/new.xyz",
+    )
+    assert calls == [], "a dry run must not submit"
+    assert sut.jobs.batches_for("U01ARUN") == []
+    assert "* xyz -2 1" in preview["input_text"]
+    assert "Fe" in preview["input_text"] and "1.00000000" in preview["input_text"]
+    # The diff is what the user reviews, so it must actually show the change.
+    assert "-* xyz 0 1" in preview["diff"] and "+* xyz -2 1" in preview["diff"]
+    # And the staged script is the registered one, filled in.
+    staged = sut.runners.Path(preview["staging_dir"])
+    assert (staged / "aspen-job.sh").is_file()
+    assert "[INPUT]" not in (staged / "aspen-job.sh").read_text()
+
+
+def test_commit_submits_with_a_tag_and_records_the_ledger(sut, ready, monkeypatch):
+    class P:
+        returncode, stdout, stderr = 0, "998877\n", ""
+
+    seen = {}
+
+    def fake_run(argv, cwd):
+        seen["argv"] = argv
+        seen["batches_at_submit"] = len(sut.jobs.batches_for("U01ARUN"))
+        return P()
+
+    monkeypatch.setattr(sut.jobs, "_run_pipeline", fake_run)
+    preview = sut.jobs.prepare_direct(requester_uid="U01ARUN", thread_ts="1723480000.1",
+                                      template="nbo-standard", charge=0)
+    result = sut.jobs.commit_direct(requester_uid="U01ARUN", thread_ts="1723480000.1",
+                                    token=preview["token"])
+
+    assert result["job_id"] == "998877"
+    assert seen["batches_at_submit"] == 1, "the ledger row must precede sbatch"
+    assert "--comment=aspen/v1/U01ARUN/1723480000.1" in seen["argv"]
+    assert any(a.startswith("--chdir=") for a in seen["argv"])
+    assert not any("--wrap" in a for a in seen["argv"])
+    # The recorded tag is what the cancel path will demand Slurm agrees with.
+    row = sut.jobs.jobs_for_batch(result["batch_id"])[0]
+    assert row["comment"] == "aspen/v1/U01ARUN/1723480000.1"
+
+
+def test_a_user_with_no_runner_cannot_submit(sut, ready):
+    with pytest.raises(sut.jobs.JobsError) as exc:
+        sut.jobs.prepare_direct(requester_uid="U0SAM", thread_ts="1",
+                                template="nbo-standard", owner="arun")
+    assert "no job runner" in str(exc.value)
+
+
+def test_a_pipeline_runner_is_directed_to_the_batch_tool(sut, ready, env, tmp_path):
+    script = tmp_path / "p.sh"
+    script.write_text(SCRIPT)
+    sut.runners.register("batch", script, kind="pipeline")
+    env.register({"slack_user_id": "U01ARUN", "alias": "arun", "display_name": "Arun N.",
+                  "calc_root": str(ready["root"]), "job_runner": "batch"})
+    with pytest.raises(sut.jobs.JobsError) as exc:
+        sut.jobs.prepare_direct(requester_uid="U01ARUN", thread_ts="1",
+                                template="nbo-standard")
+    assert "submit_orca_batch" in str(exc.value)
+
+
+def test_a_geometry_outside_the_root_is_refused(sut, ready):
+    for bad in ("../../etc/passwd", "/etc/passwd"):
+        with pytest.raises(sut.jobs.JobsError):
+            sut.jobs.prepare_direct(requester_uid="U01ARUN", thread_ts="1",
+                                    template="nbo-standard", geometry_path=bad)
+
+
+def test_an_edit_that_would_produce_a_bad_input_is_refused(sut, ready):
+    """The validator runs after editing, not only on the stored template."""
+    with pytest.raises(Exception):
+        sut.jobs.prepare_direct(requester_uid="U01ARUN", thread_ts="1",
+                                template="nbo-standard", charge=99999)

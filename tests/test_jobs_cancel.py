@@ -354,3 +354,111 @@ def test_cross_user_cancellation_is_refused_under_either_account(
         # ...and naming the other's ID explicitly reaches nothing.
         approved, refused = sut.jobs.resolve_cancellable(uid, theirs["job_id"])
         assert approved == [] and refused == []
+
+
+# --------------------------------------------------------------------------- #
+# The --comment tag, for jobs Aspen submitted itself
+#
+# Available only on the direct path, because there Aspen calls sbatch rather than
+# delegating to an orchestrator. Where it exists it is a second, independent fence
+# beside WorkDir — Slurm-maintained and unforgeable from conversation.
+# --------------------------------------------------------------------------- #
+def _tagged(sut, uid, alias, jid, staging, comment):
+    batch = sut.jobs.record_batch(
+        slack_user_id=uid, alias=alias, thread_ts="1723480000.1", project="p",
+        owner_scope=alias, template_mode="orca-nbo:t", staging_dir=staging,
+        structures=1, argv=["sbatch"])
+    sut.jobs.record_jobs(batch, [{"job_id": jid, "kind": "orca", "job_name": "aspen-x",
+                                  "work_dir": str(staging), "comment": comment}])
+    return batch
+
+
+def test_a_tagged_job_whose_live_tag_changed_is_refused(sut, two_users, monkeypatch):
+    """A tagged row must match Slurm exactly — otherwise it is a recycled ID."""
+    staging = sut.jobs.staging_dir_for("U0SAM", "1723480000.1")
+    tag = sut.jobs.build_comment("U0SAM", "1723480000.1")
+    _tagged(sut, "U0SAM", "sam", "7001", staging, tag)
+
+    monkeypatch.setattr(sut.jobs, "scontrol_job", fake_scontrol({
+        "7001": live(staging, Comment="aspen/v1/U0SAM/9999999999.9"),
+    }))
+    approved, refused = sut.jobs.resolve_cancellable("U0SAM", "7001")
+    assert approved == []
+    assert "no longer matches our record" in refused[0][1]
+
+
+def test_a_tagged_job_with_no_live_tag_is_refused(sut, two_users, monkeypatch):
+    staging = sut.jobs.staging_dir_for("U0SAM", "1723480000.1")
+    tag = sut.jobs.build_comment("U0SAM", "1723480000.1")
+    _tagged(sut, "U0SAM", "sam", "7002", staging, tag)
+    monkeypatch.setattr(sut.jobs, "scontrol_job",
+                        fake_scontrol({"7002": live(staging)}))
+    approved, refused = sut.jobs.resolve_cancellable("U0SAM", "7002")
+    assert approved == [] and refused
+
+
+def test_a_matching_tag_and_workdir_passes(sut, two_users, monkeypatch):
+    staging = sut.jobs.staging_dir_for("U0SAM", "1723480000.1")
+    tag = sut.jobs.build_comment("U0SAM", "1723480000.1")
+    _tagged(sut, "U0SAM", "sam", "7003", staging, tag)
+    monkeypatch.setattr(sut.jobs, "scontrol_job",
+                        fake_scontrol({"7003": live(staging, Comment=tag)}))
+    approved, _ = sut.jobs.resolve_cancellable("U0SAM", "7003")
+    assert [r["job_id"] for r in approved] == ["7003"]
+
+
+def test_the_tag_is_built_only_from_the_slack_event(sut, two_users):
+    tag = sut.jobs.build_comment("U0SAM", "1723480000.123456")
+    assert tag == "aspen/v1/U0SAM/1723480000.123456"
+    # It carries the ID, not the alias, so a rename cannot orphan an old record.
+    assert "sam" not in tag
+    for bad in ("", "not a slack id", "u0sam;rm -rf /"):
+        with pytest.raises(sut.jobs.JobsError):
+            sut.jobs.build_comment(bad, "1.2")
+
+
+# --------------------------------------------------------------------------- #
+# The sbatch argv Aspen builds on the direct path
+# --------------------------------------------------------------------------- #
+def test_sbatch_argv_is_literals_and_derived_values_only(sut):
+    from pathlib import Path
+    tag = sut.jobs.build_comment("U0SAM", "1.2")
+    argv = sut.jobs.build_sbatch_argv(script_name="aspen-job.sh", job_name="aspen-sam-x",
+                                      comment=tag, chdir=Path("/stage/x"))
+    assert argv[0] == "sbatch" and "--parsable" in argv
+    assert f"--comment={tag}" in argv
+    assert "--chdir=/stage/x" in argv
+    assert argv[-1] == "aspen-job.sh"
+    assert not any("--wrap" in a for a in argv), (
+        "--wrap is the flag this whole design exists to avoid"
+    )
+    assert not any("--export=ALL" in a for a in argv)
+
+
+@pytest.mark.parametrize("bad", ["a b", "a;b", "$(id)", "--wrap=x", "", "../x"])
+def test_sbatch_argv_rejects_shell_shaped_names(sut, bad):
+    from pathlib import Path
+    tag = sut.jobs.build_comment("U0SAM", "1.2")
+    with pytest.raises(sut.jobs.JobsError):
+        sut.jobs.build_sbatch_argv(script_name=bad, job_name="ok", comment=tag,
+                                   chdir=Path("/s"))
+    with pytest.raises(sut.jobs.JobsError):
+        sut.jobs.build_sbatch_argv(script_name="s.sh", job_name=bad, comment=tag,
+                                   chdir=Path("/s"))
+
+
+def test_sbatch_refuses_to_submit_untagged(sut):
+    """A job with no tag would lose one of the two cancel fences."""
+    from pathlib import Path
+    for bad in ("", "not-a-tag", "aspen/v9/U0SAM/1.2"):
+        with pytest.raises(sut.jobs.JobsError):
+            sut.jobs.build_sbatch_argv(script_name="s.sh", job_name="ok",
+                                       comment=bad, chdir=Path("/s"))
+
+
+def test_the_job_id_comes_from_parsable_output(sut):
+    assert sut.jobs._parse_job_id("12345\n") == "12345"
+    assert sut.jobs._parse_job_id("12345;cluster\n") == "12345"
+    for bad in ("", "Submitted batch job\n", "error: bad\n", "abc\n"):
+        with pytest.raises(sut.jobs.JobsError):
+            sut.jobs._parse_job_id(bad)

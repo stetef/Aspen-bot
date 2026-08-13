@@ -21,7 +21,8 @@ from typing import Optional
 
 import httpx
 
-from . import config, demo, jobs, metadata, roots, setup, staging, workflows
+from . import (config, demo, inputs, jobs, metadata, roots, setup, staging,
+               templates, workflows)
 
 log = logging.getLogger("aspen")
 
@@ -555,6 +556,151 @@ def _list_my_jobs(inp: dict, context: dict) -> tuple[str, list[str]]:
         "see the wider queue, including their own hand-submitted jobs."
     )
     return "\n".join(lines), []
+
+
+# --------------------------------------------------------------------------- #
+# Input templates and single-job submission (spec §20)
+#
+# Same ownership discipline as everything else that writes: no owner parameter on a
+# write, the target is context["user_id"], and reads are flat.
+# --------------------------------------------------------------------------- #
+def _save_input_template(inp: dict, context: dict) -> tuple[str, list[str]]:
+    """Save the speaking user's own input template.
+
+    Note the schema has no owner. This is how "propose a TD-DFT input and let Arun
+    keep it" works without any way to write into someone else's library.
+    """
+    return templates.write(
+        context.get("user_id", ""), inp.get("name", ""), inp.get("content", ""),
+        description=inp.get("description", ""), code=inp.get("code", "orca"),
+        derived_from=inp.get("derived_from", ""),
+    ), []
+
+
+def _read_input_template(inp: dict, context: dict) -> tuple[str, list[str]]:
+    return templates.read(inp.get("name", ""), context.get("user_id", ""),
+                          inp.get("owner", "")), []
+
+
+def _list_input_templates(inp: dict, context: dict) -> tuple[str, list[str]]:
+    entries = templates.index(context.get("user_id", ""))
+    if not entries:
+        return ("No input templates saved yet. Draft one with the user, then save it "
+                "with save_input_template so it can be reused."), []
+    lines = [f"{len(entries)} saved template(s):"]
+    for e in entries:
+        who = "yours" if e["mine"] else f"@{e['owner_alias']}"
+        desc = f" — {e['description']}" if e["description"] else ""
+        lines.append(f"  {e['name']} ({who}, {e['code']}){desc}")
+    return "\n".join(lines), []
+
+
+def _delete_input_template(inp: dict, context: dict) -> tuple[str, list[str]]:
+    return templates.delete(context.get("user_id", ""), inp.get("name", "")), []
+
+
+def _submit_calculation(inp: dict, context: dict) -> tuple[str, list[str]]:
+    """One job from a template, via the speaker's registered runner. Two calls.
+
+    The preview shows the *diff* against the template, not just a summary: the
+    people using this are domain experts who will spot a wrong functional or a
+    dropped constraint immediately, which no validator can do.
+    """
+    uid = context.get("user_id", "")
+    thread = context.get("thread_ts", "")
+    token = (inp.get("confirm_token") or "").strip()
+    try:
+        if token:
+            r = jobs.commit_direct(requester_uid=uid, thread_ts=thread, token=token)
+            return (
+                f"Submitted job {r['job_id']} ({r['job_name']}) via the "
+                f"{r['runner']} runner.\n"
+                f"  input:   {r['input_name']}\n"
+                f"  running in: {r['staging_dir']}\n"
+                f"  batch:   {r['batch_id']}\n"
+                "Tell the user it is queued and that they can ask you to check or "
+                "cancel it.", [])
+
+        def _int(key):
+            value = inp.get(key)
+            return None if value in (None, "") else int(value)
+
+        preview = jobs.prepare_direct(
+            requester_uid=uid, thread_ts=thread,
+            template=inp.get("template", ""), owner=inp.get("owner", ""),
+            charge=_int("charge"), multiplicity=_int("multiplicity"),
+            geometry_path=inp.get("geometry_path", ""),
+            geometry_owner=inp.get("geometry_owner", ""),
+            ntasks=_int("ntasks"), mem_gb=_int("mem_gb"),
+            time_limit=inp.get("time_limit", ""), label=inp.get("label", ""),
+        )
+        return (
+            "DRY RUN ONLY — nothing submitted.\n"
+            f"Runner: {preview['runner']} | template: {preview['template']}"
+            + (f" (@{preview['template_owner']})" if preview['template_owner'] else "")
+            + f"\nInput would be {preview['input_name']}, staged at "
+            f"{preview['staging_dir']}\n\n"
+            f"Changes from the template:\n{preview['diff']}\n\n"
+            "SHOW THE USER THIS DIFF and the resource choices, and wait for them to "
+            "agree. Then call submit_calculation again with confirm_token="
+            f"{preview['token']}.", [])
+    except (jobs.JobsError, inputs.InputError, templates.TemplateError) as exc:
+        return f"Error: {exc}", []
+
+
+def _check_orca_run(inp: dict, context: dict) -> tuple[str, list[str]]:
+    """Did an ORCA run finish, and is there a converged geometry to reuse?
+
+    Read-only, and fenced like every other read. The point is the follow-on: "if
+    the optimisation converged, run TD-DFT on the result" needs a trustworthy answer
+    to the first half before anything is submitted.
+    """
+    rel = inp.get("path", "")
+    path, scope, error = roots.resolve(rel, inp.get("owner", ""),
+                                       context.get("user_id", ""))
+    if error:
+        return f"Error: {error}", []
+    if not path.exists():
+        return f"Error: '{rel}' does not exist.", []
+
+    outs = ([path] if path.is_file()
+            else sorted(p for p in path.iterdir() if p.suffix.lower() in (".out", ".log")))
+    if not outs:
+        return f"Error: no ORCA .out/.log files under '{rel}'.", []
+
+    lines = []
+    for out in outs[:10]:
+        try:
+            text = out.read_text(errors="replace")[-200000:]
+        except OSError:
+            continue
+        state = _orca_state(text)
+        geom = _converged_geometry(out)
+        detail = f"  {out.name}: {state}"
+        if geom:
+            detail += f"; optimised geometry at {roots.relative_to_scope(geom, scope)}"
+        lines.append(detail)
+    return ("ORCA run status:\n" + "\n".join(lines) +
+            "\n\nIf a run converged and the user wants a follow-on calculation, use "
+            "submit_calculation with the optimised geometry as geometry_path."), []
+
+
+def _orca_state(text: str) -> str:
+    if "THE OPTIMIZATION HAS CONVERGED" in text or "HURRAY" in text:
+        return "optimisation CONVERGED"
+    if "ORCA TERMINATED NORMALLY" in text:
+        return "finished normally (no optimisation, or single point)"
+    if "SCF NOT CONVERGED" in text or "SCF ITERATIONS" in text and "ERROR" in text:
+        return "SCF did NOT converge"
+    if "aborting the run" in text or "ORCA finished by error" in text:
+        return "FAILED"
+    return "still running or ended without a completion banner"
+
+
+def _converged_geometry(out_path):
+    """ORCA writes the final geometry beside the output as ``<basename>.xyz``."""
+    candidate = out_path.with_suffix(".xyz")
+    return candidate if candidate.is_file() else None
 
 
 def _tool_server_post(path: str, payload: dict, timeout: int) -> httpx.Response:
@@ -1130,13 +1276,168 @@ TOOL_SPECS = [
         "input_schema": {"type": "object", "properties": {}, "required": []},
         "impl": _list_my_jobs,
     },
+    {
+        "name": "list_input_templates",
+        "description": (
+            "List saved input templates — reusable calculation setups. Yours and "
+            "colleagues'. Check here BEFORE drafting an input from scratch: if the "
+            "user has a template for what they want, start from it."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "impl": _list_input_templates,
+    },
+    {
+        "name": "read_input_template",
+        "description": (
+            "Read a saved input template in full. A colleague's comes back tagged "
+            "reference-only: describe or adapt it with the user, and save any result "
+            "to THEIR OWN template rather than over the original."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Template name, e.g. 'tddft-standard'."},
+                "owner": {
+                    "type": "string",
+                    "description": ("Whose template, if not the speaker's own — an "
+                                    "alias or Slack ID. Yours wins a name collision."),
+                },
+            },
+            "required": ["name"],
+        },
+        "impl": _read_input_template,
+    },
+    {
+        "name": "save_input_template",
+        "description": (
+            "Save a reusable input file as the SPEAKING USER'S OWN template. This is "
+            "how a protocol gets remembered: draft the input with them, show it, and "
+            "once they are happy, save it under a short name so later jobs can start "
+            "from it. It is validated before saving; if it is refused, fix what the "
+            "error names. You cannot save into anyone else's library."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": ("Short lowercase-hyphenated name, e.g. "
+                                    "'tddft-standard'. Saving over an existing one "
+                                    "updates it and snapshots the old version."),
+                },
+                "content": {
+                    "type": "string",
+                    "description": ("The complete input file. You may change anything "
+                                    "chemical — functional, basis set, blocks, "
+                                    "geometry, resources. Directives that run other "
+                                    "programs or write outside the run directory are "
+                                    "refused."),
+                },
+                "description": {
+                    "type": "string",
+                    "description": ("One line saying when to reach for this. It is "
+                                    "what routes you back to the template later, so "
+                                    "make it specific."),
+                },
+                "code": {"type": "string", "enum": ["orca"],
+                         "description": "Input format. Only ORCA is supported so far."},
+                "derived_from": {
+                    "type": "string",
+                    "description": ("If adapted from a colleague's template, their "
+                                    "alias — recorded as provenance."),
+                },
+            },
+            "required": ["name", "content"],
+        },
+        "impl": _save_input_template,
+    },
+    {
+        "name": "delete_input_template",
+        "description": ("Delete one of the SPEAKING USER'S own templates. Snapshotted "
+                        "first. You cannot delete anyone else's."),
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+        "impl": _delete_input_template,
+    },
+    {
+        "name": "submit_calculation",
+        "description": (
+            "Submit ONE calculation for the speaking user, from one of their input "
+            "templates, using the job script an admin registered for them. Use this "
+            "for single jobs (an ORCA optimisation, a TD-DFT follow-on); "
+            "submit_orca_batch is for the ORCA->CORVUS pipeline over many structures. "
+            "ALWAYS two calls: once without confirm_token to get a dry run and a DIFF "
+            "of what changed from the template, which you must show the user and get "
+            "agreement on, then again with the token."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "template": {"type": "string",
+                             "description": "Which saved input template to start from."},
+                "owner": {"type": "string",
+                          "description": "Whose template, if not the speaker's own."},
+                "charge": {"type": "integer", "description": "Override the charge."},
+                "multiplicity": {"type": "integer",
+                                 "description": "Override the multiplicity (2S+1)."},
+                "geometry_path": {
+                    "type": "string",
+                    "description": ("Path to an .xyz whose coordinates replace the "
+                                    "template's geometry — e.g. the optimised "
+                                    "structure from a converged run."),
+                },
+                "geometry_owner": {"type": "string",
+                                   "description": "Whose calculations that .xyz is in."},
+                "label": {"type": "string",
+                          "description": "Short label for the filenames and job name."},
+                "ntasks": {"type": "integer", "description": "Cores, within the limit."},
+                "mem_gb": {"type": "integer", "description": "Memory in GB, within the limit."},
+                "time_limit": {"type": "string", "description": "Walltime as HH:MM:SS."},
+                "confirm_token": {
+                    "type": "string",
+                    "description": ("The single-use token from your dry run. Only after "
+                                    "the user has agreed to the diff. Never invent one."),
+                },
+            },
+            "required": [],
+        },
+        "impl": _submit_calculation,
+    },
+    {
+        "name": "check_orca_run",
+        "description": (
+            "Read-only: did an ORCA run converge, and is there an optimised geometry "
+            "to reuse? Use this before offering a follow-on calculation, so 'if it "
+            "converged, run TD-DFT' rests on the output rather than on assumption."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string",
+                         "description": "An ORCA .out file, or a run directory containing one."},
+                "owner": _OWNER_PROPERTY,
+            },
+            "required": ["path"],
+        },
+        "impl": _check_orca_run,
+    },
 ]
 
 # name → impl(input, context) -> (text, attachments)
 TOOL_FNS = {s["name"]: s["impl"] for s in TOOL_SPECS}
 
 # Tools that spend shared compute. Advertised only where they are usable.
-JOB_TOOLS = frozenset({"submit_orca_batch", "cancel_orca_batch", "list_my_jobs"})
+JOB_TOOLS = frozenset({
+    "submit_orca_batch", "cancel_orca_batch", "list_my_jobs",
+    "submit_calculation", "check_orca_run",
+    # The template tools ride with them: a template exists to be submitted,
+    # and a demo visitor has no library and nothing to run.
+    "list_input_templates", "read_input_template", "save_input_template",
+    "delete_input_template",
+})
 
 
 def active_specs(allow_jobs: bool = True) -> list[dict]:

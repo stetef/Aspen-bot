@@ -381,21 +381,27 @@ def test_job_tools_are_withheld_unless_submission_is_enabled(sut, monkeypatch):
     from aspen import config
 
     monkeypatch.setattr(config, "BASH_ALLOWLIST", [])
+    from aspen import tools as tools_mod
+
+    # Iterate the real set rather than a hand-written list, so a tool added to
+    # JOB_TOOLS later is covered without anyone remembering to update this.
+    assert tools_mod.JOB_TOOLS, "the withheld set must not be empty"
+
     monkeypatch.setattr(config, "JOBS_SUBMIT_ENABLED", False)
     off = SdkSession("C:1")._build_options(sdk).allowed_tools
-    for name in ("submit_orca_batch", "cancel_orca_batch", "list_my_jobs"):
-        assert f"mcp__aspen__{name}" not in off
+    for name in tools_mod.JOB_TOOLS:
+        assert f"mcp__aspen__{name}" not in off, name
 
     monkeypatch.setattr(config, "JOBS_SUBMIT_ENABLED", True)
     on = SdkSession("C:1")._build_options(sdk).allowed_tools
-    for name in ("submit_orca_batch", "cancel_orca_batch", "list_my_jobs"):
-        assert f"mcp__aspen__{name}" in on
+    for name in tools_mod.JOB_TOOLS:
+        assert f"mcp__aspen__{name}" in on, name
 
     # ...and a demo session never gets them, even with submission enabled: a
     # visitor is not in the registry and must not spend the group's compute.
     demo_tools = SdkSession("C:1", allow_bash=False, allow_jobs=False)._build_options(sdk).allowed_tools
-    for name in ("submit_orca_batch", "cancel_orca_batch", "list_my_jobs"):
-        assert f"mcp__aspen__{name}" not in demo_tools
+    for name in tools_mod.JOB_TOOLS:
+        assert f"mcp__aspen__{name}" not in demo_tools, name
 
 
 def test_sbatch_and_scancel_never_enter_the_bash_allowlist(sut):
