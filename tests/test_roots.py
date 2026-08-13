@@ -248,3 +248,66 @@ def test_roots_command_lists_every_root(sut, multi, cli, capsys):
     out = capsys.readouterr().out
     assert "@sam" in out and "@arun" in out and "@smb" in out
     assert "shared" in out
+
+
+# --------------------------------------------------------------------------- #
+# Sharing a tree vs nesting inside one
+#
+# These are different things and only one of them breaks the fence. Nesting is
+# refused because containment IS the fence, so a root inside a root silently
+# encloses someone else's tree. Two roots at the SAME path enclose nothing —
+# and it is already the normal state, since everyone without a personal root
+# shares CALCULATIONS_ROOT.
+# --------------------------------------------------------------------------- #
+def test_two_users_may_share_one_tree(sut, env):
+    """The group-tree case: several readers, one directory, no default involved."""
+    group = env.root("group-calcs")
+    env.register(
+        {"slack_user_id": "U0SAM", "alias": "sam", "display_name": "Sam",
+         "role": "admin", "calc_root": str(group)},
+        {"slack_user_id": "U0CHRIS", "alias": "chris", "display_name": "Chris",
+         "calc_root": str(group)},
+    )
+    assert sut.roots.validate(str(group), for_uid="U0RITI") is None
+
+    # Both resolve there, and each is attributed to themselves.
+    (group / "thermolysin").mkdir()
+    for uid, alias in (("U0SAM", "sam"), ("U0CHRIS", "chris")):
+        path, scope, err = sut.roots.resolve("thermolysin", "", uid)
+        assert not err and path == group / "thermolysin"
+        assert scope["name"] == alias
+
+
+def test_sharing_a_tree_keeps_metadata_and_staging_separate(sut, env):
+    """Two people on one tree must not collide in Aspen's own storage."""
+    group = env.root("group-calcs", projects=["thermolysin"])
+    env.register(
+        {"slack_user_id": "U0SAM", "alias": "sam", "display_name": "Sam",
+         "role": "admin", "calc_root": str(group)},
+        {"slack_user_id": "U0CHRIS", "alias": "chris", "display_name": "Chris",
+         "calc_root": str(group)},
+    )
+    sut._write_metadata("thermolysin", "sam's note", "", "U0SAM")
+    sut._write_metadata("thermolysin", "chris's note", "", "U0CHRIS")
+    assert "sam's note" in sut._read_metadata("thermolysin", "", "U0SAM")
+    assert "chris's note" in sut._read_metadata("thermolysin", "", "U0CHRIS")
+
+    assert (sut.jobs.user_staging_root("U0SAM")
+            != sut.jobs.user_staging_root("U0CHRIS"))
+
+
+def test_nesting_is_still_refused(sut, env):
+    """The relaxation must not have weakened the case that actually matters."""
+    outer = env.root("outer")
+    env.register({"slack_user_id": "U0SAM", "alias": "sam", "display_name": "Sam",
+                  "calc_root": str(outer)})
+    inner = outer / "inner"
+    inner.mkdir()
+    problem = sut.roots.validate(str(inner), for_uid="U0CHRIS")
+    assert problem and "nested" in problem
+    # ...and in the other direction.
+    deeper = env.root("deeper/child")
+    env.register({"slack_user_id": "U0SAM", "alias": "sam", "display_name": "Sam",
+                  "calc_root": str(deeper)})
+    problem = sut.roots.validate(str(deeper.parent), for_uid="U0CHRIS")
+    assert problem and "nested" in problem

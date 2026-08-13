@@ -288,12 +288,24 @@ def validate(path: str, *, for_uid: str = "") -> Optional[str]:
 
     # Nesting would make one person's fence silently enclose another's tree:
     # _safe_path checks containment, so a root inside a root is not a boundary.
+    #
+    # Sharing the SAME tree, however, is fine, and refusing it was overreach. It
+    # is already the normal state — everyone without a personal root shares
+    # CALCULATIONS_ROOT — and it weakens nothing: containment still resolves
+    # identically for both owners, ``_distinct_scopes`` de-duplicates the tree for
+    # cross-root sweeps, and metadata/workflows/staging are all keyed
+    # ``<alias>__<slack-id>`` so two people on one tree keep separate notes, files
+    # and jobs. What it buys is the ability to say "these three read from the group
+    # tree, that one has their own" without one of them having to be the default.
+    #
+    # Equality has to be handled before the nesting test, because
+    # ``is_relative_to`` is true for identical paths.
     for scope in scopes(include_removed=True):
         if for_uid and scope["owner_id"] == for_uid:
             continue
         other = scope["path"]
         if other == candidate:
-            return f"{candidate} is already {PREFIX}{scope['name']}'s root"
+            continue
         if _under(candidate, other) or _under(other, candidate):
             return (f"{candidate} is nested with {PREFIX}{scope['name']}'s root ({other}) "
                     "— roots must not contain one another")
