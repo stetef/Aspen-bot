@@ -530,7 +530,16 @@ def _refusal_lines(refused: list) -> str:
 
 
 def _list_my_jobs(inp: dict, context: dict) -> tuple[str, list[str]]:
+    """What this user has in flight, refreshed before it is read.
+
+    The refresh is the point. Without it this answered from whatever the notify
+    poller last wrote, so "are my jobs done?" could report a job as running four
+    minutes after it finished — and, worse, say ``state unknown (not reconciled)``
+    about a job Slurm had known the answer for all along. ``refresh_states`` is
+    rate-limited and squeue-gated precisely so a read tool may call it (spec §19.8).
+    """
     uid = context.get("user_id", "")
+    jobs.refresh_states()
     try:
         rows = jobs.active_rows(uid)
     except jobs.JobsError as exc:

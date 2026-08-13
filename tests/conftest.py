@@ -106,6 +106,8 @@ _MODMAP = {
     "notify": "aspen",
     "JOBS_NOTIFY_ENABLED": "aspen.config",
     "JOBS_NOTIFY_POLL_SECONDS": "aspen.config",
+    "JOBS_NOTIFY_ACTIVE_POLL_SECONDS": "aspen.config",
+    "JOBS_REFRESH_MIN_GAP_SECONDS": "aspen.config",
     "RUNNERS_ROOT": "aspen.config",
     "RUNNERS_HISTORY_ROOT": "aspen.config",
     "RUNNER_MAX_NTASKS": "aspen.config",

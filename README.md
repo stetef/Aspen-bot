@@ -317,9 +317,12 @@ anyone's calculations directory, as everywhere else in Aspen.
 ./aspen-users jobs reconcile         # fill in what jobs actually consumed, from sacct
 ```
 
-`reconcile` is worth running periodically: the ledger knows *who submitted what*, but
-elapsed time, CPU-hours and exit state only exist once a job has finished, so
-"who used the compute" is unanswerable until you join against `sacct`.
+`reconcile` is the full sweep, and worth running periodically: the ledger knows *who
+submitted what*, but elapsed time, CPU-hours and exit state only exist once a job has
+finished, so "who used the compute" is unanswerable until you join against `sacct`.
+Day to day the bot keeps itself current — the notify watcher and `list_my_jobs` both
+refresh first, using `squeue` to decide whether an `sacct` is worth making — so this is
+the backstop for a window nobody was watching, not the only thing that ever runs.
 
 ## Your own way of running calculations (beta)
 

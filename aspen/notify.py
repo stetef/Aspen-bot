@@ -19,6 +19,15 @@ interesting once it is actually done.
 pings for a single piece of news. The message names what failed, which is the part
 you would otherwise go looking for.
 
+**Two cadences, not one.** A single poll interval had to be a compromise between
+telling someone promptly and not polling Slurm's accounting database forever, and
+it settled on five minutes — which is a long time to sit on news the cluster
+already has. It does not have to be a compromise, because the two states cost
+different amounts: an idle pass is one ledger ``COUNT``, and an active pass is a
+``squeue`` against controller memory that reaches ``sacct`` only once something has
+actually left the queue (``jobs.refresh_states``). So the loop watches often while
+there is something to watch, and rarely when there is not.
+
 **In the thread, falling back to a DM.** The thread is where the context is — the
 diff that was approved, the structures that were chosen. But threads can outlive
 their channel, and Slack refuses posts to conversations the bot has been removed
@@ -93,7 +102,7 @@ def due() -> list:
     Pure with respect to Slack — it reads the ledger and returns intentions, so the
     decision can be tested without a workspace, a network, or a bot token.
     """
-    jobs.reconcile_quietly()
+    jobs.refresh_states()
 
     out = []
     with jobs.connect() as conn:
@@ -200,6 +209,26 @@ def run_once(client) -> int:
     return sent
 
 
+# Floor on either interval. Lower than the 60s this used to be pinned at, because
+# what a pass costs changed: with nothing outstanding it is one ledger COUNT and no
+# Slurm call, and with jobs in flight it is a squeue against controller memory that
+# only escalates to sacct when something has actually left the queue.
+MIN_INTERVAL = 30
+
+
+def interval_for(outstanding: int) -> int:
+    """How long to sleep after a pass, given what is still in flight.
+
+    One interval had to serve two situations that want opposite things: a user
+    waiting on a batch wants to hear quickly, and a bot with an empty ledger should
+    not be waking up every minute for years. Splitting them costs nothing, since
+    the frequent case is also the cheap one.
+    """
+    active = max(MIN_INTERVAL, config.JOBS_NOTIFY_ACTIVE_POLL_SECONDS)
+    idle = max(active, config.JOBS_NOTIFY_POLL_SECONDS)
+    return active if outstanding else idle
+
+
 def watcher(client, stop: threading.Event = None) -> None:
     """The loop. Started as a daemon thread at boot; never raises out.
 
@@ -207,13 +236,16 @@ def watcher(client, stop: threading.Event = None) -> None:
     outcome of a bad poll is a late notification, and the worst outcome of an
     unhandled exception would be no notifications at all, silently.
     """
-    interval = max(60, config.JOBS_NOTIFY_POLL_SECONDS)
-    log.info("Job notifications: watching every %ds", interval)
+    log.info("Job notifications: watching every %ds while jobs are outstanding, "
+             "%ds when the ledger is quiet",
+             interval_for(1), interval_for(0))
     while not (stop and stop.is_set()):
+        interval = interval_for(0)
         try:
             count = run_once(client)
             if count:
                 log.info("notify: sent %d job notification(s)", count)
+            interval = interval_for(jobs.outstanding_count())
         except Exception:
             log.warning("notify: poll failed; will try again", exc_info=True)
         if stop:

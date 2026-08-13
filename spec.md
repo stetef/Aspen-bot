@@ -1394,10 +1394,43 @@ it decides whether Aspen speaks to *that person* about *their own* jobs. It gran
 nothing and reaches nobody else. `ASPEN_JOBS_NOTIFY=false` disables the whole thing
 regardless of what anyone has saved.
 
-The watcher is a daemon thread started at boot, polling every
-`ASPEN_JOBS_NOTIFY_POLL_SECONDS` (default 300). It reconciles first, so states are fresh,
-and it swallows its own exceptions — a bad poll should mean a late notification, not a
-silently dead watcher.
+The watcher is a daemon thread started at boot. It refreshes states first, so what it
+reads is current, and it swallows its own exceptions — a bad poll should mean a late
+notification, not a silently dead watcher.
+
+#### How fresh the ledger is, and what that costs
+
+The ledger used to be refreshed on exactly one schedule — this watcher's — and every other
+reader answered from whatever that pass had last written. So `list_my_jobs` could report a
+job as running four minutes after it finished, or say `state unknown (not reconciled)`
+about a job Slurm had known the answer for all along. The obvious fix, reconciling on every
+read, trades a stale answer for a worse problem: `sacct` reads slurmdbd, the shared
+accounting database, and a tool the model can call in a loop must not be a way to hammer
+it.
+
+So `jobs.refresh_states` uses the two Slurm reads for what each is actually good at.
+`squeue` reads the controller's own memory and is cheap enough to poll; `sacct` is the only
+thing that knows elapsed time, CPU-hours and exit codes, and is not. A refresh reads the
+ledger for outstanding jobs (no Slurm call at all if there are none), asks `squeue` whether
+they are all still queued, and only reaches `sacct` when something has actually left —
+which is exactly when there is something new to learn. Three consequences worth stating:
+
+- **It is rate-limited** (`ASPEN_JOBS_REFRESH_MIN_GAP_SECONDS`, default 15) behind a lock,
+  because it is now reachable from a conversation and the limit must not depend on the
+  model being reasonable.
+- **Unreadable is not empty.** `queued_states` returns `None` rather than `{}` when squeue
+  cannot be asked, and `None` falls through to a reconcile — the same fail-toward-the-truth
+  rule as `scontrol_job` at cancel time.
+- **The queue is asked for wholesale, not per job.** `squeue --jobs <ids>` fails the entire
+  call with "Invalid job id specified" as soon as one ID has aged out of the controller,
+  and that ageing-out is the event being detected. The account's queue is intersected with
+  ledger IDs instead.
+
+That makes the poll interval cheap enough to split in two: `ASPEN_JOBS_NOTIFY_POLL_SECONDS`
+(default 300) when the ledger is quiet, and `ASPEN_JOBS_NOTIFY_ACTIVE_POLL_SECONDS`
+(default 60) while anything is outstanding, floored at 30s either way. A single interval had
+to be a compromise between telling someone promptly and polling Slurm forever; two do not,
+because the frequent case is also the cheap one.
 
 ### 19.9 The CLI escape hatch
 
@@ -1427,8 +1460,10 @@ the risks visible:
   `WorkDir`, recoverable from `sacct -o Comment` even if the ledger is lost — worth doing,
   since `AccountingStoreFlags = job_comment` is confirmed on s3df. Deliberately **not** a
   generic `--sbatch-extra-args` pass-through, which would be `--wrap` by another name.
-- **The reconciler is manual** (`aspen-users jobs reconcile`), not a cron job —
-  though the caps reconcile once on their own before refusing, since a row with no
+- **The full reconciler is still manual** (`aspen-users jobs reconcile`), not a cron
+  job — though it is no longer the only thing that refreshes state: the notify
+  watcher and `list_my_jobs` both call `jobs.refresh_states` ([§19.8](#198-being-told-when-it-ends)),
+  and the caps reconcile once on their own before refusing, since a row with no
   state counts as active and an unreconciled ledger would otherwise jam the cap
   permanently while advising the user to "wait for jobs to finish" that already had.
   Abandoned staging (a preview the user declined) is pruned opportunistically on the

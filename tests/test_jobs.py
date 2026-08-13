@@ -813,6 +813,132 @@ def test_staging_is_readable_so_results_can_be_collected(sut, jobs_env):
     assert (dest / "a.xyz").stat().st_mode & 0o004, "and read what is in it"
 
 
+# --------------------------------------------------------------------------- #
+# Keeping the ledger fresh — squeue gates sacct (spec §19.6)
+#
+# The ledger used to be refreshed on exactly one schedule, the notify poller's, so
+# every other reader answered from whatever that pass had last written. Fixing it
+# by reconciling on every read would have replaced a stale answer with a hammered
+# accounting database, so the two Slurm reads are used for what each is good at.
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def refreshable(sut, jobs_env, monkeypatch):
+    """One batch with one job in flight, and no real cluster underneath."""
+    sut.jobs.invalidate_refresh_clock()
+    monkeypatch.setattr(sut, "JOBS_REFRESH_MIN_GAP_SECONDS", 0, raising=False)
+    monkeypatch.setattr(sut.jobs, "whoami", lambda: "botuser")
+    staging = sut.jobs.staging_dir_for("U0SAM", "1723480009.1")
+    staging.mkdir(parents=True, exist_ok=True)
+    batch = sut.jobs.record_batch(
+        slack_user_id="U0SAM", alias="sam", thread_ts="1723480009.1", project="p",
+        owner_scope="sam", template_mode="interp", staging_dir=staging,
+        structures=1, argv=["x"])
+    sut.jobs.record_jobs(batch, [{"job_id": "7001", "kind": "orca",
+                                  "work_dir": str(staging)}])
+    calls = []
+    monkeypatch.setattr(sut.jobs, "reconcile_quietly",
+                        lambda days=30: calls.append(days))
+    return {"batch": batch, "reconciles": calls}
+
+
+def test_a_job_still_in_the_queue_does_not_cost_an_sacct(sut, refreshable, monkeypatch):
+    """The whole point: the cheap read answers "nothing has changed"."""
+    monkeypatch.setattr(sut.jobs, "queued_states", lambda: {"7001": "RUNNING"})
+    assert sut.jobs.refresh_states() is False
+    assert refreshable["reconciles"] == []
+
+
+def test_a_job_that_has_left_the_queue_triggers_one(sut, refreshable, monkeypatch):
+    """Vanishing from squeue is exactly when there is something new to learn."""
+    monkeypatch.setattr(sut.jobs, "queued_states", lambda: {})
+    assert sut.jobs.refresh_states() is True
+    assert refreshable["reconciles"] == [30]
+
+
+def test_a_terminal_state_in_the_queue_still_reconciles(sut, refreshable, monkeypatch):
+    """squeue reports COMPLETED briefly; the accounting columns come from sacct."""
+    monkeypatch.setattr(sut.jobs, "queued_states", lambda: {"7001": "COMPLETED"})
+    assert sut.jobs.refresh_states() is True
+
+
+def test_an_unreadable_queue_falls_back_to_reconciling(sut, refreshable, monkeypatch):
+    """None means "could not ask" — which must not read as "the queue is empty"
+    *or* as "everything is still running". Fail toward the truthful answer."""
+    monkeypatch.setattr(sut.jobs, "queued_states", lambda: None)
+    assert sut.jobs.refresh_states() is True
+
+
+def test_nothing_outstanding_asks_slurm_nothing(sut, jobs_env, monkeypatch):
+    sut.jobs.invalidate_refresh_clock()
+    monkeypatch.setattr(sut, "JOBS_REFRESH_MIN_GAP_SECONDS", 0, raising=False)
+    called = []
+    monkeypatch.setattr(sut.jobs, "queued_states", lambda: called.append(1) or {})
+    monkeypatch.setattr(sut.jobs, "reconcile_quietly", lambda days=30: called.append(2))
+    assert sut.jobs.refresh_states() is False
+    assert called == [], "an empty ledger is answered from the ledger"
+
+
+def test_the_refresh_is_rate_limited(sut, refreshable, monkeypatch):
+    """It is reachable from a conversation now, so it needs a limit that does not
+    depend on the model being reasonable."""
+    monkeypatch.setattr(sut, "JOBS_REFRESH_MIN_GAP_SECONDS", 3600, raising=False)
+    monkeypatch.setattr(sut.jobs, "queued_states", lambda: {})
+    sut.jobs.invalidate_refresh_clock()
+    assert sut.jobs.refresh_states() is True
+    assert sut.jobs.refresh_states() is False, "second call inside the window is skipped"
+    assert len(refreshable["reconciles"]) == 1
+
+
+def test_a_cluster_with_no_squeue_at_all_does_not_break_a_refresh(sut, refreshable,
+                                                                  monkeypatch):
+    """A deployment without Slurm client tools must still take a turn."""
+    def boom(argv):
+        raise OSError("squeue: command not found")
+    monkeypatch.setattr(sut.jobs, "_run_slurm", boom)
+    assert sut.jobs.queued_states() is None
+    assert sut.jobs.refresh_states() is True, "unreadable falls through to sacct"
+
+
+def test_the_squeue_argv_asks_for_our_own_queue_only(sut):
+    argv = sut.jobs.build_squeue_argv(user="botuser")
+    assert argv[0] == "squeue"
+    assert "-u" in argv and "botuser" in argv
+    assert "--jobs" not in argv, (
+        "squeue fails the whole call once one ID has aged out of the controller — "
+        "which is the event this is used to detect"
+    )
+
+
+def test_queued_states_parses_and_ignores_array_masks(sut, monkeypatch):
+    monkeypatch.setattr(sut.jobs, "whoami", lambda: "botuser")
+    monkeypatch.setattr(sut.jobs, "_run_slurm", lambda argv: FakeProc(
+        stdout="7001|RUNNING\n7002_3|PENDING\n7003_[8-20]|PENDING\nrubbish\n"))
+    assert sut.jobs.queued_states() == {"7001": "RUNNING", "7002_3": "PENDING"}
+
+
+def test_queued_states_says_none_when_squeue_fails(sut, monkeypatch):
+    monkeypatch.setattr(sut.jobs, "whoami", lambda: "botuser")
+    monkeypatch.setattr(sut.jobs, "_run_slurm",
+                        lambda argv: FakeProc(stderr="boom", returncode=1))
+    assert sut.jobs.queued_states() is None, (
+        "empty must not be confused with unreadable"
+    )
+
+
+def test_outstanding_count_ignores_finished_and_cancelled(sut, refreshable):
+    assert sut.jobs.outstanding_count() == 1
+    sut.jobs.apply_reconciliation([{"job_id": "7001", "state": "COMPLETED"}])
+    assert sut.jobs.outstanding_count() == 0
+
+
+def test_listing_jobs_refreshes_first(sut, jobs_env, monkeypatch):
+    """"Are my jobs done?" must not answer as of the last background poll."""
+    calls = []
+    monkeypatch.setattr(sut.jobs, "refresh_states", lambda days=30: calls.append(1))
+    sut.tools._list_my_jobs({}, {"user_id": "U0SAM"})
+    assert calls, "the read tool asks for a refresh before reading"
+
+
 def test_a_running_jobs_fence_survives_moving_the_staging_root(sut, jobs_env, monkeypatch):
     """Relocating staging must not orphan jobs already running from the old path."""
     old_root = sut.JOBS_STAGING_ROOT / "old-location"

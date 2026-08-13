@@ -59,7 +59,14 @@ def _settle(sut, batch_id, *states):
 
 @pytest.fixture(autouse=True)
 def _no_sacct(sut, monkeypatch):
-    """The poller reconciles first; don't let tests shell out to a real cluster."""
+    """The poller refreshes first; don't let tests shell out to a real cluster.
+
+    Both seams, deliberately: ``refresh_states`` is what ``due()`` calls, and
+    ``reconcile_quietly`` is what it would reach for underneath. On a login node
+    the real squeue exists, so patching only the inner one would leave the suite
+    querying the actual queue.
+    """
+    monkeypatch.setattr(sut.jobs, "refresh_states", lambda days=30: False)
     monkeypatch.setattr(sut.jobs, "reconcile_quietly", lambda days=30: None)
 
 
@@ -225,6 +232,48 @@ def test_the_tool_only_sets_the_speakers_own_preference(sut):
 # --------------------------------------------------------------------------- #
 # The watcher must not take the bot down
 # --------------------------------------------------------------------------- #
+def test_the_loop_watches_often_while_jobs_are_outstanding(sut, monkeypatch):
+    """One interval had to trade promptness against polling slurmdbd forever.
+    Two intervals do not, because the frequent case is also the cheap one."""
+    monkeypatch.setattr(sut, "JOBS_NOTIFY_ACTIVE_POLL_SECONDS", 45, raising=False)
+    monkeypatch.setattr(sut, "JOBS_NOTIFY_POLL_SECONDS", 600, raising=False)
+    assert sut.notify.interval_for(3) == 45
+    assert sut.notify.interval_for(0) == 600
+
+
+def test_neither_interval_goes_below_the_floor(sut, monkeypatch):
+    monkeypatch.setattr(sut, "JOBS_NOTIFY_ACTIVE_POLL_SECONDS", 1, raising=False)
+    monkeypatch.setattr(sut, "JOBS_NOTIFY_POLL_SECONDS", 1, raising=False)
+    assert sut.notify.interval_for(1) == sut.notify.MIN_INTERVAL
+    assert sut.notify.interval_for(0) == sut.notify.MIN_INTERVAL
+
+
+def test_an_idle_interval_below_the_active_one_is_lifted(sut, monkeypatch):
+    """A misconfiguration must not make a quiet bot poll harder than a busy one."""
+    monkeypatch.setattr(sut, "JOBS_NOTIFY_ACTIVE_POLL_SECONDS", 120, raising=False)
+    monkeypatch.setattr(sut, "JOBS_NOTIFY_POLL_SECONDS", 60, raising=False)
+    assert sut.notify.interval_for(0) == 120
+
+
+def test_the_loop_sleeps_by_what_is_outstanding(sut, batch, monkeypatch):
+    import threading
+
+    monkeypatch.setattr(sut, "JOBS_NOTIFY_ACTIVE_POLL_SECONDS", 45, raising=False)
+    monkeypatch.setattr(sut, "JOBS_NOTIFY_POLL_SECONDS", 600, raising=False)
+    bid = batch()
+    _settle(sut, bid, "RUNNING", "PENDING", "PENDING")
+
+    slept, stop = [], threading.Event()
+
+    def record(seconds):
+        slept.append(seconds)
+        stop.set()
+
+    stop.wait = record
+    sut.notify.watcher(Recorder(), stop=stop)
+    assert slept == [45], "three jobs are in flight; look again soon"
+
+
 def test_a_failing_poll_does_not_stop_the_loop(sut, monkeypatch):
     import threading
 

@@ -352,7 +352,22 @@ JOBS_SUBMIT_TIMEOUT   = int(os.getenv("ASPEN_JOBS_SUBMIT_TIMEOUT_SECONDS", "3600
 # silence for hours is the wrong default. Off means nobody is ever pinged, whatever
 # their preference says.
 JOBS_NOTIFY_ENABLED   = _flag_early("ASPEN_JOBS_NOTIFY", "true")
+# How often the watcher looks, in the two states it can be in. A single interval
+# had to be a compromise between "tell me quickly" and "do not poll the accounting
+# database every minute forever"; it does not have to be, because the two states
+# have entirely different costs. With nothing outstanding a pass is one cheap
+# ledger COUNT and no Slurm call at all, so the idle number can stay conservative;
+# with jobs in flight the pass is gated by `squeue` (controller memory) and only
+# reaches `sacct` (slurmdbd) when something has actually left the queue. See
+# jobs.refresh_states.
 JOBS_NOTIFY_POLL_SECONDS = int(os.getenv("ASPEN_JOBS_NOTIFY_POLL_SECONDS", "300"))
+JOBS_NOTIFY_ACTIVE_POLL_SECONDS = int(
+    os.getenv("ASPEN_JOBS_NOTIFY_ACTIVE_POLL_SECONDS", "60"))
+# Floor on how often a state refresh may actually talk to Slurm, whoever asks.
+# The refresh is now reachable from a conversation (`list_my_jobs` runs one so the
+# answer is not simply "as of the last poll"), and a tool the model can call in a
+# loop needs a rate limit that does not depend on the model being reasonable.
+JOBS_REFRESH_MIN_GAP_SECONDS = int(os.getenv("ASPEN_JOBS_REFRESH_MIN_GAP_SECONDS", "15"))
 
 # Timeout for a single read-only Slurm client call (scontrol/sacct/squeue).
 JOBS_SLURM_TIMEOUT    = int(os.getenv("ASPEN_JOBS_SLURM_TIMEOUT_SECONDS", "30"))

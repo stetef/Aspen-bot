@@ -42,6 +42,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -275,6 +276,22 @@ def active_rows(slack_user_id: str = "") -> list:
         return [dict(r) for r in conn.execute(sql, params)]
 
 
+def outstanding_count() -> int:
+    """How many ledger rows are not known to have finished.
+
+    Deliberately a ``COUNT`` and not ``len(active_rows())``: the watcher asks this
+    on every pass purely to decide how long to sleep, and ``active_rows`` runs a
+    backfill and materialises every row to answer a question that is really "is
+    there anything to wait for at all".
+    """
+    sql = ("SELECT COUNT(*) FROM jobs WHERE cancelled_at IS NULL "
+           "  AND (state IS NULL OR state NOT IN (%s))"
+           % ",".join("?" * len(TERMINAL_STATES)))
+    with connect() as conn:
+        (n,) = conn.execute(sql, list(TERMINAL_STATES)).fetchone()
+    return int(n)
+
+
 def submits_today(slack_user_id: str) -> int:
     since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(timespec="seconds")
     with connect() as conn:
@@ -492,6 +509,22 @@ def build_sacct_argv(*, user: str, since: str) -> list:
     ]
 
 
+def build_squeue_argv(*, user: str) -> list:
+    """The cheap "is any of this still queued?" read.
+
+    Deliberately the account's whole queue rather than ``--jobs <ids>``: squeue
+    fails the *entire* call with "Invalid job id specified" as soon as one ID in
+    the list has aged out of the controller, and a job ageing out is precisely the
+    event this call exists to detect. Asking for the queue and intersecting it with
+    the ledger cannot fail that way.
+
+    ``-u`` is safe here in a way it explicitly is not for ``scancel`` (see
+    FORBIDDEN_SCANCEL_FLAGS): this reads, and the answer is then filtered against
+    ledger IDs rather than acted on wholesale.
+    """
+    return ["squeue", "-h", "-o", "%i|%T", "-u", user]
+
+
 # --------------------------------------------------------------------------- #
 # Live Slurm state
 # --------------------------------------------------------------------------- #
@@ -524,6 +557,35 @@ def scontrol_job(job_id: str) -> Optional[dict]:
         if sep:
             out.setdefault(key, value)
     return out or None
+
+
+def queued_states() -> Optional[dict]:
+    """``{job_id: state}`` for everything of ours the controller still knows about.
+
+    ``None`` — never ``{}`` — when squeue could not be asked, so no caller can read
+    "the queue is empty" out of "the queue could not be read". Same rule, and the
+    same reason, as :func:`scontrol_job`.
+
+    A pending array *mask* (``12345_[8-20]``) does not match a job ID and is
+    dropped, so the tasks behind it read as absent. That errs toward doing the
+    expensive check, which is the safe direction: the cost is one ``sacct``, where
+    the other way round would be a finished batch nobody is told about.
+    """
+    try:
+        proc = _run_slurm(build_squeue_argv(user=whoami()))
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.debug("jobs: squeue unavailable (%s)", exc)
+        return None
+    if proc.returncode != 0:
+        log.debug("jobs: squeue failed: %s", (proc.stderr or "").strip())
+        return None
+
+    out = {}
+    for line in proc.stdout.splitlines():
+        jid, sep, state = line.strip().partition("|")
+        if sep and _JOB_ID_RE.match(jid):
+            out[jid] = state.strip().upper()
+    return out
 
 
 def whoami() -> str:
@@ -1183,6 +1245,65 @@ def reconcile(days: int = 30) -> dict:
             "total_cpu": f[8], "alloc_tres": f[9], "exit_code": f[10],
         })
     return {"updated": apply_reconciliation(rows), "scanned": len(rows), "since": since}
+
+
+# The rate limit on talking to Slurm at all, shared by every caller of
+# refresh_states. A lock rather than a bare timestamp because the notify thread and
+# a turn thread can arrive together, and two simultaneous sacct calls is the exact
+# thing being avoided.
+_REFRESH_LOCK = threading.Lock()
+_LAST_REFRESH = {"at": 0.0}
+
+
+def invalidate_refresh_clock() -> None:
+    """Forget when the last refresh happened — for tests, and after a config change."""
+    with _REFRESH_LOCK:
+        _LAST_REFRESH["at"] = 0.0
+
+
+def refresh_states(days: int = 30) -> bool:
+    """Bring the ledger's job states up to date — cheaply, and at most so often.
+
+    This exists because the ledger used to be refreshed on exactly one schedule:
+    the notify poller's. Everything else read whatever that pass had last written,
+    so ``list_my_jobs`` could answer "state unknown (not reconciled)" about a job
+    that had been finished for four minutes. Making every read reconcile would fix
+    that and replace it with a worse problem — ``sacct`` reads slurmdbd, the shared
+    accounting database, and a tool the model can call in a loop must not be a way
+    to hammer it.
+
+    So the two Slurm reads are used for what each is actually good at. ``squeue``
+    reads the controller's own memory and is cheap enough to poll; ``sacct`` is the
+    only thing that knows elapsed time, CPU-hours and exit codes, and is not. The
+    expensive read therefore happens only when the cheap one says something has
+    left the queue — which is exactly when there is something new to learn.
+
+    Returns True when a reconcile actually ran. Never raises: a stale answer is
+    worth more than a broken turn, which is why every caller can treat this as
+    advisory.
+    """
+    with _REFRESH_LOCK:
+        now = time.monotonic()
+        if now - _LAST_REFRESH["at"] < max(0, config.JOBS_REFRESH_MIN_GAP_SECONDS):
+            return False
+        _LAST_REFRESH["at"] = now
+
+    try:
+        outstanding = {str(r["job_id"]) for r in active_rows()}
+    except Exception:
+        log.debug("jobs: could not read the ledger for a refresh", exc_info=True)
+        return False
+    if not outstanding:
+        return False                       # nothing in flight; sacct would say so slowly
+
+    queued = queued_states()
+    if queued is not None and all(
+            jid in queued and queued[jid] not in TERMINAL_STATES
+            for jid in outstanding):
+        return False                       # all still queued: the ledger is as fresh as it can be
+
+    reconcile_quietly(days=days)
+    return True
 
 
 def _all_job_ids() -> list:
