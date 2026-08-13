@@ -247,6 +247,13 @@ def main() -> None:
 
     threading.Thread(target=_warm, name="aspen-warm", daemon=True).start()
 
+    # Tell people when their jobs end. A daemon thread rather than cron: it needs
+    # the Slack client this process already holds, and a missed pass is a late
+    # notification rather than a lost one.
+    if config.JOBS_SUBMIT_ENABLED and config.JOBS_NOTIFY_ENABLED:
+        from . import notify
+        notify.start(slack_app.app.client)
+
     SocketModeHandler(slack_app.app, config.SLACK_APP_TOKEN).start()
 
 

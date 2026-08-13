@@ -314,9 +314,12 @@ the Bash route this section anticipated:
   somewhere" — which is the version C15 exists to prevent. The input-file surface is
   narrower still (C16), and an ORCA input cannot delete anything.
 
-- **Nothing watches jobs for you.** There is no background poller and no follow-up when a
-  batch finishes or fails; a user asks, or reads `squeue`. Worth listing because the gap is
-  easy to mistake for "the job is fine" — Aspen's silence carries no information.
+- **Job notifications post into a channel from a background thread.** The one place
+  Aspen speaks without being spoken to. Bounded by construction: it only ever messages the
+  user who submitted the batch, in the thread they submitted from or their own DM, once
+  per batch, and only when they opted in. Worth listing because "the agent can initiate a
+  message" is a category the rest of the system does not have — the failure to watch for is
+  a notification loop, which is why an undeliverable one is still marked sent.
 
 - **A batch whose IDs were never captured used to be untrackable.** The first real
   submission hit exactly that: three jobs running, none recorded, so they could not be

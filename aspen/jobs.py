@@ -99,7 +99,12 @@ CREATE TABLE IF NOT EXISTS batches (
     staging_dir   TEXT NOT NULL,
     structures    INTEGER NOT NULL,
     argv          TEXT NOT NULL,
-    submitted_at  TEXT NOT NULL
+    submitted_at  TEXT NOT NULL,
+    -- Where to post when this batch finishes, and whether to. The channel is
+    -- stored because a thread_ts alone is not addressable.
+    channel       TEXT,
+    notify        INTEGER DEFAULT 0,
+    notified_at   TEXT
 );
 CREATE TABLE IF NOT EXISTS jobs (
     job_id        TEXT NOT NULL,
@@ -160,7 +165,14 @@ def _migrate(conn) -> None:
     for column, decl in (("comment", "TEXT"),):
         if column not in have:
             conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {decl}")
-            log.info("jobs: added ledger column %s", column)
+            log.info("jobs: added ledger column jobs.%s", column)
+
+    have = {row[1] for row in conn.execute("PRAGMA table_info(batches)")}
+    for column, decl in (("channel", "TEXT"), ("notify", "INTEGER DEFAULT 0"),
+                         ("notified_at", "TEXT")):
+        if column not in have:
+            conn.execute(f"ALTER TABLE batches ADD COLUMN {column} {decl}")
+            log.info("jobs: added ledger column batches.%s", column)
 
 
 def _utc_now() -> str:
@@ -169,7 +181,8 @@ def _utc_now() -> str:
 
 def record_batch(*, slack_user_id: str, alias: str, thread_ts: str, project: str,
                  owner_scope: str, template_mode: str, staging_dir: Path,
-                 structures: int, argv: list) -> str:
+                 structures: int, argv: list, channel: str = "",
+                 notify: bool = False) -> str:
     """Write the batch row and return its id. Called BEFORE the pipeline runs.
 
     Spec §18.2's "every submission is fully logged before sbatch" requirement,
@@ -182,10 +195,10 @@ def record_batch(*, slack_user_id: str, alias: str, thread_ts: str, project: str
         conn.execute(
             "INSERT INTO batches (batch_id, slack_user_id, alias, thread_ts, "
             "project, owner_scope, template_mode, staging_dir, structures, argv, "
-            "submitted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "submitted_at, channel, notify) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (batch_id, slack_user_id, alias, thread_ts, project, owner_scope,
              template_mode, str(staging_dir), int(structures),
-             json.dumps(list(argv)), _utc_now()),
+             json.dumps(list(argv)), _utc_now(), channel, 1 if notify else 0),
         )
     return batch_id
 
@@ -220,6 +233,14 @@ def jobs_for_batch(batch_id: str) -> list:
         return [dict(r) for r in conn.execute(
             "SELECT * FROM jobs WHERE batch_id = ? ORDER BY submitted_at, kind",
             (batch_id,))]
+
+
+def reconcile_quietly(days: int = 30) -> None:
+    """Refresh job states without letting a bad sacct call break the caller."""
+    try:
+        reconcile(days=days)
+    except Exception:
+        log.debug("jobs: background reconcile failed", exc_info=True)
 
 
 def _backfill_quietly() -> None:
@@ -902,7 +923,8 @@ def dry_run(*, requester_uid: str, thread_ts: str, rel: str, owner: str,
     return {**payload, "token": token, "stdout": proc.stdout[-4000:]}
 
 
-def commit(*, requester_uid: str, thread_ts: str, token: str) -> dict:
+def commit(*, requester_uid: str, thread_ts: str, token: str,
+           channel: str = "", notify: bool = False) -> dict:
     """Redeem a dry-run token and submit for real.
 
     The ledger row is written **before** the pipeline runs and a failure to write
@@ -948,6 +970,7 @@ def commit(*, requester_uid: str, thread_ts: str, token: str) -> dict:
         thread_ts=thread_ts, project=payload.get("project", ""),
         owner_scope=payload.get("scope", ""), template_mode=payload["template_mode"],
         staging_dir=staging_dir, structures=len(structures), argv=argv,
+        channel=channel, notify=notify,
     )
 
     try:
@@ -1357,7 +1380,8 @@ def _unified_diff(before: str, after: str, before_name: str, after_name: str,
     return "\n".join(lines)
 
 
-def commit_direct(*, requester_uid: str, thread_ts: str, token: str) -> dict:
+def commit_direct(*, requester_uid: str, thread_ts: str, token: str,
+                  channel: str = "", notify: bool = False) -> dict:
     """Redeem a prepared submission and run ``sbatch``. Ledger first, always."""
     require_registered(requester_uid)
     if not config.JOBS_SUBMIT_ENABLED:
@@ -1383,6 +1407,7 @@ def commit_direct(*, requester_uid: str, thread_ts: str, token: str) -> dict:
         owner_scope=payload.get("template_owner", ""),
         template_mode=f"{payload['runner']}:{payload['template']}",
         staging_dir=staging_dir, structures=1, argv=argv,
+        channel=channel, notify=notify,
     )
 
     try:

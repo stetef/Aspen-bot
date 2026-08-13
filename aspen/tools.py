@@ -21,8 +21,8 @@ from typing import Optional
 
 import httpx
 
-from . import (config, demo, inputs, jobs, metadata, roots, runners, setup,
-               staging, templates, workflows)
+from . import (config, demo, inputs, jobs, metadata, notify, roots, runners,
+               setup, staging, templates, workflows)
 
 log = logging.getLogger("aspen")
 
@@ -421,7 +421,11 @@ def _submit_orca_batch(inp: dict, context: dict) -> tuple[str, list[str]]:
 
     try:
         if token:
-            result = jobs.commit(requester_uid=uid, thread_ts=thread, token=token)
+            result = jobs.commit(
+                requester_uid=uid, thread_ts=thread, token=token,
+                channel=context.get("channel", ""),
+                notify=_wants_notification(uid, inp),
+            )
             lines = [
                 f"Submitted batch `{result['batch_id']}` — "
                 f"{len(result['structures'])} structure(s), "
@@ -611,7 +615,11 @@ def _submit_calculation(inp: dict, context: dict) -> tuple[str, list[str]]:
     token = (inp.get("confirm_token") or "").strip()
     try:
         if token:
-            r = jobs.commit_direct(requester_uid=uid, thread_ts=thread, token=token)
+            r = jobs.commit_direct(
+                requester_uid=uid, thread_ts=thread, token=token,
+                channel=context.get("channel", ""),
+                notify=_wants_notification(uid, inp),
+            )
             return (
                 f"Submitted job {r['job_id']} ({r['job_name']}) via the "
                 f"{r['runner']} runner.\n"
@@ -794,6 +802,25 @@ def _delete_job_runner(inp: dict, context: dict) -> tuple[str, list[str]]:
         return runners.delete(context.get("user_id", ""), inp.get("name", "")), []
     except runners.RunnerError as exc:
         return f"Error: {exc}", []
+
+
+def _wants_notification(uid: str, inp: dict) -> bool:
+    """Whether to ping this user when the batch ends.
+
+    A saved preference wins, so nobody is asked twice. ``notify`` on the call is the
+    answer to "shall I tell you when it's done?" for someone who has not set one —
+    and it does not persist by itself; saving that is a separate, explicit act.
+    """
+    if not config.JOBS_NOTIFY_ENABLED:
+        return False
+    saved = notify.preference(uid)
+    if saved:
+        return saved == notify.ALWAYS
+    return bool(inp.get("notify"))
+
+
+def _set_job_notifications(inp: dict, context: dict) -> tuple[str, list[str]]:
+    return notify.set_preference(context.get("user_id", ""), inp.get("choice", "")), []
 
 
 def _tool_server_post(path: str, payload: dict, timeout: int) -> httpx.Response:
@@ -1317,6 +1344,15 @@ TOOL_SPECS = [
                         "calculated. Ignored when confirm_token is given."
                     ),
                 },
+                "notify": {
+                    "type": "boolean",
+                    "description": (
+                        "Tell this user when the batch ends. Ask if they want it, "
+                        "unless they already have a saved preference — a saved one "
+                        "always wins. If they say 'always', also call "
+                        "set_job_notifications so you stop asking."
+                    ),
+                },
                 "confirm_token": {
                     "type": "string",
                     "description": (
@@ -1497,6 +1533,11 @@ TOOL_SPECS = [
                 "ntasks": {"type": "integer", "description": "Cores, within the limit."},
                 "mem_gb": {"type": "integer", "description": "Memory in GB, within the limit."},
                 "time_limit": {"type": "string", "description": "Walltime as HH:MM:SS."},
+                "notify": {
+                    "type": "boolean",
+                    "description": ("Tell this user when the job ends. A saved "
+                                    "preference wins; otherwise ask."),
+                },
                 "confirm_token": {
                     "type": "string",
                     "description": ("The single-use token from your dry run. Only after "
@@ -1585,6 +1626,22 @@ TOOL_SPECS = [
         "impl": _save_job_runner,
     },
     {
+        "name": "set_job_notifications",
+        "description": (
+            "Remember whether this user wants to be pinged when their jobs finish, so "
+            "you stop asking every time. 'always' means Aspen messages them when a "
+            "batch ends — and straight away if a job fails, since a dependency chain "
+            "fails late. 'never' means it stays quiet and they ask. Only ever sets the "
+            "preference of the person you are talking to."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"choice": {"type": "string", "enum": ["always", "never"]}},
+            "required": ["choice"],
+        },
+        "impl": _set_job_notifications,
+    },
+    {
         "name": "delete_job_runner",
         "description": "Delete one of the SPEAKING USER'S own runners. Snapshotted first.",
         "input_schema": {"type": "object", "properties": {"name": {"type": "string"}},
@@ -1605,6 +1662,7 @@ JOB_TOOLS = frozenset({
     "list_input_templates", "read_input_template", "save_input_template",
     "delete_input_template",
     "list_job_runners", "read_job_runner", "save_job_runner", "delete_job_runner",
+    "set_job_notifications",
 })
 
 

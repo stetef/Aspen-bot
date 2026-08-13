@@ -464,6 +464,9 @@ def _handle_event(event: dict, say, client, strip_mention: bool) -> None:
         # ``on_interim`` carries the agent's own words out while it works.
         context = {"user_id": uid, "username": registry.display_name(uid),
                    "thread_ts": thread_ts or "",
+                   # Where to post a job notification later. A thread_ts alone is
+                   # not addressable — chat.postMessage needs the channel too.
+                   "channel": channel,
                    "attachments": [], "on_progress": _on_progress,
                    # So a tool can DM the admin about a request. Nothing the agent
                    # can reach grants anything — the client is here to *ask*.

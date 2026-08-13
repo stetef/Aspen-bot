@@ -83,11 +83,20 @@ def test_neither_write_tool_takes_an_owner(sut):
         if name == "submit_orca_batch":
             # `owner` here names whose *calculations* to read the structures from —
             # a read, fenced like every other read. It never selects who the job
-            # belongs to; that is always the speaker.
-            assert set(props) <= {"path", "owner", "template_mode", "confirm_token"}
+            # belongs to; that is always the speaker. `notify` is a yes/no about
+            # messaging the speaker, which reaches nobody else.
+            assert set(props) <= {"path", "owner", "template_mode", "notify",
+                                  "confirm_token"}
         else:
             assert "owner" not in props
             assert "user" not in props and "slack_user_id" not in props
+        # Whatever else a job tool grows, it must never name WHO on behalf of.
+        for forbidden in ("user", "slack_user_id", "for_user", "on_behalf_of",
+                          "notify_user", "channel"):
+            assert forbidden not in props, (
+                f"{name} must not accept {forbidden!r} — the requester and where to "
+                "reply both come from the Slack event"
+            )
 
 
 def test_template_mode_is_a_closed_enum(sut, jobs_env):

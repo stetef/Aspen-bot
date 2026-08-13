@@ -254,6 +254,7 @@ auto-approves exactly the MCP tools below plus a read-only Bash allowlist, and a
 | `delete_input_template` | **write** | Delete one of the speaker's own templates (snapshotted) |
 | `submit_calculation` | **submit** | One job from a template via the speaker's registered runner — [§20.5](#205-submission-and-the-tag-that-comes-back) |
 | `check_orca_run` | read-only | Did a run converge, and where is the optimised geometry — [§20.7](#207-the-follow-on) |
+| `set_job_notifications` | preference | Remember whether to ping the speaker when their jobs end — [§19.8](#198-being-told-when-it-ends) |
 
 Every path-taking tool takes an **`owner`** — a *name* (alias, Slack ID, or shared-root
 name), never a path. Reading is flat: any root may be read by anyone ([§5.1](#51-calculations-roots-aspenrootspy)).
@@ -862,6 +863,8 @@ ASPEN_JOBS_MAX_STRUCTURES=24              # per submission
 ASPEN_JOBS_MAX_ACTIVE_PER_USER=48         # concurrent non-terminal jobs
 ASPEN_JOBS_MAX_ACTIVE_TOTAL=200
 ASPEN_JOBS_MAX_SUBMITS_PER_DAY=10         # per user
+ASPEN_JOBS_NOTIFY=true                    # tell people when their jobs end (§19.8)
+ASPEN_JOBS_NOTIFY_POLL_SECONDS=300
 ASPEN_JOBS_CONFIRM_TTL_SECONDS=900        # dry-run → confirm token lifetime
 ASPEN_JOBS_SUBMIT_TIMEOUT_SECONDS=3600    # cap on the orchestrator subprocess
 # Extra env names to pass through to the orchestrator subprocess (and thus to
@@ -1083,7 +1086,7 @@ replacements are load-bearing rather than cosmetic:
   see [§19.1](#191-why-the-ledger-and-the-workdir-tag-are-load-bearing). The
   `AccountingStoreFlags = job_comment` finding still holds and still matters: it is what
   makes the comment worth plumbing through the pipeline as a *second* check later
-  ([§19.9](#199-what-the-beta-does-not-fix)).
+  ([§19.10](#1910-what-the-beta-does-not-fix)).
 - **Two endpoints on the tool server** is not where this went. `tool_server.py` is
   deliberately standalone — it never imports the `aspen` package and keeps its own
   registry reader. Putting the cancel-ownership check there would mean a **second
@@ -1183,7 +1186,7 @@ oversight. The requester is `context["user_id"]` — the ID Slack itself attache
 event — exactly as with `write_workflow` (C9). A model can be argued into passing any
 argument it is handed; it cannot pass a value it never receives. There is deliberately no
 way to submit or cancel *on behalf of* someone else, not even for the admin through the
-agent: the admin's escape hatch is the CLI ([§19.8](#198-the-cli-escape-hatch)), outside
+agent: the admin's escape hatch is the CLI ([§19.9](#199-the-cli-escape-hatch)), outside
 the model's reach, like every other granting action in the system.
 
 `sbatch` and `scancel` are **never** added to the Bash allowlist ([§4](#4-tool-surface)),
@@ -1250,7 +1253,7 @@ One SQLite file, `$ASPEN_STATE_DIR/jobs.sqlite`, written only by the bot:
   (`state`, `elapsed`, `total_cpu`, `alloc_tres`, `exit_code`, `reconciled_at`).
 
 Submit rows are **immutable**; only the reconciler's columns are ever updated
-([§19.9](#199-what-the-beta-does-not-fix)). The write happens **before** the pipeline is
+([§19.10](#1910-what-the-beta-does-not-fix)). The write happens **before** the pipeline is
 invoked and a failure to write **aborts the submission** — the §18.2 requirement, kept
 literally, because a job running with no ledger row is a job nobody can cancel through
 Aspen and nobody can attribute.
@@ -1362,7 +1365,41 @@ Asking the model in the system prompt to "confirm first" would be advice — the
 here is the same one `pending.py` uses, and it survives a model that has been talked into
 skipping the question.
 
-### 19.8 The CLI escape hatch
+### 19.8 Being told when it ends
+
+Aspen's silence used to carry no information — a batch could be done, failed, or queued,
+and the only way to know was to ask. A user opts in once (`set_job_notifications`, stored
+as `notify_jobs` on their registry record, so nobody is asked twice) and `aspen/notify.py`
+tells them. Three decisions, each of which could have gone the other way:
+
+**A failure interrupts; success waits for the batch.** Waiting for every job to settle
+before saying anything would keep a run that died in its first minute quiet for the hours
+its dependents spend queued — and a dependency chain does not fail fast, it fails *late*.
+So any job reaching a failed state is worth interrupting for; a clean run is only
+interesting once it is actually done.
+
+**One notification per batch**, not one per job — a nine-job batch would otherwise be nine
+pings for one piece of news. The message names what failed, which is the part you would
+go looking for anyway, and where the results are.
+
+**In the thread, falling back to a DM.** The thread holds the context — the diff that was
+approved, the structures chosen — so that is where it belongs. But a channel the bot has
+been removed from would swallow it, so a failed post retries as a direct message. Either
+way the batch is marked notified: a notification is worth one good attempt, not an
+unbounded retry against a channel that is never coming back.
+
+The preference is one of the few things the agent may write, for the same reason
+`decline` is ([§5.0](#50-getting-set-up-and-asking-for-things-aspensetuppy-aspenpendingpy)):
+it decides whether Aspen speaks to *that person* about *their own* jobs. It grants
+nothing and reaches nobody else. `ASPEN_JOBS_NOTIFY=false` disables the whole thing
+regardless of what anyone has saved.
+
+The watcher is a daemon thread started at boot, polling every
+`ASPEN_JOBS_NOTIFY_POLL_SECONDS` (default 300). It reconciles first, so states are fresh,
+and it swallows its own exceptions — a bad poll should mean a late notification, not a
+silently dead watcher.
+
+### 19.9 The CLI escape hatch
 
 `aspen-users jobs` — `list`, `show`, `cancel`, `prune`, and `reconcile` — is the
 operator's path in, outside the agent and outside Slack. It exists because the beta's
@@ -1373,7 +1410,7 @@ blast radius of a mistyped panic is every user's work at once. Like every other 
 ([§5.1](#51-calculations-roots-aspenrootspy)), it is CLI-only and has no agent-facing
 equivalent.
 
-### 19.9 What the beta does not fix
+### 19.10 What the beta does not fix
 
 Recorded here rather than left implicit, because the point of the beta is to iterate with
 the risks visible:
@@ -1390,11 +1427,6 @@ the risks visible:
   `WorkDir`, recoverable from `sacct -o Comment` even if the ledger is lost — worth doing,
   since `AccountingStoreFlags = job_comment` is confirmed on s3df. Deliberately **not** a
   generic `--sbatch-extra-args` pass-through, which would be `--wrap` by another name.
-- **Nothing notifies you when a job finishes.** Aspen does not offer to follow up, and
-  there is no background watcher; you ask, or you run `squeue`. The pieces exist (the
-  ledger holds each batch's `thread_ts`, and the reconciler already reads terminal state
-  from `sacct`), so this is a small feature rather than a design question — it is simply
-  not built.
 - **The reconciler is manual** (`aspen-users jobs reconcile`), not a cron job —
   though the caps reconcile once on their own before refusing, since a row with no
   state counts as active and an unreconciled ledger would otherwise jam the cap

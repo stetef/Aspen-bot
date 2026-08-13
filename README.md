@@ -381,8 +381,19 @@ which is world-readable — so the ORCA output, the optimised geometry and every
 run wrote are there to read or copy out, by you or by Aspen. (In the first build this was
 `~/.aspen` at 0700, and nobody could get the results back.)
 
-**Nothing tells you when a job finishes.** There is no watcher and no follow-up: ask Aspen,
-or use `squeue`. Its silence means nothing either way.
+**Getting told when it's done.** Aspen asks once whether you want to be pinged, and
+remembers the answer:
+
+```
+Aspen  Submitted batch 9f2c… — 18 jobs queued.
+       Want me to tell you when it finishes?
+you    yes, always
+Aspen  I'll tell you when your jobs finish, and straight away if one fails.
+```
+
+It replies in the thread you submitted from (or DMs you if that's gone), once per batch —
+on completion, or immediately if a job fails, since a dependency chain fails late and
+waiting would keep you in the dark for hours. Change your mind any time by telling it so.
 
 ## What Aspen records (`aspen-users telemetry`)
 

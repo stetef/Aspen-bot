@@ -173,6 +173,11 @@ def _normalize(raw: dict) -> dict:
                 # Their Unix account on the cluster. A Slack ID does not name
                 # one, and job submission on someone's behalf needs it.
                 "unix_user": str(entry.get("unix_user") or ""),
+                # Whether Aspen pings them when their jobs finish: "always",
+                # "never", or empty = not asked yet. Agent-writable like
+                # `declined`, because it only decides whether Aspen speaks to
+                # this person about their own jobs. See notify.py.
+                "notify_jobs": str(entry.get("notify_jobs") or ""),
                 # Which registered runner submits their jobs (see runners.py).
                 # Empty = they cannot submit. CLI-only, like calc_root: a tool
                 # that wrote this would choose what executes, which is exactly

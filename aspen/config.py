@@ -347,6 +347,13 @@ JOBS_CONFIRM_TTL      = int(os.getenv("ASPEN_JOBS_CONFIRM_TTL_SECONDS", "900"))
 # orchestrator is not mistaken for a failure, and `jobs.backfill()` so the job IDs
 # are recovered from the pipeline's own log whichever way this goes wrong.
 JOBS_SUBMIT_TIMEOUT   = int(os.getenv("ASPEN_JOBS_SUBMIT_TIMEOUT_SECONDS", "3600"))
+# Job notifications (aspen/notify.py). A user opts in once and is told when their
+# jobs finish — immediately if one fails, since a dependency chain fails late and
+# silence for hours is the wrong default. Off means nobody is ever pinged, whatever
+# their preference says.
+JOBS_NOTIFY_ENABLED   = _flag_early("ASPEN_JOBS_NOTIFY", "true")
+JOBS_NOTIFY_POLL_SECONDS = int(os.getenv("ASPEN_JOBS_NOTIFY_POLL_SECONDS", "300"))
+
 # Timeout for a single read-only Slurm client call (scontrol/sacct/squeue).
 JOBS_SLURM_TIMEOUT    = int(os.getenv("ASPEN_JOBS_SLURM_TIMEOUT_SECONDS", "30"))
 

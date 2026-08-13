@@ -73,7 +73,12 @@ if config.JOBS_SUBMIT_ENABLED:
         "offer to save it with save_input_template so it is reusable. You can only "
         "save to the speaking user's own library.\n"
         "Before offering a follow-on calculation, use check_orca_run rather than "
-        "assuming a run converged.\n\n"
+        "assuming a run converged.\n"
+        "When you submit, ask whether they want to be told when it finishes -- unless "
+        "they already have a saved preference, in which case just honour it and do not "
+        "ask again. If they say they always want it, call set_job_notifications so "
+        "nobody is asked twice. Aspen pings on completion, and immediately if a job "
+        "fails.\n\n"
     )
 else:
     _JOBS_SECTION = ""
