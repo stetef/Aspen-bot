@@ -534,10 +534,19 @@ By default the Claude Code CLI authenticates with the Claude Code login; set
 ## Tests
 
 ```bash
+uv pip install --python venv/bin/python -r requirements-dev.txt   # once
 pytest -q
 ```
 
 A hermetic suite — no live Slack, Claude CLI, or network needed.
+
+It covers the dashboard's data layer as well (`tests/test_dashboard.py`), which is why
+`requirements-dev.txt` carries `pandas`: the dashboard parses the turn log with its own
+reader rather than importing `aspen.telemetry`, and a second reader of the same format
+that nothing tests is a second reader that drifts. Those tests drive `telemetry.record`
+and read the result back, so a field the bot stops writing fails here instead of on the
+page. Streamlit stays out of the bot venv — `app.py` is exercised by
+`./aspen-dashboard --demo`.
 
 ## Status
 

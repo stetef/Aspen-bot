@@ -1,4 +1,18 @@
-# Development / test dependencies (not needed at runtime).
-# Install with:  venv/bin/pip install -r requirements-dev.txt
+# Development / test dependencies (not needed at runtime, never installed in
+# production). Install into the bot venv with uv — the same tool start.sh and
+# ./aspen-dashboard use to build theirs:
+#
+#   uv pip install --python venv/bin/python -r requirements-dev.txt
+#   venv/bin/pip install -r requirements-dev.txt        # without uv
+#
 pytest>=7
 pytest-cov>=5.0
+
+# For tests/test_dashboard.py. The dashboard runs from its own venv
+# (dashboard-requirements.txt) and that separation is deliberate — but its data
+# layer is a *second, independent reader of the turn log*, and a second reader
+# that nothing tests is a second reader that drifts. One suite, one `pytest -q`,
+# so it can't be the suite people forget to run. Only pandas is needed: the
+# module under test imports nothing else, and streamlit/altair stay out of the
+# bot's tree entirely.
+pandas>=2.0

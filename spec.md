@@ -1728,10 +1728,17 @@ discovered map, never from the string the model passed.
 
 **The pipeline source is readable.** `automated-pipeline` sat outside every calculations
 root, so the read tools could not see it and Aspen could not answer questions about its own
-submission machinery. It is now a **shared root** named `@pipeline` — owned by nobody in
-particular, read-only like every root, and a sibling of `calculations/` so the two do not
-nest. Keeping it out of anyone's *personal* root also keeps the executable out of a tree
-whose write permissions would then decide what Aspen runs.
+submission machinery. It was briefly a **shared root** named `@pipeline`; since 2026-08-13
+the group's personal roots sit at `dft-work/` itself, which *contains* both
+`calculations/` and `automated-pipeline/`, so the shared root was retired — roots may not
+nest, and containment is the fence. The source is still readable, addressed as
+`@<alias>/automated-pipeline` instead of `@pipeline`.
+
+The cost of that consolidation is the property the shared root was buying: the pipeline
+executable now lives inside a tree someone *owns*, so the write permissions on that tree —
+not Aspen's — decide what a submitted job runs. Aspen itself still writes nowhere inside
+any root ([§4](#4-tools)); the exposure is to whoever can write `dft-work/` on the
+filesystem. Splitting the roots back apart is the fix if that stops being the same person.
 
 ### 20.7 The follow-on
 

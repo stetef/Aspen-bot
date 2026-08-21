@@ -91,8 +91,12 @@ def denied_commands(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "denials" not in df:
         return pd.DataFrame(columns=["tool", "command", "times"])
     rows = []
-    for _, turn in df.iterrows():
-        for d in turn.get("denials") or []:
+    # A turn logged before the field existed — or one with nothing denied — reads
+    # as NaN here, which is truthy, so the type check is what does the guarding.
+    for denials in df["denials"]:
+        if not isinstance(denials, list):
+            continue
+        for d in denials:
             if isinstance(d, dict):
                 rows.append({"tool": d.get("tool") or "?",
                              "command": (d.get("command") or "").strip()})
@@ -109,6 +113,8 @@ def tool_sequences(df: pd.DataFrame, length: int = 3, top: int = 12) -> pd.DataF
     by hand every time — the strongest signal for what deserves one purpose-built
     tool instead.
     """
+    if df.empty:
+        return pd.DataFrame(columns=["sequence", "times"])
     counts: dict[tuple, int] = {}
     for tools in df["tools"]:
         for i in range(len(tools) - length + 1):
