@@ -9,6 +9,12 @@ the 0600 log file mode exists to prevent.
 Nothing here writes. It reads the JSONL turn log (see dashboard/data.py) and
 renders. ``--demo`` substitutes synthetic rows so the layout can be judged before
 real traffic accumulates; demo mode never touches the real log.
+
+The Conversations panel reads a second source — the CLI transcripts, via
+dashboard/transcripts.py — because the turn log deliberately keeps no reply text.
+Those transcripts hold everything both sides said regardless of the telemetry
+content switch, so what may be *shown* is gated on the turn log's own per-turn
+decision rather than on what happens to be on disk.
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import data as dataio          # noqa: E402
 import theme                   # noqa: E402
+import transcripts as convo    # noqa: E402
 
 st.set_page_config(page_title="Aspen usage", page_icon="🐺", layout="wide")
 
@@ -45,6 +52,12 @@ PRIMARY = theme.PRIMARY[MODE]
 @st.cache_data(ttl=60, show_spinner=False)
 def _load(log_dir: str, demo: bool, _stamp: float) -> pd.DataFrame:
     return dataio.demo_turns() if demo else dataio.read_turns(Path(log_dir))
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_conversations(projects_dir: str, _stamp: float) -> list[dict]:
+    """Parsing every transcript is seconds of work; the mtime stamp caches it."""
+    return convo.read_all(Path(projects_dir))
 
 
 def _stamp(log_dir: Path) -> float:
@@ -323,6 +336,74 @@ else:
         width="stretch", hide_index=True)
     if redacted:
         st.caption(f"{redacted} turn(s) in this range were recorded without text.")
+
+# --------------------------------------------------------------------------- #
+# Conversations — the turn log says how it went, this says what was said
+# --------------------------------------------------------------------------- #
+st.subheader("Conversations")
+if DEMO:
+    st.caption("Not available in demo mode — there are no transcripts to read.")
+else:
+    sessions = _load_conversations(str(convo.DEFAULT_PROJECTS_DIR),
+                                   convo.stamp(convo.DEFAULT_PROJECTS_DIR))
+    listing = convo.index(sessions)
+    if listing.empty:
+        st.caption(
+            f"No transcripts found under `{convo.DEFAULT_PROJECTS_DIR}`. The CLI "
+            "writes one per Slack thread; set CLAUDE_PROJECTS_DIR if the bot runs "
+            "as another user."
+        )
+    else:
+        excluded = convo.excluded_users(log_dir.parent / "telemetry.json")
+        people = sorted(listing["who"].unique())
+        left, right = st.columns([1, 2])
+        who = left.selectbox("Person", people)
+        mine = listing[listing["who"] == who]
+        pick = right.selectbox(
+            "Conversation", list(mine["session_id"]),
+            format_func=lambda sid: (
+                f"{mine.loc[mine['session_id'] == sid, 'last'].iloc[0]:%d %b %H:%M}"
+                f"  ·  {mine.loc[mine['session_id'] == sid, 'title'].iloc[0]}"),
+        )
+        session = next(s for s in sessions if s["session_id"] == pick)
+        # Joined against the WHOLE log, not the filtered view: the sidebar range
+        # scopes the charts, and a turn falling outside it is not a turn whose
+        # consent decision is unknown.
+        convo_turns = convo.visible_turns(session, turns, excluded)
+
+        withheld = [t for t in convo_turns if not t["shown"]]
+        unjoined = [t for t in withheld if t["unjoined"]]
+        reveal = False
+        if unjoined:
+            # Everything recorded before session_id was logged lands here. It is
+            # the operator's own backlog rather than anyone else's data, so it is
+            # reachable — behind a switch that says what it is.
+            reveal = st.toggle(
+                f"Show {len(unjoined)} turn(s) with no telemetry record",
+                help="Recorded before the session id was logged, so the consent "
+                     "decision for them cannot be looked up.")
+        opted_out = [t for t in withheld if not t["unjoined"]]
+        if opted_out:
+            st.caption(f"{len(opted_out)} turn(s) hidden — recorded without text, "
+                       "or the person has opted out of content collection.")
+
+        st.caption(f"`{pick}` · {len(session['turns'])} turns · "
+                   f"{session['turns'][0]['ts'][:10]} → {session['turns'][-1]['ts'][:10]}")
+        for turn in convo_turns:
+            visible = turn["shown"] or (turn["unjoined"] and reveal)
+            when = turn["ts"][11:19]
+            if not visible:
+                st.markdown(f"**{turn['who']}** · {when} — _withheld ({turn['why']})_")
+                st.divider()
+                continue
+            st.markdown(f"**{turn['who']}** · {when}")
+            st.info(turn["question"])
+            if turn["tools"]:
+                with st.expander(f"{len(turn['tools'])} tool call(s)"):
+                    st.code("\n".join(turn["tools"]), language=None)
+            st.markdown("\n\n".join(turn["reply"]) if turn["reply"]
+                        else "_(no text reply — the turn errored or is still running)_")
+            st.divider()
 
 # --------------------------------------------------------------------------- #
 # Jobs — lights up when the agent starts submitting
