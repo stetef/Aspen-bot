@@ -366,22 +366,21 @@ else:
                 f"  ·  {mine.loc[mine['session_id'] == sid, 'title'].iloc[0]}"),
         )
         session = next(s for s in sessions if s["session_id"] == pick)
+        # Everything recorded before session_id was logged has no row to consult.
+        # Those turns are shown, because collection defaults to on and "no record"
+        # is not a prohibition — but the switch is here to read them strictly.
+        strict = not st.toggle(
+            "Show turns recorded before the session id was logged", value=True,
+            help="These predate the join key, so their consent decision cannot be "
+                 "looked up. Collection defaults to on, so they are shown; turn "
+                 "this off to see only turns whose record can be verified.")
         # Joined against the WHOLE log, not the filtered view: the sidebar range
         # scopes the charts, and a turn falling outside it is not a turn whose
         # consent decision is unknown.
-        convo_turns = convo.visible_turns(session, turns, excluded)
+        convo_turns = convo.visible_turns(session, turns, excluded,
+                                          show_unjoined=not strict)
 
         withheld = [t for t in convo_turns if not t["shown"]]
-        unjoined = [t for t in withheld if t["unjoined"]]
-        reveal = False
-        if unjoined:
-            # Everything recorded before session_id was logged lands here. It is
-            # the operator's own backlog rather than anyone else's data, so it is
-            # reachable — behind a switch that says what it is.
-            reveal = st.toggle(
-                f"Show {len(unjoined)} turn(s) with no telemetry record",
-                help="Recorded before the session id was logged, so the consent "
-                     "decision for them cannot be looked up.")
         opted_out = [t for t in withheld if not t["unjoined"]]
         if opted_out:
             st.caption(f"{len(opted_out)} turn(s) hidden — recorded without text, "
@@ -390,7 +389,7 @@ else:
         st.caption(f"`{pick}` · {len(session['turns'])} turns · "
                    f"{session['turns'][0]['ts'][:10]} → {session['turns'][-1]['ts'][:10]}")
         for turn in convo_turns:
-            visible = turn["shown"] or (turn["unjoined"] and reveal)
+            visible = turn["shown"]
             when = turn["ts"][11:19]
             if not visible:
                 st.markdown(f"**{turn['who']}** · {when} — _withheld ({turn['why']})_")

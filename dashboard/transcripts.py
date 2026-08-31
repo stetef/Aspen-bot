@@ -189,7 +189,8 @@ def excluded_users(state_file: Path) -> set[str]:
 
 
 def visible_turns(session: dict, turn_log: pd.DataFrame,
-                  excluded: set[str] | None = None) -> list[dict]:
+                  excluded: set[str] | None = None,
+                  show_unjoined: bool = True) -> list[dict]:
     """The session's turns, with text withheld wherever the log withheld it.
 
     The gate is the turn log's own ``redacted`` flag rather than a re-derivation
@@ -201,8 +202,15 @@ def visible_turns(session: dict, turn_log: pd.DataFrame,
     Two additions on top. A person on the exclusion list *now* has their past
     conversations withheld too, so removing someone takes effect backwards. And a
     turn with no matching log row — anything recorded before ``session_id`` was
-    logged — is marked ``unjoined`` rather than shown: absence of a record is not
-    consent. The caller decides what to do with those.
+    logged — is marked ``unjoined``.
+
+    Unjoined turns are shown, because that is what the recording policy actually
+    said: collection defaults to on (``telemetry._DEFAULTS``), so a turn with no
+    row to consult was recorded under whatever was in force at the time, not
+    under a prohibition. Treating "no record" as "withhold" would hide
+    conversations collected under a fully open policy, while an explicit opt-out
+    is still honoured by the two checks above. ``show_unjoined=False`` restores
+    the strict reading for an operator who wants only turns they can verify.
     """
     excluded = excluded or set()
     joined = pd.DataFrame()
@@ -213,7 +221,8 @@ def visible_turns(session: dict, turn_log: pd.DataFrame,
     for turn in session["turns"]:
         row = _match(joined, turn["ts"])
         if row is None:
-            out.append({**turn, "shown": False, "unjoined": True, "why": "no telemetry record"})
+            out.append({**turn, "shown": show_unjoined, "unjoined": True,
+                        "why": "" if show_unjoined else "no telemetry record"})
         elif bool(row.get("redacted")):
             out.append({**turn, "shown": False, "unjoined": False, "why": "recorded without text"})
         elif str(row.get("uid") or "") in excluded:

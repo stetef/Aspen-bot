@@ -160,12 +160,29 @@ def test_excluding_someone_hides_their_past_conversations(tmp_path):
     assert turn["why"] == "person opted out"
 
 
-def test_a_turn_with_no_log_row_is_not_shown_by_default(tmp_path):
-    """Absence of a record is not consent. Everything recorded before session_id
-    was logged lands here, so this is the whole existing backlog."""
+def test_a_turn_with_no_log_row_is_shown_by_default(tmp_path):
+    """Everything recorded before session_id was logged lands here — the whole
+    existing backlog. Collection defaults to on, so a turn with no row to consult
+    was recorded under whatever was in force then, not under a prohibition."""
     _transcript(tmp_path, "s1", *_exchange("q", "a"))
     turn = T.visible_turns(T.read_all(tmp_path)[0], _log_frame())[0]
-    assert turn["shown"] is False and turn["unjoined"] is True
+    assert turn["shown"] is True and turn["unjoined"] is True
+
+
+def test_strict_mode_withholds_turns_that_cannot_be_verified(tmp_path):
+    """The other reading, for an operator who wants only checkable turns."""
+    _transcript(tmp_path, "s1", *_exchange("q", "a"))
+    turn = T.visible_turns(T.read_all(tmp_path)[0], _log_frame(),
+                           show_unjoined=False)[0]
+    assert turn["shown"] is False and turn["why"] == "no telemetry record"
+
+
+def test_an_explicit_opt_out_is_honoured_even_in_the_default_open_mode(tmp_path):
+    """Defaulting unjoined turns to visible must not weaken a real redaction."""
+    _transcript(tmp_path, "s1", *_exchange("private", "answer"))
+    log = _log_frame({"ts": "2026-08-31T18:02:46+00:00", "uid": "U08B", "outcome": "ok",
+                      "session_id": "s1", "text": None, "redacted": True})
+    assert T.visible_turns(T.read_all(tmp_path)[0], log)[0]["shown"] is False
 
 
 def test_an_old_log_without_the_session_id_column_does_not_crash(tmp_path):
