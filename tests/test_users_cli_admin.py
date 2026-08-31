@@ -197,3 +197,24 @@ def test_telemetry_exclude_and_include_one_person(sut, cli):
 
 def test_telemetry_include_of_someone_not_excluded_is_an_error(sut, cli):
     assert cli.main(["telemetry", "include", "arun"]) == 1
+
+
+def test_unix_user_can_be_recorded_without_re_supplying_a_path(sut, cli, env):
+    """Someone on the shared default root has no path to give, and demanding one
+    to fill in an account is how the field stayed empty for everybody."""
+    root = env.root("arun-calcs")
+    cli.main(["set-root", "arun", str(root)])
+    assert cli.main(["set-root", "arun", "--unix-user", "aasundi"]) == 0
+    entry = sut.registry.resolve("arun")
+    assert entry["unix_user"] == "aasundi"
+    assert entry["calc_root"] == str(root)        # the root is left alone
+
+
+def test_unix_user_alone_works_for_someone_on_the_default_root(sut, cli):
+    assert cli.main(["set-root", "arun", "--unix-user", "aasundi"]) == 0
+    entry = sut.registry.resolve("arun")
+    assert entry["unix_user"] == "aasundi" and entry["calc_root"] == ""
+
+
+def test_set_root_with_neither_a_path_nor_an_account_still_errors(sut, cli):
+    assert cli.main(["set-root", "arun"]) != 0

@@ -322,6 +322,23 @@ def test_preamble_lists_the_roster(sut, wf):
     assert "priya (Priya P.)" in out
 
 
+def test_preamble_names_each_persons_cluster_account(sut, wf):
+    """The gap that let the bot guess. Asked about a person's jobs with only a
+    display name in context, it inferred an account from a username it had seen
+    in `squeue` output and reported a stranger's jobs as theirs."""
+    from aspen import users_cli
+    users_cli.main(["set-root", "priya", "--unix-user", "ppatel"])
+    out = wf.turn_preamble("U01ARUN")
+    assert "priya (Priya P., submits as ppatel)" in out
+    assert "never infer an account" in out
+
+
+def test_preamble_leaves_an_unknown_account_blank_rather_than_inventing_one(sut, wf):
+    out = wf.turn_preamble("U01ARUN")
+    assert "sam (Sam) [admin]" in out          # no account on file: say nothing
+    assert "submits as" not in out.split("Registered users:")[1].split("\n")[0]
+
+
 def test_preamble_omits_removed_users(sut, wf):
     from aspen import users_cli
     users_cli.main(["remove", "priya", "-y"])

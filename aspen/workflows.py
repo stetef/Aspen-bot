@@ -257,12 +257,27 @@ def turn_preamble(uid: str, extra_lines: Optional[list] = None) -> str:
             who = "_group" if e["owner_id"] == GROUP_DIR else f"{e['alias']} ({e['owner_name']})"
             lines.append(f"- {who} — {e['description']}")
 
+    # The cluster account is on this line because its absence is what makes the
+    # bot guess. Asked about "Sam Tetef"'s jobs with only a display name to go
+    # on, it picked the closest-looking username it had just seen in `squeue`
+    # output — a different person — and reported their jobs as fact. A display
+    # name is not an account, and the two can look alike: arun-asundi shows as
+    # "arunasundi" and submits as "aasundi".
     roster = ", ".join(
-        f"{u['alias']} ({u['display_name']})" + (" [admin]" if u["role"] == "admin" else "")
+        f"{u['alias']} ({u['display_name']}"
+        + (f", submits as {u['unix_user']}" if u.get("unix_user") else "")
+        + ")" + (" [admin]" if u["role"] == "admin" else "")
         for u in registry.users()
     )
     if roster:
         lines.append(f"Registered users: {roster}")
+        lines.append(
+            "A person's cluster account is ONLY what this line says it is. If "
+            "someone is named without one here, ask — never infer an account "
+            "from a display name, an alias, or a username seen in command "
+            "output. Querying the wrong account returns real jobs belonging to "
+            "someone else, which reads exactly like a correct answer."
+        )
     lines.extend(extra_lines or [])
     lines.append("</aspen_context>")
     return "\n".join(lines) + "\n\n"

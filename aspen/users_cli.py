@@ -447,11 +447,19 @@ def cmd_set_root(args) -> int:
         return _err(f"no active user matches '{args.who}'")
     uid = user["slack_user_id"]
 
+    # Recording only the cluster account is its own errand: someone on the shared
+    # default root has no path to re-supply, and requiring one to fill in an
+    # account is how the field stayed empty long enough for the bot to guess.
+    account_only = bool(args.unix_user) and not args.path and not args.clear
+
     if args.clear:
         new_root = ""
+    elif account_only:
+        new_root = user["calc_root"]
     else:
         if not args.path:
-            return _err("give a path, or pass --clear to fall back to the default")
+            return _err("give a path, pass --clear to fall back to the default, "
+                        "or pass --unix-user on its own to record just the account")
         problem = roots.validate(args.path, for_uid=uid)
         if problem:
             return _err(problem)
@@ -462,12 +470,14 @@ def cmd_set_root(args) -> int:
              for u in registry.users(include_removed=True)]
     registry.save(users)
 
-    if new_root:
+    if account_only:
+        print(f"{user['display_name']} (@{user['alias']}) submits as {args.unix_user}")
+    elif new_root:
         print(f"{user['display_name']} (@{user['alias']}) now reads from {new_root}")
     else:
         print(f"{user['display_name']} (@{user['alias']}) falls back to the shared "
               f"default: {config.CALCULATIONS_ROOT}")
-    if args.unix_user:
+    if args.unix_user and not account_only:
         print(f"Unix account recorded as {args.unix_user}")
     print("Takes effect on their next message — no restart needed.")
     return 0
@@ -1188,7 +1198,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--clear", action="store_true",
                    help="unset it — they fall back to the shared CALCULATIONS_ROOT")
     s.add_argument("--unix-user", default="",
-                   help="their cluster account (a Slack ID doesn't name one)")
+                   help="their cluster account (a Slack ID doesn't name one). May "
+                        "be given on its own, with no path, to record just this")
     s.set_defaults(func=cmd_set_root)
 
     s = sub.add_parser("roots", help="list every calculations root and its state")
