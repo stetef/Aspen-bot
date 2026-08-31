@@ -228,10 +228,18 @@ def _flatten_meta(meta: Optional[dict]) -> dict:
     per-user: they appear only on the turns where the meter changed state. Under
     a subscription seat they matter more than ``cost_usd``, which the CLI reports
     as 0 or omits entirely when billing runs through the seat rather than a key.
+
+    ``session_id`` is a *pointer*, not content: it names the CLI transcript for
+    the thread, which holds the full text of both sides regardless of what the
+    content switch says here. Recording it does not widen what Aspen collects —
+    the CLI writes that file either way — but anything reading turns back must
+    keep this record's own ``redacted`` flag authoritative and not treat the
+    pointer as permission to show text this turn deliberately withheld.
     """
     meta = meta or {}
     keep = ("result_subtype", "num_turns", "denials", "input_tokens",
             "output_tokens", "cost_usd", "agent_ms", "api_ms", "model_usage",
+            "session_id",
             "quota_status", "quota_utilization", "quota_resets_at", "quota_type",
             "quota_overage_status")
     return {k: meta[k] for k in keep if meta.get(k) is not None}

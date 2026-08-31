@@ -298,6 +298,11 @@ class SdkSession:
         return {
             "result_subtype": getattr(result_msg, "subtype", None),
             "num_turns": getattr(result_msg, "num_turns", None),
+            # The CLI's own session id, which is also the filename of the
+            # transcript it writes. The turn log keeps reply_chars but never the
+            # reply text, so this is the only key that ties a recorded turn back
+            # to what was actually said in it.
+            "session_id": getattr(result_msg, "session_id", None),
             "denials": denials or None,
             "input_tokens": usage.get("input_tokens"),
             "output_tokens": usage.get("output_tokens"),

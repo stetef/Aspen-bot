@@ -68,6 +68,24 @@ def test_the_log_is_private_on_a_shared_node(sut):
     assert stat.S_IMODE(log.parent.stat().st_mode) == 0o700
 
 
+def test_session_id_is_kept_as_the_join_key_to_the_transcript(sut):
+    """The turn log keeps reply_chars, never the reply. session_id is the only
+    thing tying a recorded turn to the CLI transcript that holds what was said."""
+    _record(sut, text="did it converge?", meta={"session_id": "8e743356-2c52"})
+    assert _entries(sut)[0]["session_id"] == "8e743356-2c52"
+
+
+def test_session_id_survives_a_redacted_turn(sut):
+    """Redaction withholds the text, not the pointer — volume and latency stay
+    unbroken, and a reader is expected to honour ``redacted`` rather than follow
+    the pointer around it."""
+    _configure(sut, content=False)
+    _record(sut, text="a question", meta={"session_id": "abc-123"})
+    entry = _entries(sut)[0]
+    assert entry["session_id"] == "abc-123"
+    assert entry["text"] is None and entry["redacted"] is True
+
+
 def test_long_text_is_truncated_but_the_true_length_is_kept(sut, monkeypatch):
     monkeypatch.setattr(sut, "TELEMETRY_MAX_TEXT", 50)
     _record(sut, text="x" * 5000)
