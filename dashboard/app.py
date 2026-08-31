@@ -398,8 +398,12 @@ else:
             st.markdown(f"**{turn['who']}** · {when}")
             st.info(turn["question"])
             if turn["tools"]:
-                with st.expander(f"{len(turn['tools'])} tool call(s)"):
-                    st.code("\n".join(turn["tools"]), language=None)
+                names = ", ".join(dict.fromkeys(c["name"] for c in turn["tools"]))
+                with st.expander(f"{len(turn['tools'])} tool call(s) — {names}"):
+                    # The arguments, not just the names: "checked the queue" and
+                    # "ran squeue -u samss" read the same until you see the call.
+                    st.code("\n".join(convo.call_line(c) for c in turn["tools"]),
+                            language="bash")
             st.markdown("\n\n".join(turn["reply"]) if turn["reply"]
                         else "_(no text reply — the turn errored or is still running)_")
             st.divider()

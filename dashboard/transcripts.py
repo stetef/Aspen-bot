@@ -71,9 +71,11 @@ def read_session(path: Path) -> dict | None:
     """One transcript as ``{session_id, aliases, turns}``, or None if not Aspen's.
 
     A turn is one human message plus everything the agent did before the next
-    one: its prose, and the names of the tools it called. Tool *results* are
-    deliberately dropped — they are the bulk of the file and none of the
-    conversation.
+    one: its prose, and each tool call with the arguments it was given. The
+    arguments are the point — "it checked the queue" and "it ran `squeue -u
+    samss`" look identical without them, and only the second shows the agent
+    querying the wrong account. Tool *results* are dropped: they are the bulk of
+    the file and none of the conversation.
     """
     turns: list[dict] = []
     aliases: list[str] = []
@@ -107,8 +109,11 @@ def read_session(path: Path) -> dict | None:
                         if block.get("type") == "text" and (block.get("text") or "").strip():
                             pending["reply"].append(block["text"].strip())
                         elif block.get("type") == "tool_use":
-                            pending["tools"].append(
-                                str(block.get("name", "?")).removeprefix("mcp__aspen__"))
+                            args = block.get("input")
+                            pending["tools"].append({
+                                "name": str(block.get("name", "?")).removeprefix("mcp__aspen__"),
+                                "input": args if isinstance(args, dict) else {},
+                            })
     except OSError:
         return None
     if pending:
@@ -151,6 +156,25 @@ def title_of(session: dict, width: int = 70) -> str:
         return "(empty)"
     first = " ".join(session["turns"][0]["question"].split())
     return first[:width] + "…" if len(first) > width else first or "(no text)"
+
+
+def call_line(call: dict) -> str:
+    """One tool call as a line you could almost paste into a shell.
+
+    Bash is rendered as the command itself because that is what a reader is
+    checking; everything else as ``key=value``, with ``description`` dropped —
+    it is the agent's narration of the call, not an argument to it.
+    """
+    name = call.get("name", "?")
+    args = call.get("input") or {}
+    if name == "Bash" and args.get("command"):
+        return f"$ {args['command']}"
+    shown = {k: v for k, v in args.items() if k != "description"}
+    if not shown:
+        return f"{name}()"
+    pairs = ", ".join(f"{k}={v!r}" if not isinstance(v, str) else f"{k}={v}"
+                      for k, v in shown.items())
+    return f"{name}({pairs})"
 
 
 def index(sessions: list[dict]) -> pd.DataFrame:

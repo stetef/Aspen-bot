@@ -102,7 +102,32 @@ def test_tool_results_are_not_mistaken_for_questions(tmp_path):
     turns = T.read_all(tmp_path)[0]["turns"]
     assert len(turns) == 1
     assert turns[0]["reply"] == ["One job running."]
-    assert turns[0]["tools"] == ["list_directory"]      # prefix stripped, like the log
+    assert [c["name"] for c in turns[0]["tools"]] == ["list_directory"]   # prefix stripped
+
+
+def test_tool_arguments_are_kept_not_just_the_name(tmp_path):
+    """The regression this exists for: Aspen was asked about Sam Tetef's jobs and
+    ran `squeue -u samss` — a different person. "It checked the queue" and the
+    actual command read identically until the arguments are on screen."""
+    _transcript(
+        tmp_path, "s1",
+        _line("user", CONTEXT + "where are Sam Tetef's jobs?"),
+        _line("assistant", [{"type": "tool_use", "id": "t1", "name": "Bash",
+                             "input": {"command": "squeue -u samss",
+                                       "description": "Show Sam's jobs"}}]),
+    )
+    call = T.read_all(tmp_path)[0]["turns"][0]["tools"][0]
+    assert call["input"]["command"] == "squeue -u samss"
+    assert T.call_line(call) == "$ squeue -u samss"      # description is narration
+
+
+def test_call_line_renders_a_path_argument(tmp_path):
+    call = {"name": "read_file", "input": {"path": "runs/orca.log", "section": "tail"}}
+    assert T.call_line(call) == "read_file(path=runs/orca.log, section=tail)"
+
+
+def test_call_line_survives_a_call_with_no_arguments(tmp_path):
+    assert T.call_line({"name": "list_my_jobs", "input": {}}) == "list_my_jobs()"
 
 
 def test_a_torn_final_line_does_not_lose_the_conversation(tmp_path):
