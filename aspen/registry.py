@@ -71,6 +71,24 @@ def slugify(name: str) -> str:
     return slug[:ALIAS_MAX_LEN].strip("-")
 
 
+def display_from_alias(alias: str) -> str:
+    """The readable name an alias stands for ('macon-abernathy' -> 'Macon Abernathy').
+
+    Roughly the inverse of ``slugify``, and the reason it exists is that Slack's
+    two name fields disagree: the alias is slugified from someone's real name
+    while ``display_name`` took their Slack handle, so the registry ended up
+    holding "macon-abernathy" next to "mjabern" and "arun-asundi" next to
+    "arunasundi". A handle is not a name, and the near-miss between the two is
+    what an agent guesses wrong on.
+
+    Not a general title-caser: it only upper-cases the first letter of each
+    hyphen-separated part, so "o'brien" and "mcdonald" keep the rest of their
+    spelling rather than being mangled into "O'Brien" or "McDonald" by rule.
+    """
+    parts = [p for p in (alias or "").split("-") if p]
+    return " ".join(p[:1].upper() + p[1:] for p in parts)
+
+
 def validate_alias(alias: str) -> Optional[str]:
     """Return an error message if ``alias`` is unusable, else ``None``."""
     if not alias:

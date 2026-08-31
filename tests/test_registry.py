@@ -271,7 +271,9 @@ def test_migration_runs_only_once(cli_bootstrap, sut, reg):
 def test_cli_add_registers_a_user(cli, sut, reg, capsys):
     assert cli.main(["add", "U01ARUN", "--alias", "arun", "--name", "Arun N."]) == 0
     assert "U01ARUN" in sut.ALLOWED_USER_IDS
-    assert reg.by_alias("arun")["display_name"] == "Arun N."
+    # --name is slugified into the alias; the stored name then comes back FROM
+    # the alias, so a Slack handle can never be recorded as somebody's name.
+    assert reg.by_alias("arun")["display_name"] == "Arun"
 
 
 def test_cli_add_derives_the_alias_from_the_name(cli, reg):
@@ -340,11 +342,33 @@ def test_cli_rename_rejects_a_taken_alias(cli, reg, capsys):
     assert "already used" in capsys.readouterr().err
 
 
+def test_display_name_is_derived_from_the_alias(reg):
+    assert reg.display_from_alias("macon-abernathy") == "Macon Abernathy"
+    assert reg.display_from_alias("arun-asundi") == "Arun Asundi"
+    assert reg.display_from_alias("sam-tetef") == "Sam Tetef"
+    assert reg.display_from_alias("") == ""
+
+
+def test_display_name_does_not_re_spell_a_name_it_only_capitalises(reg):
+    """Only the first letter of each part — a rule-based title-caser would turn
+    "o'brien" into "O'Brien" and "mcdonald" into "McDonald" and be wrong as often
+    as it is right."""
+    assert reg.display_from_alias("kelly-o'brien") == "Kelly O'brien"
+    assert reg.display_from_alias("ada-mcdonald") == "Ada Mcdonald"
+
+
+def test_renaming_someone_updates_the_name_that_follows_from_it(cli, reg):
+    cli.main(["add", "U0X", "--alias", "mjabern", "--name", "mjabern"])
+    assert reg.by_alias("mjabern")["display_name"] == "Mjabern"
+    cli.main(["rename", "mjabern", "--to", "macon-abernathy"])
+    assert reg.by_alias("macon-abernathy")["display_name"] == "Macon Abernathy"
+
+
 def test_cli_whois_reports_the_entry(cli, reg, capsys):
-    cli.main(["add", "U01ARUN", "--alias", "arun", "--name", "Arun N."])
-    assert cli.main(["whois", "arun"]) == 0
+    cli.main(["add", "U01ARUN", "--alias", "arun-n", "--name", "Arun N."])
+    assert cli.main(["whois", "arun-n"]) == 0
     out = capsys.readouterr().out
-    assert "U01ARUN" in out and "Arun N." in out
+    assert "U01ARUN" in out and "Arun N" in out
 
 
 def test_cli_list_shows_registered_users(cli, reg, capsys):

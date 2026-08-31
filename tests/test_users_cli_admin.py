@@ -41,10 +41,23 @@ def test_sync_is_a_dry_run_by_default(sut, cli, monkeypatch, capsys):
     assert sut.registry.by_id("U0SAM")["display_name"] == "Sam"     # unchanged
 
 
-def test_sync_apply_writes_the_new_names(sut, cli, monkeypatch):
+def test_sync_apply_normalises_names_to_the_alias(sut, cli, monkeypatch):
+    """Names come from the alias, not from Slack. Slack's two name fields
+    disagree — the alias is slugified from a real name while display_name took
+    the handle — which is how "macon-abernathy" ended up beside "mjabern"."""
     _slack(cli, monkeypatch, {"U0SAM": "Sam Tetef", "U01ARUN": "Arun N."})
+    cli.main(["rename", "sam", "--to", "sam-tetef"])
     assert cli.main(["sync", "--apply"]) == 0
     assert sut.registry.by_id("U0SAM")["display_name"] == "Sam Tetef"
+    assert sut.registry.by_id("U01ARUN")["display_name"] == "Arun"   # alias is "arun"
+
+
+def test_sync_does_not_take_a_slack_handle_as_a_name(sut, cli, monkeypatch):
+    """The regression: a handle is not a name, and the near-miss between the two
+    is what an agent guesses wrong on."""
+    _slack(cli, monkeypatch, {"U0SAM": "mjabern", "U01ARUN": "Arun N."})
+    cli.main(["sync", "--apply"])
+    assert sut.registry.by_id("U0SAM")["display_name"] == "Sam"      # from the alias
 
 
 def test_sync_reports_alias_drift_without_renaming(sut, cli, monkeypatch, capsys):
@@ -56,14 +69,19 @@ def test_sync_reports_alias_drift_without_renaming(sut, cli, monkeypatch, capsys
 
 
 def test_sync_survives_slack_being_unreachable(sut, cli, monkeypatch, capsys):
+    """Slack is now only consulted for alias drift, so an outage costs that check
+    and nothing else — the names still normalise."""
     _slack(cli, monkeypatch, {"U0SAM": "!network is down", "U01ARUN": "Arun N."})
     assert cli.main(["sync", "--apply"]) == 0
     assert "warning" in capsys.readouterr().out
     assert sut.registry.by_id("U0SAM")["display_name"] == "Sam"     # kept, not blanked
+    assert sut.registry.by_id("U01ARUN")["display_name"] == "Arun"  # still normalised
 
 
 def test_sync_says_nothing_to_do_when_names_match(sut, cli, monkeypatch, capsys):
-    _slack(cli, monkeypatch, {"U0SAM": "Sam", "U01ARUN": "Arun N."})
+    _slack(cli, monkeypatch, {"U0SAM": "Sam", "U01ARUN": "Arun"})
+    cli.main(["sync", "--apply"])            # settle both onto their aliases
+    capsys.readouterr()
     assert cli.main(["sync"]) == 0
     assert "up to date" in capsys.readouterr().out
 

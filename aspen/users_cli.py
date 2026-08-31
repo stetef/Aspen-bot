@@ -118,14 +118,21 @@ def _migrate_bootstrap(quiet: bool = False) -> bool:
 
 
 def _lookup_slack_profile(uid: str) -> tuple[str, str]:
-    """(display_name, error) for a Slack user ID."""
+    """(real name, error) for a Slack user ID.
+
+    ``real_name`` first, deliberately. Slack's ``profile.display_name`` is the
+    *handle* someone picked — "mjabern", "arunasundi" — and preferring it is how
+    handles got recorded as people's names, and then slugified into aliases that
+    no longer look like anybody. A handle is a login, not a name; take it only
+    when there is no real name to be had.
+    """
     try:
         user = _slack_client().users_info(user=uid)["user"]
     except Exception as exc:
         return "", str(exc)
     profile = user.get("profile", {})
-    name = (profile.get("display_name") or profile.get("real_name")
-            or user.get("real_name") or user.get("name") or "")
+    name = (profile.get("real_name") or user.get("real_name")
+            or profile.get("display_name") or user.get("name") or "")
     return name, ""
 
 
@@ -193,8 +200,10 @@ def cmd_add(args) -> int:
                     "— pick another with --alias")
 
     users = registry.users(include_removed=True)
-    entry = registry.new_user(uid, alias, name or alias, role=args.role,
-                              added_by=_actor(args), notes=args.notes or "")
+    entry = registry.new_user(uid, alias,
+                              registry.display_from_alias(alias) or name or alias,
+                              role=args.role, added_by=_actor(args),
+                              notes=args.notes or "")
     if existing:                       # reinstating a previously removed user
         users = [entry if u["slack_user_id"] == uid else u for u in users]
     else:
@@ -224,7 +233,9 @@ def cmd_rename(args) -> int:
         return _err(f"alias '{new_alias}' is already used by {clash['slack_user_id']}")
 
     old_alias = user["alias"]
-    users = [dict(u, alias=new_alias) if u["slack_user_id"] == user["slack_user_id"] else u
+    new_display = registry.display_from_alias(new_alias) or user["display_name"]
+    users = [dict(u, alias=new_alias, display_name=new_display)
+             if u["slack_user_id"] == user["slack_user_id"] else u
              for u in registry.users(include_removed=True)]
     registry.save(users)
     # Folder names track the alias; lookups go by Slack ID, so this is cosmetic
@@ -280,7 +291,18 @@ def cmd_remove(args) -> int:
 
 
 def cmd_sync(args) -> int:
-    """Refresh display names from Slack and report alias drift."""
+    """Normalise display names to their alias, and report alias drift from Slack.
+
+    Names come from the *alias*, not from Slack, because Slack's two name fields
+    disagree: the alias was slugified from someone's real name while the display
+    name took their handle, leaving "macon-abernathy" sitting next to "mjabern".
+    Slack is still consulted — but only to notice that someone's real name no
+    longer matches their alias, which is a rename to approve by hand rather than
+    a value to overwrite.
+
+    So this no longer needs Slack to do its main job: an unreachable API costs
+    the drift check, not the normalisation.
+    """
     changes, users = [], registry.users(include_removed=True)
     updated = []
     for u in users:
@@ -288,17 +310,18 @@ def cmd_sync(args) -> int:
         if u["status"] != "active":
             updated.append(u)
             continue
+        proper = registry.display_from_alias(u["alias"])
+        if proper and proper != u["display_name"]:
+            changes.append(f"  {u['alias']}: name '{u['display_name']}' -> '{proper}'")
+            u = dict(u, display_name=proper)
         name, failure = _lookup_slack_profile(uid)
         if failure:
-            print(f"warning: {uid}: {failure}")
+            print(f"warning: {uid}: {failure} — alias drift not checked")
             updated.append(u)
             continue
-        if name and name != u["display_name"]:
-            changes.append(f"  {u['alias']}: name '{u['display_name']}' -> '{name}'")
-            u = dict(u, display_name=name)
         suggested = registry.slugify(name)
         if suggested and suggested != u["alias"] and not registry.validate_alias(suggested):
-            print(f"  {u['alias']}: alias no longer matches their name "
+            print(f"  {u['alias']}: alias no longer matches their Slack name "
                   f"(suggest '{suggested}' — rename with `aspen-users rename {u['alias']} "
                   f"--to {suggested}`)")
         updated.append(u)
@@ -1153,7 +1176,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("add", help="register a user (grants access)")
     s.add_argument("slack_user_id", help="Slack member ID, e.g. U01ABC2DEF")
     s.add_argument("--alias", default="", help="kebab-case alias (default: from their name)")
-    s.add_argument("--name", default="", help="display name (default: looked up from Slack)")
+    s.add_argument("--name", default="", help="Slack name to slugify into an alias (the display name is derived from the alias)")
     s.add_argument("--role", default="member", choices=registry.ROLES)
     s.add_argument("--notes", default="", help="free-text note, e.g. 'beta'")
     s.set_defaults(func=cmd_add)
@@ -1171,7 +1194,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     s.set_defaults(func=cmd_remove)
 
-    s = sub.add_parser("sync", help="refresh display names from Slack; report alias drift")
+    s = sub.add_parser("sync", help="normalise display names to their alias; report alias drift")
     s.add_argument("--apply", action="store_true", help="write the changes (default: dry run)")
     s.set_defaults(func=cmd_sync)
 
