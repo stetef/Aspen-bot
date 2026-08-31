@@ -63,15 +63,54 @@ def test_list_directory_outside_root(sut):
 def test_read_file_returns_contents(sut):
     (sut.CALCULATIONS_ROOT / "hello.txt").write_text("hello world")
     out = sut._read_file("hello.txt")
-    assert out == "--- hello.txt ---\nhello world"
+    # The size is stated on every read, so a capped one can never pass for whole.
+    assert out == "--- hello.txt (11 bytes) ---\nhello world"
 
 
 def test_read_file_truncates_at_limit(sut, monkeypatch):
     monkeypatch.setattr(sut, "MAX_FILE_BYTES", 5)
     (sut.CALCULATIONS_ROOT / "big.txt").write_text("0123456789")  # 10 bytes
     out = sut._read_file("big.txt")
-    assert out.startswith("--- big.txt ---\n01234")
-    assert "[Truncated: showing first 5 of 10 bytes]" in out
+    assert "10 bytes" in out                       # the true size, not what we got
+    assert "NOT read" in out
+
+
+def test_read_file_oversized_returns_both_ends(sut, monkeypatch):
+    """The ORCA shape: settings at the head, the verdict at the tail.
+
+    A head-only read of a long log returns everything except the answer while
+    looking complete, which is how a converged run got reported as unconverged.
+    """
+    monkeypatch.setattr(sut, "MAX_FILE_BYTES", 200)
+    body = ("CHARGE=0 MULTIPLICITY=1\n" + "filler line\n" * 400
+            + "THE OPTIMIZATION HAS CONVERGED\n****ORCA TERMINATED NORMALLY****\n")
+    (sut.CALCULATIONS_ROOT / "orca.log").write_text(body)
+    out = sut._read_file("orca.log")
+    assert "CHARGE=0 MULTIPLICITY=1" in out        # head: how the run was set up
+    assert "ORCA TERMINATED NORMALLY" in out       # tail: how it ended
+    assert "bytes skipped" in out                  # and the gap is admitted
+
+
+def test_read_file_section_tail_spends_budget_at_the_end(sut, monkeypatch):
+    monkeypatch.setattr(sut, "MAX_FILE_BYTES", 120)
+    (sut.CALCULATIONS_ROOT / "t.log").write_text(
+        "HEAD MARKER\n" + "x" * 4000 + "\nFinal Gibbs free energy  -1.5 Eh\n")
+    out = sut._read_file("t.log", section="tail")
+    assert "Final Gibbs free energy" in out
+    assert "HEAD MARKER" not in out
+    assert "NOT read" in out
+
+
+def test_read_file_rejects_unknown_section(sut):
+    (sut.CALCULATIONS_ROOT / "s.txt").write_text("x")
+    assert "section must be" in sut._read_file("s.txt", section="middle")
+
+
+def test_read_file_says_when_a_file_is_empty(sut):
+    """A 0-byte file must say so; a bare header reads as 'nothing to report'."""
+    (sut.CALCULATIONS_ROOT / "empty.sout").write_text("")
+    out = sut._read_file("empty.sout")
+    assert "0 bytes" in out and "empty" in out
 
 
 def test_read_file_missing(sut):
@@ -132,6 +171,56 @@ def test_search_files_cannot_read_outside_root(sut, tmp_path):
     # A no-match reply echoes the query, so check the secret FILE wasn't reached:
     assert out.startswith("No matches")
     assert "outside_secret" not in out
+
+
+def test_search_files_reads_a_named_file_whole(sut, monkeypatch):
+    """The regression: a match past the sweep's byte cap must still be found.
+
+    A real ORCA log put 'THE OPTIMIZATION HAS CONVERGED' at line 94356 of a
+    7.4 MB file. The cap read the first 30%, the search reported "No matches",
+    and the agent told a user their calculations had not converged. Naming one
+    file bounds the work already, so it is scanned in full.
+    """
+    monkeypatch.setattr(sut, "SEARCH_MAX_FILE_BYTES", 500)
+    proj = sut.CALCULATIONS_ROOT / "big_log"
+    proj.mkdir()
+    log = proj / "run.log"
+    log.write_text("filler\n" * 500 + "THE OPTIMIZATION HAS CONVERGED\n")
+    out = sut._search_files("THE OPTIMIZATION HAS CONVERGED", "big_log/run.log")
+    assert "run.log:501:" in out
+    assert "INCOMPLETE" not in out              # nothing was hidden, so say nothing
+
+
+def test_search_files_discloses_the_byte_cap_on_a_sweep(sut, monkeypatch):
+    """A capped sweep may not report a false negative as a fact."""
+    monkeypatch.setattr(sut, "SEARCH_MAX_FILE_BYTES", 500)
+    proj = sut.CALCULATIONS_ROOT / "swept"
+    proj.mkdir()
+    (proj / "run.log").write_text("filler\n" * 500 + "TERMINATED NORMALLY\n")
+    out = sut._search_files("TERMINATED NORMALLY", "swept")
+    assert out.startswith("No matches")          # still capped: that is the budget
+    assert "INCOMPLETE" in out                   # but it no longer reads as absence
+    assert "run.log" in out                      # and it names what it could not finish
+
+
+def test_search_files_partial_hits_are_flagged_too(sut, monkeypatch):
+    """Truncated results are as misleading as empty ones — 17 hits out of 51."""
+    monkeypatch.setattr(sut, "SEARCH_MAX_FILE_BYTES", 200)
+    proj = sut.CALCULATIONS_ROOT / "partial"
+    proj.mkdir()
+    (proj / "e.log").write_text("ENERGY here\n" * 200)
+    out = sut._search_files("ENERGY", "partial")
+    assert "match(es)" in out
+    assert "INCOMPLETE" in out
+
+
+def test_search_files_skips_binary_when_named_directly(sut):
+    """The single-file path detects binary on a probe, not the whole read."""
+    proj = sut.CALCULATIONS_ROOT / "named_bin"
+    proj.mkdir()
+    (proj / "data.gbw").write_bytes(b"\x00\x01PATTERN" + b"\x00" * 100)
+    out = sut._search_files("PATTERN", "named_bin/data.gbw")
+    assert out.startswith("No matches")
 
 
 def test_search_files_skips_binary(sut):

@@ -110,8 +110,57 @@ def _project_of(rel: str, path: Path, scope: dict) -> str:
     return parts[0] if parts else ""
 
 
+def _read_capped(path: Path, label: str, size: int, section: str) -> str:
+    """The oversized case: one end or both, always naming what was skipped.
+
+    Both ends is the default because a scientific log is written back-to-front
+    in importance: the run's *parameters* (charge, multiplicity, basis, geometry)
+    are echoed at the head, and its *verdict* (convergence, final energies,
+    thermochemistry, the termination banner) lands in the last few hundred lines.
+    A head-only read of a multi-megabyte ORCA log therefore returns everything
+    except the answer, which is worse than returning nothing — it looks complete.
+    """
+    cap = config.MAX_FILE_BYTES
+    head_n = 0 if section == "tail" else (cap if section == "head" else cap // 2)
+    tail_n = 0 if section == "head" else cap - head_n
+
+    with open(path, "rb") as fh:
+        head = fh.read(head_n) if head_n else b""
+        if tail_n:
+            fh.seek(max(head_n, size - tail_n))
+            tail = fh.read()
+        else:
+            tail = b""
+    # Don't hand back half a line at either seam.
+    if head and b"\n" in head:
+        head = head[: head.rfind(b"\n") + 1]
+    if tail and b"\n" in tail:
+        tail = tail[tail.find(b"\n") + 1:]
+
+    skipped = size - len(head) - len(tail)
+    text = lambda b: b.decode("utf-8", errors="replace")
+    if section == "head":
+        note = (f"showing the FIRST {len(head):,} bytes; {skipped:,} bytes at the end "
+                f"were NOT read — pass section='tail' for the results")
+        return f"--- {label} ({size:,} bytes — {note}) ---\n{text(head)}"
+    if section == "tail":
+        note = f"showing the LAST {len(tail):,} bytes; {skipped:,} bytes before them were NOT read"
+        return f"--- {label} ({size:,} bytes — {note}) ---\n{text(tail)}"
+    note = (f"showing the first {len(head):,} and last {len(tail):,} bytes; "
+            f"{skipped:,} bytes in the middle were NOT read")
+    return (f"--- {label} ({size:,} bytes — {note}) ---\n"
+            f"{text(head)}\n[… {skipped:,} bytes skipped …]\n{text(tail)}")
+
+
 def _read_file(rel: str, owner: str = "", viewer_uid: str = "",
-               batch_id: str = "") -> str:
+               batch_id: str = "", section: str = "both") -> str:
+    """Read a file, always disclosing its size and which part came back.
+
+    Every return path states the file's true size, so a capped read can never be
+    mistaken for the whole file and an empty file cannot be mistaken for one with
+    nothing interesting in it. ``section`` picks which end of an oversized file to
+    spend the budget on: 'both' (default), 'head', or 'tail'.
+    """
     path, scope, error = _scoped(rel, owner, viewer_uid, batch_id)
     if error:
         return f"Error: '{rel}' is outside the allowed directory." if "outside" in error else error
@@ -119,18 +168,44 @@ def _read_file(rel: str, owner: str = "", viewer_uid: str = "",
         return f"Error: '{rel}' does not exist."
     if not path.is_file():
         return f"Error: '{rel}' is not a regular file."
+    if section not in ("both", "head", "tail"):
+        return f"Error: section must be 'head', 'tail' or 'both' (got {section!r})."
+    label = _display(path, scope) if scope.get("kind") == "results" else rel
     try:
         size = path.stat().st_size
-        with open(path, "r", errors="replace") as fh:
-            content = fh.read(config.MAX_FILE_BYTES)
-        truncation_note = (
-            f"\n[Truncated: showing first {config.MAX_FILE_BYTES} of {size} bytes]"
-            if size > config.MAX_FILE_BYTES else ""
-        )
-        label = _display(path, scope) if scope.get("kind") == "results" else rel
-        return f"--- {label} ---\n{content}{truncation_note}"
+        # An empty file must say so outright. A bare header is indistinguishable
+        # from a file of blank lines, and reads as "nothing to report" when the
+        # real answer is "you are reading the wrong file" — which is exactly how
+        # a 0-byte .sout sent a convergence check down the wrong path.
+        if size == 0:
+            return f"--- {label} (0 bytes — file is empty) ---"
+        if size <= config.MAX_FILE_BYTES:
+            with open(path, "rb") as fh:
+                body = fh.read().decode("utf-8", errors="replace")
+            return f"--- {label} ({size:,} bytes) ---\n{body}"
+        return _read_capped(path, label, size, section)
     except PermissionError:
         return f"Error: permission denied for '{rel}'."
+
+
+def _partial_note(truncated: list[str]) -> str:
+    """Say, in the result itself, that the search did not cover everything.
+
+    The failure this exists to prevent is not a missing match — it is a *false
+    negative reported as fact*. "No matches (1 file searched)" reads as "the
+    string is not in that file", so an agent that searched 30% of a 7 MB ORCA log
+    told a user their calculations had not converged. Any cap that hides data has
+    to be visible in the same breath as the result.
+    """
+    if not truncated:
+        return ""
+    names = sorted(set(truncated))
+    cap_mb = config.SEARCH_MAX_FILE_BYTES / (1024 * 1024)
+    shown = ", ".join(names[:5]) + (f" (+{len(names) - 5} more)" if len(names) > 5 else "")
+    return (f"\n(INCOMPLETE — {len(names)} file(s) were read only to the first "
+            f"{cap_mb:.0f} MB, so anything after that was NOT searched: {shown}. "
+            f"Results such as convergence and final energies are written at the "
+            f"END of a long log; pass that one file as `path` to search all of it.)")
 
 
 def _search_files(query: str, rel: str = ".", regex: bool = False,
@@ -167,12 +242,16 @@ def _search_files(query: str, rel: str = ".", regex: bool = False,
     if not base.exists():
         return f"Error: '{rel}' does not exist."
 
-    matches, files_scanned, files_capped, hit_match_cap = _search_one(
+    matches, files_scanned, files_capped, hit_match_cap, truncated = _search_one(
         pattern, base, scope["path"], config.SEARCH_MAX_FILES, qualify_as="",
     )
+    partial = _partial_note(truncated)
     if not matches:
-        return f"No matches for {query!r} under '{rel}' ({files_scanned} file(s) searched)."
+        return (f"No matches for {query!r} under '{rel}' "
+                f"({files_scanned} file(s) searched).{partial}")
     out = [f"{len(matches)} match(es) for {query!r} under '{rel}':", *matches]
+    if partial:
+        out.append(partial.lstrip("\n"))
     if hit_match_cap:
         out.append(f"(stopped at the {config.SEARCH_MAX_MATCHES}-match limit — narrow your query)")
     if files_capped:
@@ -208,7 +287,7 @@ def _distinct_scopes(viewer_uid: str = "") -> list[dict]:
 def _search_every_root(query: str, pattern, rel: str, viewer_uid: str) -> str:
     """The cross-root sweep, with a shared budget and an honest tail."""
     budget = config.SEARCH_MAX_FILES_ALL
-    matches, scanned_total, skipped = [], 0, []
+    matches, scanned_total, skipped, truncated = [], 0, [], []
     for scope in _distinct_scopes(viewer_uid):
         if budget <= 0:
             skipped.append(f"{roots.PREFIX}{scope['name']}")
@@ -220,10 +299,11 @@ def _search_every_root(query: str, pattern, rel: str, viewer_uid: str) -> str:
             continue
         if not base.exists():
             continue                        # a subpath that only some roots have
-        found, scanned, _capped, hit_match_cap = _search_one(
+        found, scanned, _capped, hit_match_cap, cut = _search_one(
             pattern, base, scope["path"],
             min(budget, config.SEARCH_MAX_FILES), qualify_as=scope["name"],
         )
+        truncated.extend(cut)
         matches.extend(found)
         scanned_total += scanned
         budget -= scanned
@@ -235,25 +315,66 @@ def _search_every_root(query: str, pattern, rel: str, viewer_uid: str) -> str:
             break
 
     where = "every root" + (f" under '{rel}'" if rel not in (".", "") else "")
+    partial = _partial_note(truncated)
     if not matches:
-        return f"No matches for {query!r} across {where} ({scanned_total} file(s) searched)."
+        return (f"No matches for {query!r} across {where} "
+                f"({scanned_total} file(s) searched).{partial}")
     out = [f"{len(matches)} match(es) for {query!r} across {where}:", *matches[:config.SEARCH_MAX_MATCHES]]
     # Never let a truncated sweep read as a complete one.
+    if partial:
+        out.append(partial.lstrip("\n"))
     if skipped:
         out.append(f"(budget spent — these roots were NOT searched: {', '.join(sorted(set(skipped)))})")
     return "\n".join(out)
 
 
+def _scan_lines(fpath: Path, unbounded: bool):
+    """``(iterator of (lineno, text), truncated)`` for one file; ``(None, False)`` if binary.
+
+    ``unbounded`` streams the whole file a line at a time — bounded memory, no
+    byte cap. It is used when the caller named a single file, which already
+    bounds the work; the read cap exists to keep an *N-root walk* finite, and
+    applying it to a named file is what let a 7 MB ORCA log answer "no matches"
+    for a string sitting at line 94356. Binary detection then runs on a probe
+    rather than the whole read, so it stays cheap on a multi-gigabyte .gbw.
+    """
+    if not unbounded:
+        with open(fpath, "rb") as fh:
+            raw = fh.read(config.SEARCH_MAX_FILE_BYTES)
+        if b"\x00" in raw:
+            return None, False              # binary file — skip
+        truncated = fpath.stat().st_size > len(raw)
+        return enumerate(raw.decode("utf-8", errors="replace").splitlines(), 1), truncated
+
+    with open(fpath, "rb") as fh:
+        if b"\x00" in fh.read(8192):
+            return None, False
+
+    def stream():
+        with open(fpath, "r", errors="replace") as fh:
+            for lineno, line in enumerate(fh, 1):
+                yield lineno, line.rstrip("\n")
+
+    return stream(), False
+
+
 def _search_one(pattern, base: Path, root: Path, file_budget: int,
-                qualify_as: str = "") -> tuple[list[str], int, bool, bool]:
-    """Walk one root. Returns (matches, files_scanned, files_capped, match_capped)."""
+                qualify_as: str = "") -> tuple[list[str], int, bool, bool, list[str]]:
+    """Walk one root.
+
+    Returns ``(matches, files_scanned, files_capped, match_capped, truncated)``,
+    where ``truncated`` names the files read only as far as the byte cap — the
+    caller must say so, or a partial search reads as a complete one.
+    """
     matches: list[str] = []
     files_scanned = 0
     files_capped = False
     hit_match_cap = False
+    truncated_files: list[str] = []
 
     # A single file, or a directory walk (not following symlinked dirs).
-    if base.is_file():
+    single = base.is_file()
+    if single:
         candidates = [base]
     else:
         candidates = (
@@ -276,19 +397,19 @@ def _search_one(pattern, base: Path, root: Path, file_budget: int,
             continue
         files_scanned += 1
         try:
-            with open(fpath, "rb") as fh:
-                raw = fh.read(config.SEARCH_MAX_FILE_BYTES)
-        except OSError:
-            continue
-        if b"\x00" in raw:
-            continue  # binary file — skip
-        text = raw.decode("utf-8", errors="replace")
-        try:
             rel_name = fpath.relative_to(root)
         except ValueError:
             continue
         shown = roots.qualify(qualify_as, str(rel_name)) if qualify_as else str(rel_name)
-        for lineno, line in enumerate(text.splitlines(), 1):
+        try:
+            lines, was_truncated = _scan_lines(fpath, single)
+        except OSError:
+            continue
+        if lines is None:
+            continue                        # binary file — skip
+        if was_truncated:
+            truncated_files.append(shown)
+        for lineno, line in lines:
             if pattern.search(line):
                 snippet = line.strip()
                 if len(snippet) > 300:
@@ -300,7 +421,7 @@ def _search_one(pattern, base: Path, root: Path, file_budget: int,
         if hit_match_cap:
             break
 
-    return matches, files_scanned, files_capped, hit_match_cap
+    return matches, files_scanned, files_capped, hit_match_cap, truncated_files
 
 
 def _attach_file(rel: str, owner: str = "", viewer_uid: str = "",
@@ -1058,7 +1179,11 @@ TOOL_SPECS = [
         "description": (
             "Read the text contents of a file in someone's calculations. Defaults "
             "to the speaker's own files; pass owner (or an '@alias/...' path) for "
-            "someone else's, or batch_id to read a submitted job's output."
+            "someone else's, or batch_id to read a submitted job's output. Always "
+            "reports the file's true size and which part of it you got, so a "
+            "capped read is never mistaken for the whole file. A file too large "
+            "to return whole comes back as BOTH ends by default — run settings "
+            "live at the head, results at the tail."
         ),
         "input_schema": {
             "type": "object",
@@ -1067,6 +1192,17 @@ TOOL_SPECS = [
                     "type": "string",
                     "description": "Path relative to that person's calculations root.",
                 },
+                "section": {
+                    "type": "string",
+                    "enum": ["both", "head", "tail"],
+                    "description": (
+                        "Which end of an oversized file to spend the budget on. "
+                        "Default 'both'. Use 'tail' for an ORCA/Slurm log whose "
+                        "outcome you need — convergence, final energies, "
+                        "thermochemistry and the termination banner are all "
+                        "written at the END. Ignored for files read in full."
+                    ),
+                },
                 "owner": _OWNER_PROPERTY,
                 "batch_id": _BATCH_PROPERTY,
             },
@@ -1074,7 +1210,7 @@ TOOL_SPECS = [
         },
         "impl": lambda inp, ctx: (
             _read_file(inp["path"], inp.get("owner", ""), ctx.get("user_id", ""),
-                       inp.get("batch_id", "")), []
+                       inp.get("batch_id", ""), inp.get("section", "both")), []
         ),
     },
     {
@@ -1097,7 +1233,12 @@ TOOL_SPECS = [
                 },
                 "path": {
                     "type": "string",
-                    "description": "Subdirectory or file to search within the root. Default '.'",
+                    "description": (
+                        "Subdirectory or file to search within the root. Default '.' "
+                        "Naming a SINGLE file searches all of it however large; a "
+                        "directory sweep reads each file only to a size cap and "
+                        "says so when it does."
+                    ),
                 },
                 "regex": {
                     "type": "boolean",

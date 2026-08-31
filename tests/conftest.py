@@ -40,6 +40,7 @@ _MODMAP = {
     "METADATA_HISTORY_ROOT": "aspen.config",
     "SHARED_CALC_ROOTS": "aspen.config",
     "SEARCH_MAX_FILES_ALL": "aspen.config",
+    "SEARCH_MAX_FILE_BYTES": "aspen.config",
     "BOOTSTRAP_USER_IDS": "aspen.config",
     "ADMIN_OVERRIDE": "aspen.config",
     # Slurm jobs (spec §19)
