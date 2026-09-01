@@ -60,6 +60,16 @@ def test_sync_does_not_take_a_slack_handle_as_a_name(sut, cli, monkeypatch):
     assert sut.registry.by_id("U0SAM")["display_name"] == "Sam"      # from the alias
 
 
+def test_sync_leaves_a_chosen_name_alone(sut, cli, monkeypatch):
+    """Normalising a Slack handle is tidying; overwriting "Riti" with the name
+    her alias spells out is not. sync must not do the second."""
+    _slack(cli, monkeypatch, {"U0SAM": "Sam Tetef", "U01ARUN": "Arun N."})
+    cli.main(["set-name", "sam", "Sammy"])
+    cli.main(["sync", "--apply"])
+    assert sut.registry.by_id("U0SAM")["display_name"] == "Sammy"
+    assert sut.registry.by_id("U01ARUN")["display_name"] == "Arun"   # still tidied
+
+
 def test_sync_reports_alias_drift_without_renaming(sut, cli, monkeypatch, capsys):
     """Renaming is never automatic — an alias is a folder name people rely on."""
     _slack(cli, monkeypatch, {"U0SAM": "Samantha Rivera", "U01ARUN": "Arun N."})

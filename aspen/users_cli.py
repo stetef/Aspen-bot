@@ -200,10 +200,14 @@ def cmd_add(args) -> int:
                     "— pick another with --alias")
 
     users = registry.users(include_removed=True)
-    entry = registry.new_user(uid, alias,
-                              registry.display_from_alias(alias) or name or alias,
-                              role=args.role, added_by=_actor(args),
-                              notes=args.notes or "")
+    # --name given means somebody chose it; without one the name follows the
+    # alias, which is what keeps Slack handles from becoming people's names.
+    chosen = bool(args.name)
+    display = args.name if chosen else (registry.display_from_alias(alias) or name or alias)
+    entry = registry.new_user(uid, alias, display, role=args.role,
+                              added_by=_actor(args), notes=args.notes or "",
+                              unix_user=(args.unix_user or "").strip(),
+                              custom_name=chosen)
     if existing:                       # reinstating a previously removed user
         users = [entry if u["slack_user_id"] == uid else u for u in users]
     else:
@@ -233,9 +237,13 @@ def cmd_rename(args) -> int:
         return _err(f"alias '{new_alias}' is already used by {clash['slack_user_id']}")
 
     old_alias = user["alias"]
-    new_display = registry.display_from_alias(new_alias) or user["display_name"]
-    users = [dict(u, alias=new_alias, display_name=new_display)
-             if u["slack_user_id"] == user["slack_user_id"] else u
+    if user.get("custom_name"):
+        changed = dict(alias=new_alias)          # their name is theirs, not the alias's
+    else:
+        changed = dict(alias=new_alias,
+                       display_name=registry.display_from_alias(new_alias)
+                       or user["display_name"])
+    users = [dict(u, **changed) if u["slack_user_id"] == user["slack_user_id"] else u
              for u in registry.users(include_removed=True)]
     registry.save(users)
     # Folder names track the alias; lookups go by Slack ID, so this is cosmetic
@@ -244,6 +252,44 @@ def cmd_rename(args) -> int:
     print(f"Renamed '{old_alias}' -> '{new_alias}' ({user['slack_user_id']}).")
     if moved:
         print(f"Workflow directory is now {moved}")
+    return 0
+
+
+def cmd_set_name(args) -> int:
+    """Set what someone is called, or hand them back to the alias.
+
+    Separate from ``rename`` because the two answer different questions. An alias
+    is an address — it names folders and gets typed at a prompt, so changing it
+    moves things. A display name is only what the person is called, and someone
+    who goes by Riti rather than Ritimukta should not have to reshape their
+    alias, or their workflow directory, to say so.
+
+    Once set, the name is marked as chosen and neither ``sync`` nor ``rename``
+    will tidy it away.
+    """
+    _migrate_bootstrap()
+    user = registry.resolve(args.who, include_removed=False)
+    if user is None:
+        return _err(f"no active user matches '{args.who}'")
+    uid = user["slack_user_id"]
+
+    if args.reset:
+        display, chosen = registry.display_from_alias(user["alias"]), False
+    else:
+        display = " ".join((args.name or "").split())
+        if not display:
+            return _err("give a name, or pass --reset to fall back to their alias")
+        chosen = True
+
+    users = [dict(u, display_name=display, custom_name=chosen)
+             if u["slack_user_id"] == uid else u
+             for u in registry.users(include_removed=True)]
+    registry.save(users)
+    if chosen:
+        print(f"@{user['alias']} is now called {display}.")
+    else:
+        print(f"@{user['alias']} falls back to their alias: {display}.")
+    print("Takes effect on their next message — no restart needed.")
     return 0
 
 
@@ -311,6 +357,8 @@ def cmd_sync(args) -> int:
             updated.append(u)
             continue
         proper = registry.display_from_alias(u["alias"])
+        if u.get("custom_name"):
+            proper = ""                          # chosen by a human; not ours to tidy
         if proper and proper != u["display_name"]:
             changes.append(f"  {u['alias']}: name '{u['display_name']}' -> '{proper}'")
             u = dict(u, display_name=proper)
@@ -895,6 +943,9 @@ def cmd_whois(args) -> int:
                   "job_runner"):
         if user.get(field):
             print(f"{field:<15} {user[field]}")
+    print(f"{'name source':<15} "
+          + ("chosen — sync leaves it alone" if user.get("custom_name")
+             else f"from their alias (@{user['alias']})"))
     root = roots.for_user(uid)
     if roots.is_rootless(uid):
         print(f"{'calculations':<15} (none — declined; unqualified paths are an error)")
@@ -1178,6 +1229,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--alias", default="", help="kebab-case alias (default: from their name)")
     s.add_argument("--name", default="", help="Slack name to slugify into an alias (the display name is derived from the alias)")
     s.add_argument("--role", default="member", choices=registry.ROLES)
+    s.add_argument("--unix-user", default="",
+                   help="their cluster account, so the bot never has to guess one")
     s.add_argument("--notes", default="", help="free-text note, e.g. 'beta'")
     s.set_defaults(func=cmd_add)
 
@@ -1193,6 +1246,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--force", action="store_true", help="allow removing the admin")
     s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     s.set_defaults(func=cmd_remove)
+
+    s = sub.add_parser("set-name", help="set what someone is called (not their alias)")
+    s.add_argument("who", help="alias or Slack ID")
+    s.add_argument("name", nargs="?", default="", help='what they go by, e.g. "Riti Sarangi"')
+    s.add_argument("--reset", action="store_true",
+                   help="forget the chosen name and derive it from their alias again")
+    s.set_defaults(func=cmd_set_name)
 
     s = sub.add_parser("sync", help="normalise display names to their alias; report alias drift")
     s.add_argument("--apply", action="store_true", help="write the changes (default: dry run)")

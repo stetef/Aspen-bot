@@ -176,6 +176,11 @@ def _normalize(raw: dict) -> dict:
                 "slack_user_id": uid,
                 "alias": alias,
                 "display_name": str(entry.get("display_name") or alias),
+                # True once somebody names this person deliberately. Names are
+                # otherwise derived from the alias, and a derived name must never
+                # win over one a human chose — that is the difference between
+                # tidying a Slack handle and overwriting "Riti" with "Ritimukta".
+                "custom_name": bool(entry.get("custom_name", False)),
                 "role": role if role in ROLES else "member",
                 "status": status if status in STATUSES else "active",
                 "added": str(entry.get("added") or ""),
@@ -360,11 +365,12 @@ def save(users_list: list[dict]) -> None:
 
 def new_user(uid: str, alias: str, display: str, role: str = "member",
              added_by: str = "", notes: str = "", calc_root: str = "",
-             unix_user: str = "") -> dict:
+             unix_user: str = "", custom_name: bool = False) -> dict:
     return {
         "slack_user_id": uid,
         "alias": alias,
         "display_name": display or alias,
+        "custom_name": custom_name,
         "role": role if role in ROLES else "member",
         "status": "active",
         "added": date.today().isoformat(),

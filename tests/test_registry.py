@@ -271,9 +271,9 @@ def test_migration_runs_only_once(cli_bootstrap, sut, reg):
 def test_cli_add_registers_a_user(cli, sut, reg, capsys):
     assert cli.main(["add", "U01ARUN", "--alias", "arun", "--name", "Arun N."]) == 0
     assert "U01ARUN" in sut.ALLOWED_USER_IDS
-    # --name is slugified into the alias; the stored name then comes back FROM
-    # the alias, so a Slack handle can never be recorded as somebody's name.
-    assert reg.by_alias("arun")["display_name"] == "Arun"
+    # --name is somebody choosing it, so it stands as given.
+    assert reg.by_alias("arun")["display_name"] == "Arun N."
+    assert reg.by_alias("arun")["custom_name"] is True
 
 
 def test_cli_add_derives_the_alias_from_the_name(cli, reg):
@@ -358,10 +358,39 @@ def test_display_name_does_not_re_spell_a_name_it_only_capitalises(reg):
 
 
 def test_renaming_someone_updates_the_name_that_follows_from_it(cli, reg):
-    cli.main(["add", "U0X", "--alias", "mjabern", "--name", "mjabern"])
+    cli.main(["add", "U0X", "--alias", "mjabern"])
     assert reg.by_alias("mjabern")["display_name"] == "Mjabern"
     cli.main(["rename", "mjabern", "--to", "macon-abernathy"])
     assert reg.by_alias("macon-abernathy")["display_name"] == "Macon Abernathy"
+
+
+def test_a_chosen_name_is_not_dragged_along_by_a_rename(cli, reg):
+    """An alias is an address; a name is what someone is called. Moving the one
+    must not rewrite the other."""
+    cli.main(["add", "U0X", "--alias", "ritimukta-sarangi"])
+    cli.main(["set-name", "ritimukta-sarangi", "Riti Sarangi"])
+    cli.main(["rename", "ritimukta-sarangi", "--to", "riti-sarangi"])
+    assert reg.by_alias("riti-sarangi")["display_name"] == "Riti Sarangi"
+
+
+def test_set_name_sticks_and_reset_hands_it_back_to_the_alias(cli, reg):
+    cli.main(["add", "U0X", "--alias", "ritimukta-sarangi"])
+    assert reg.by_alias("ritimukta-sarangi")["display_name"] == "Ritimukta Sarangi"
+    assert cli.main(["set-name", "ritimukta-sarangi", "Riti"]) == 0
+    assert reg.by_alias("ritimukta-sarangi")["display_name"] == "Riti"
+    assert cli.main(["set-name", "ritimukta-sarangi", "--reset"]) == 0
+    assert reg.by_alias("ritimukta-sarangi")["display_name"] == "Ritimukta Sarangi"
+    assert reg.by_alias("ritimukta-sarangi")["custom_name"] is False
+
+
+def test_set_name_needs_a_name(cli):
+    cli.main(["add", "U0X", "--alias", "someone"])
+    assert cli.main(["set-name", "someone"]) != 0
+
+
+def test_a_cluster_account_can_be_recorded_at_registration(cli, reg):
+    cli.main(["add", "U0X", "--alias", "kewei-zhao", "--unix-user", "keweiz"])
+    assert reg.by_alias("kewei-zhao")["unix_user"] == "keweiz"
 
 
 def test_cli_whois_reports_the_entry(cli, reg, capsys):
