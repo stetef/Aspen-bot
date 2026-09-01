@@ -889,6 +889,23 @@ def test_the_refresh_is_rate_limited(sut, refreshable, monkeypatch):
     assert len(refreshable["reconciles"]) == 1
 
 
+def test_the_first_refresh_runs_on_a_freshly_booted_host(sut, refreshable, monkeypatch):
+    """The rate-limit clock is time.monotonic(), which counts from BOOT.
+
+    Seeding "never refreshed" as 0.0 therefore meant different things on
+    different machines: ages ago on a login node up for weeks, and *right now* on
+    a host that started a minute ago — which skipped the first refresh of the
+    bot's life for a whole gap window. Invisible where the bot runs, immediate on
+    a fresh CI runner, which is what caught it.
+    """
+    monkeypatch.setattr(sut, "JOBS_REFRESH_MIN_GAP_SECONDS", 3600, raising=False)
+    monkeypatch.setattr(sut.jobs, "queued_states", lambda: {})
+    monkeypatch.setattr(sut.jobs.time, "monotonic", lambda: 12.0)   # 12s of uptime
+    sut.jobs.invalidate_refresh_clock()
+    assert sut.jobs.refresh_states() is True, "a reboot is not a recent refresh"
+    assert sut.jobs.refresh_states() is False, "the gap still applies afterwards"
+
+
 def test_a_cluster_with_no_squeue_at_all_does_not_break_a_refresh(sut, refreshable,
                                                                   monkeypatch):
     """A deployment without Slurm client tools must still take a turn."""

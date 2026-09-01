@@ -1260,13 +1260,18 @@ def reconcile(days: int = 30) -> dict:
 # a turn thread can arrive together, and two simultaneous sacct calls is the exact
 # thing being avoided.
 _REFRESH_LOCK = threading.Lock()
-_LAST_REFRESH = {"at": 0.0}
+# None, not 0.0, for "never refreshed". The clock is time.monotonic(), which
+# counts from BOOT — so 0.0 reads as "ages ago" on a host that has been up for
+# weeks and as "just now" on one that started a minute ago. With 0.0 the very
+# first refresh after a reboot was skipped for a whole gap window, which is
+# invisible on a long-lived login node and immediate on a fresh VM.
+_LAST_REFRESH: dict = {"at": None}
 
 
 def invalidate_refresh_clock() -> None:
     """Forget when the last refresh happened — for tests, and after a config change."""
     with _REFRESH_LOCK:
-        _LAST_REFRESH["at"] = 0.0
+        _LAST_REFRESH["at"] = None
 
 
 def refresh_states(days: int = 30) -> bool:
@@ -1292,7 +1297,8 @@ def refresh_states(days: int = 30) -> bool:
     """
     with _REFRESH_LOCK:
         now = time.monotonic()
-        if now - _LAST_REFRESH["at"] < max(0, config.JOBS_REFRESH_MIN_GAP_SECONDS):
+        last = _LAST_REFRESH["at"]
+        if last is not None and now - last < max(0, config.JOBS_REFRESH_MIN_GAP_SECONDS):
             return False
         _LAST_REFRESH["at"] = now
 
